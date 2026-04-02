@@ -27,7 +27,7 @@
 |---|--|
 | **Канал** | [@coxerhub_playerok](https://t.me/coxerhub_playerok) |
 | **Чат проекта** | [@coxerhub_ch](https://t.me/coxerhub_ch) |
-| **Владельцы** | [@exfador](https://t.me/exfador) · [@terop1](https://t.me/terop1) |
+| **Владельцы** | [@exfador](https://t.me/exfador) · [@terop11](https://t.me/terop11) |
 
 Вопросы и баги удобнее обсуждать в чате сообщества.
 
@@ -38,7 +38,7 @@
 ### 🛒 **Playerok и автоматизация**
 
 * **Автовыдача** — ключевые фразы в названии лота → текст или пакет файлов при продаже (`conf/auto_deliveries.json`).
-* **Автоподнятие** — подъём лотов по расписанию, белые/чёрные списки по названию (`conf/auto_bump_items.json`).
+* **Автоподнятие** — подъём лотов по расписанию; режим **весь каталог** или **только по списку фраз** в названии лота (`conf/auto_bump_items.json` → `included`, плюс `auto.bump.all` в `conf/config.json`).
 * **Автовосстановление** — возврат проданных/истёкших лотов на витрину (`conf/auto_restore_items.json`, `auto.restore`).
 * **Автоподтверждение сделок** — по ключевым фразам в названии (`conf/auto_complete_deals.json`).
 * **Пользовательские команды** — триггеры в чате на площадке (`conf/custom_commands.json`).
@@ -144,3 +144,4 @@ python main.py
 ---
 
 *Версия: `lib/consts.py` → `VERSION`.*
+
