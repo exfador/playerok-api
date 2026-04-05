@@ -94,6 +94,7 @@ sudo INSTALL_DIR=/opt/playerok-api bash install_playerok_api.sh
 ```bash
 screen -S playerok
 cd /root/playerok-api
+python3.11 -m pip install "setuptools==68.2.2"
 python3.11 main.py
 ```
 
