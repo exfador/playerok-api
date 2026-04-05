@@ -1,365 +1,412 @@
+
 import asyncio
 import logging
 import os
+import signal
 import sys
-from colorama import Fore, init as init_colorama
-from keel.netfix import apply_tls_patch
+from typing import Dict, Any, Optional, List
+
+from colorama import Fore, init as colorama_init
+
+from lib.tls_patch import apply_tls_patch
+
 apply_tls_patch()
-from keel.tone import VERSION, C_PRIMARY, C_DIM, C_BRIGHT, C_SUCCESS, C_WARNING, C_ERROR, C_TEXT
-from keel.shelf import ConfigShelf as cfg, hash_password
-from keel.kit import (
-    clear_terminal, set_console_title, setup_logging, check_requirements, monkey_patch_http,
-    bind_loop, spawn_async, setup_prompt,
-    token_ok, account_reachable, account_banned,
-    ua_ok, proxy_ok, proxy_reachable, tg_token_ok, tg_ok, tg_api_reachable, password_ok,
-)
-from keel.graft import harvest_grafts, publish_grafts, ignite_grafts
-from keel.relay import broadcast
 
-log = logging.getLogger('app.boot')
+import lib.consts as const
+import lib.cfg as cfgmod
+import lib.util as ut
+import lib.ext as extmod
+import lib.bus as busmod
 
-try:
-    main_loop = asyncio.get_running_loop()
-except RuntimeError:
-    main_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(main_loop)
-init_colorama()
-bind_loop(main_loop)
+LOG = logging.getLogger('cxh.boot')
+COLOR_MAP = {
+    'primary': const.C_PRIMARY,
+    'success': const.C_SUCCESS,
+    'warning': const.C_WARNING,
+    'error': const.C_ERROR,
+    'text': const.C_TEXT,
+    'dim': const.C_DIM,
+    'bright': const.C_BRIGHT,
+}
 
 
-def _blank(v) -> bool:
-    return v == ''
+class CXHBot:
 
+    def __init__(self):
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
+        self._shutdown_flag = False
 
-def _need_fields(config: dict) -> int:
-    fields = [
-        config['bot']['token'],
-        config['bot']['password_hash'],
-        config['bot']['proxy'],
-        config['account']['token'],
-        config['account']['proxy'],
-        config['account']['user_agent'],
-    ]
-    return max(sum(1 for f in fields if _blank(f)), 1)
+    @staticmethod
+    def _log_status(level: str, msg: str, *, icon: str = '', newline: bool = True) -> None:
+        color = COLOR_MAP.get(level, Fore.RESET)
+        icon_map = {
+            'success': f'{const.C_SUCCESS}✓{Fore.RESET}',
+            'error': f'{const.C_ERROR}✗{Fore.RESET}',
+            'skip': f'{const.C_DIM}–{Fore.RESET}',
+            'note': f'{const.C_DIM}·{Fore.RESET}',
+            'warn': f'{const.C_WARNING}⚠{Fore.RESET}',
+        }
+        used_icon = icon or icon_map.get(level, '')
+        if used_icon:
+            line = f'{used_icon} {color}{msg}{Fore.RESET}'
+        else:
+            line = f'{color}{msg}{Fore.RESET}'
+        LOG.info(line + ('\n' if newline else ''))
 
-
-async def _trim_log():
-    path = 'logs/bot.log'
-    while True:
+    @staticmethod
+    def _flush_output() -> None:
+        for h in logging.root.handlers:
+            try:
+                h.flush()
+            except OSError:
+                pass
         try:
-            c = cfg.get('config') or {}
-            max_mb = (c.get('logs') or {}).get('max_mb', 300)
-            if os.path.exists(path):
-                size_mb = os.path.getsize(path) / (1024 * 1024)
-                if size_mb > max_mb:
-                    open(path, 'w').close()
+            sys.stdout.flush()
+            sys.stderr.flush()
         except OSError:
             pass
-        await asyncio.sleep(30)
 
-
-async def _start_panel():
-    from trellis.facade import Facade
-    spawn_async(Facade().operate)
-
-
-async def _start_engine():
-    from chamber.supervisor import Supervisor
-    from moor.kinds import TransportShakeError
-    try:
-        rt = Supervisor()
-        await rt.operate()
-    except TransportShakeError as e:
-        log.error('  %s✗%s  Playerok недоступен (прокси или сеть).', C_ERROR, Fore.RESET)
-        log.error('  %s%s', C_TEXT, str(e)[:500])
-        log.error(
-            '  %sПроверьте account.proxy в conf/config.json (socks5h:… для SOCKS5) или оставьте пустым; '
-            'узел прокси и белый список IP у провайдера.%s',
-            C_DIM,
-            Fore.RESET,
-        )
-        raise SystemExit(1) from None
-
-
-def _header() -> str:
-    line = f'{C_DIM}  {"━" * 50}{Fore.RESET}'
-    name = f'{C_PRIMARY}CXH Playerok{Fore.RESET}  {C_DIM}{VERSION}{Fore.RESET}'
-    tagline = f'{C_DIM}автоматизация продаж на Playerok{Fore.RESET}'
-    return f'\n{line}\n  {name}\n  {tagline}\n{line}\n'
-
-
-def _done(msg: str):
-    log.info(f'  {C_SUCCESS}✓{Fore.RESET}  {C_BRIGHT}{msg}{Fore.RESET}\n')
-
-
-def _fail(msg: str):
-    log.error(f'  {C_ERROR}✗{Fore.RESET}  {C_TEXT}{msg}{Fore.RESET}\n')
-
-
-def _skip(msg: str):
-    log.info(f'  {C_DIM}–{Fore.RESET}  {C_DIM}{msg}{Fore.RESET}\n')
-
-
-def _note(msg: str):
-    log.info(f'  {C_DIM}·{Fore.RESET}  {C_DIM}{msg}{Fore.RESET}\n')
-
-
-def _flush_out():
-    for h in logging.root.handlers:
-        try:
-            h.flush()
-        except OSError:
-            pass
-    try:
-        sys.stdout.flush()
-        sys.stderr.flush()
-    except OSError:
-        pass
-
-
-def _test_connections(config: dict, *, verbose: bool = True) -> bool:
-    if config['account']['proxy']:
-        if not proxy_reachable(config['account']['proxy']):
-            _fail('Прокси Playerok недоступен — проверьте сеть/прокси или смените в настройках')
-            return False
-        if verbose:
-            _done('Прокси Playerok — соединение есть')
-
-    if not account_reachable():
-        _fail('Не удалось войти в аккаунт Playerok — токен/сеть/прокси; конфиг не менялся')
-        return False
-    if verbose:
-        _done('Playerok — аккаунт авторизован')
-
-    if account_banned():
-        _fail('Аккаунт заблокирован на платформе — конфиг не менялся')
+    def _is_field_empty(self, cfg: Dict[str, Any], *keys: str) -> bool:
+        for key in keys:
+            val = cfg
+            for part in key.split('.'):
+                val = val.get(part, '')
+                if val is None:
+                    break
+            if not val:
+                return True
         return False
 
-    if config['bot']['proxy']:
-        if not proxy_reachable(config['bot']['proxy'], 'https://api.telegram.org/'):
-            _fail('Прокси Telegram недоступен — проверьте или отключите прокси в настройках')
+    async def _test_all_connections(self, cfg: Dict[str, Any], quiet: bool = False) -> bool:
+        if cfg['account']['proxy']:
+            if not ut.proxy_reachable(cfg['account']['proxy']):
+                if not quiet:
+                    self._log_status('error', 'Прокси Playerok недоступен')
+                return False
+            if not quiet:
+                self._log_status('success', 'Прокси Playerok в порядке')
+
+        if not ut.account_reachable():
+            self._log_status('error', 'Playerok: аккаунт, токен или сеть — ошибка')
             return False
-        if verbose:
-            _done('Прокси Telegram — соединение есть')
-
-    if not tg_ok():
-        if not tg_api_reachable(config['bot'].get('proxy')):
-            _fail('Не удаётся достучаться до api.telegram.org — укажите прокси для Telegram или VPN (часто в РФ без этого Telegram API недоступен)')
+        if not quiet:
+            self._log_status('success', 'Аккаунт Playerok доступен')
+        if ut.account_banned():
+            self._log_status('error', 'Аккаунт заблокирован на Playerok')
             return False
-        _fail('Неверный или отозванный токен бота — замените в conf/config.json или настройках; конфиг не менялся')
-        return False
 
-    if verbose:
-        _done('Telegram-бот доступен')
-    else:
-        _done('Playerok и Telegram — всё в порядке')
-    return True
+        if cfg['bot']['proxy']:
+            if not ut.proxy_reachable(cfg['bot']['proxy'], 'https://api.telegram.org/'):
+                if not quiet:
+                    self._log_status('error', 'Прокси Telegram недоступен')
+                return False
+            if not quiet:
+                self._log_status('success', 'Прокси Telegram в порядке')
 
+        if not ut.tg_ok():
+            if not ut.tg_api_reachable(cfg['bot'].get('proxy')):
+                self._log_status('error', 'api.telegram.org недоступен — нужны прокси или VPN')
+                return False
+            self._log_status('error', 'Неверный токен бота Telegram')
+            return False
+        if not quiet:
+            self._log_status('success', 'Бот Telegram в порядке')
 
-def first_launch():
-    while True:
-        config = cfg.get('config')
-        total = _need_fields(config)
+        if not quiet:
+            self._log_status('success', 'Все проверки связи пройдены')
+        return True
+
+    async def _interactive_config(self) -> None:
+        config = cfgmod.AppConf.read('config')
+
+        if config['bot'].get('token') and config['bot'].get('password_hash') and config['account'].get('token'):
+            patched = False
+            if not (config['bot'].get('proxy') or '') and not config['bot'].get('proxy_prompt_ok'):
+                config['bot']['proxy_prompt_ok'] = True
+                patched = True
+            if not (config['account'].get('proxy') or '') and not config['account'].get('proxy_prompt_ok'):
+                config['account']['proxy_prompt_ok'] = True
+                patched = True
+            if not (config['account'].get('user_agent') or '') and not config['account'].get('user_agent_prompt_ok'):
+                config['account']['user_agent_prompt_ok'] = True
+                patched = True
+            if patched:
+                cfgmod.AppConf.write('config', config)
+
+        def _wizard_step_count(c: Dict[str, Any]) -> int:
+            n = 0
+            if not c['bot']['token']:
+                n += 1
+            if not c['bot']['password_hash']:
+                n += 1
+            if not (c['bot'].get('proxy') or '') and not c['bot'].get('proxy_prompt_ok'):
+                n += 1
+            if not c['account']['token']:
+                n += 1
+            if not (c['account'].get('proxy') or '') and not c['account'].get('proxy_prompt_ok'):
+                n += 1
+            if not (c['account'].get('user_agent') or '') and not c['account'].get('user_agent_prompt_ok'):
+                n += 1
+            return max(n, 1)
+
+        total_fields = _wizard_step_count(config)
         step = 0
-        was_prompted = False
+        prompted = False
 
-        def _field(label: str, hints: list[str], ex: str = '', note: str = '') -> str:
-            nonlocal step, was_prompted
-            was_prompted = True
+        def ask_step(label: str, desc: List[str], example: str = '', skip_allowed: bool = False) -> Optional[str]:
+            nonlocal step
             step += 1
-            return setup_prompt(step, total, label, hints, ex, note)
+            raw = ut.setup_prompt(step, total_fields, label, desc, example)
+            if skip_allowed and raw == '':
+                return None
+            return raw
 
         while not config['bot']['token']:
-            val = _field(
-                'Токен Telegram-бота',
-                [
-                    'Используется для управления ботом через Telegram.',
-                    '',
-                    'Как получить:',
-                    '  1. Откройте @BotFather в Telegram',
-                    '  2. Отправьте команду /newbot',
-                    '  3. Скопируйте выданный токен',
-                ],
-                ex='123456789:abcdefghijklmnopqrstuvwxyz123456789',
+            val = ask_step(
+                'Токен бота Telegram',
+                ['В @BotFather выполните /newbot и скопируйте токен'],
+                example='123456789:AA...',
             )
-            if tg_token_ok(val):
+            if ut.tg_token_ok(val):
                 config['bot']['token'] = val
-                cfg.set('config', config)
-                _done('Токен сохранён')
+                cfgmod.AppConf.write('config', config)
+                self._log_status('success', 'Токен Telegram сохранён')
+                prompted = True
             else:
                 step -= 1
-                _fail('Формат не распознан — ожидается ID:hash')
+                self._log_status('error', 'Неверный формат токена (ожидается id:hash)')
 
         while not config['bot']['password_hash']:
-            val = _field(
+            val = ask_step(
                 'Пароль панели управления',
-                [
-                    'Вводится при каждом входе в Telegram-бот.',
-                    '',
-                    'Требования:',
-                    '  от 6 до 64 символов',
-                    '  не должен быть тривиальным',
-                ],
+                ['6–64 символа, надёжный, не из простых словарей'],
             )
-            if password_ok(val):
-                config['bot']['password_hash'] = hash_password(val)
-                cfg.set('config', config)
-                _done('Пароль установлен')
+            if ut.password_ok(val):
+                config['bot']['password_hash'] = cfgmod.hash_password(val)
+                cfgmod.AppConf.write('config', config)
+                self._log_status('success', 'Пароль сохранён')
+                prompted = True
             else:
                 step -= 1
-                _fail('Пароль слишком простой')
+                self._log_status('error', 'Слабый или недопустимый пароль')
 
-        if _blank(config['bot']['proxy']):
-            val = _field(
-                'Прокси для Telegram',
+        if not (config['bot'].get('proxy') or '') and not config['bot'].get('proxy_prompt_ok'):
+            val = ask_step(
+                'Прокси для Telegram (Enter — пропустить)',
                 [
-                    'Нужен если Telegram заблокирован в вашей сети.',
-                    '',
-                    'Формат:',
-                    '  user:pass@host:port',
-                    '  socks5h:host:port:user:pass  (резидентский SOCKS5)',
-                    '  host:port:user:pass  (только HTTP CONNECT, не SOCKS)',
-                    '  socks5h://user:pass@host:port',
-                    '  host:port  (без авторизации)',
-                    '',
-                    '→ Enter, чтобы пропустить',
+                    'Форматы: user:pass@host:port, socks5h:host:port:user:pass',
+                    'Из РФ часто нужен прокси или VPN до api.telegram.org',
                 ],
-                ex='user:pass@185.10.20.30:8080',
-                note='Обязателен для РФ без VPN.',
+                example='user:pass@1.2.3.4:8080',
+                skip_allowed=True,
             )
-            if not val:
-                config['bot']['proxy'] = None
-                cfg.set('config', config)
-                _skip('Прокси не задан')
-            elif proxy_ok(val):
-                config['bot']['proxy'] = val
-                cfg.set('config', config)
-                _done('Прокси сохранён')
-            else:
-                _fail('Неверный формат адреса')
+            if val is None:
                 config['bot']['proxy'] = ''
+                config['bot']['proxy_prompt_ok'] = True
+                cfgmod.AppConf.write('config', config)
+                self._log_status('skip', 'Прокси Telegram не задан')
+                prompted = True
+            elif val:
+                if ut.proxy_ok(val):
+                    config['bot']['proxy'] = val
+                    config['bot']['proxy_prompt_ok'] = True
+                    cfgmod.AppConf.write('config', config)
+                    self._log_status('success', 'Прокси Telegram сохранён')
+                    prompted = True
+                else:
+                    self._log_status('error', 'Некорректный формат прокси')
+                    config['bot']['proxy'] = ''
 
         while not config['account']['token']:
-            val = _field(
-                'JWT токен Playerok (cookie «token»)',
+            val = ask_step(
+                'JWT Playerok (из cookie)',
                 [
-                    'JWT авторизованной сессии на playerok.com.',
-                    '',
-                    'Как получить:',
-                    '  1. Войдите на playerok.com в браузере',
-                    '  2. Откройте инструменты разработчика (F12) → вкладка Application / Хранилище',
-                    '  3. В разделе Cookies для playerok.com скопируйте значение cookie с именем token',
+                    'playerok.com → расширение Cookie-Editor → поле «token»',
                 ],
-                ex='eyJhbGci...eyJzdWIi...signature',
+                example='eyJ...',
             )
-            if token_ok(val):
+            if ut.token_ok(val):
                 config['account']['token'] = val
-                cfg.set('config', config)
-                _done('Токен принят')
+                cfgmod.AppConf.write('config', config)
+                self._log_status('success', 'Токен Playerok сохранён')
+                prompted = True
             else:
                 step -= 1
-                _fail('Не похоже на JWT — должен содержать три части через точку')
+                self._log_status('error', 'Строка не похожа на корректный JWT')
 
-        if _blank(config['account']['proxy']):
-            val = _field(
-                'Прокси для Playerok (JWT / запросы к площадке)',
+        if not (config['account'].get('proxy') or '') and not config['account'].get('proxy_prompt_ok'):
+            val = ask_step(
+                'Прокси Playerok (Enter — пропустить)',
                 [
-                    'HTTP или SOCKS5 к playerok.com.',
-                    '',
-                    'Формат:',
-                    '  user:pass@host:port',
-                    '  socks5h:host:port:user:pass  (резидентский SOCKS5)',
-                    '  host:port:user:pass  (только HTTP, не SOCKS)',
-                    '  socks5h://user:pass@host:port',
-                    '  host:port  (без авторизации)',
-                    '',
-                    '→ Enter, чтобы пропустить',
+                    'Те же форматы, что и для Telegram — HTTP/SOCKS5 до playerok.com',
                 ],
-                ex='user:pass@185.10.20.30:8080',
+                example='socks5h:host:port:user:pass',
+                skip_allowed=True,
             )
-            if not val:
-                config['account']['proxy'] = None
-                cfg.set('config', config)
-                _skip('Прокси не задан')
-            elif proxy_ok(val):
-                config['account']['proxy'] = val
-                cfg.set('config', config)
-                _done('Прокси сохранён')
-            else:
-                _fail('Неверный формат адреса')
+            if val is None:
                 config['account']['proxy'] = ''
+                config['account']['proxy_prompt_ok'] = True
+                cfgmod.AppConf.write('config', config)
+                self._log_status('skip', 'Прокси Playerok не задан')
+                prompted = True
+            elif val:
+                if ut.proxy_ok(val):
+                    config['account']['proxy'] = val
+                    config['account']['proxy_prompt_ok'] = True
+                    cfgmod.AppConf.write('config', config)
+                    self._log_status('success', 'Прокси Playerok сохранён')
+                    prompted = True
+                else:
+                    self._log_status('error', 'Некорректный формат прокси')
+                    config['account']['proxy'] = ''
 
-        if _blank(config['account']['user_agent']):
-            val = _field(
-                'User-Agent браузера (Playerok)',
+        if not (config['account'].get('user_agent') or '') and not config['account'].get('user_agent_prompt_ok'):
+            val = ask_step(
+                'User-Agent браузера для Playerok (Enter — пропустить, нежелательно)',
                 [
-                    'Идентифицирует ваш клиент при запросах к Playerok.',
-                    'Без него авторизация может не пройти.',
-                    '',
-                    'Скопируйте заголовок User-Agent из того же браузера, где вы вошли на сайт:',
-                    '  Chrome / Edge: F12 → Network → любой запрос к playerok.com → Request Headers',
-                    '  Firefox: about:support → «Копировать данные» и найдите строку user agent',
-                    '',
-                    '→ Enter, чтобы пропустить (не рекомендуется)',
+                    'whatmyuseragent.com — скопируйте полную строку',
                 ],
-                ex='Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/144',
+                example='Mozilla/5.0 … Chrome/144',
+                skip_allowed=True,
             )
-            if not val:
-                config['account']['user_agent'] = None
-                cfg.set('config', config)
-                _skip('User-Agent не задан')
-            elif ua_ok(val):
-                config['account']['user_agent'] = val
-                cfg.set('config', config)
-                _done('User-Agent сохранён')
-            else:
-                _fail('Строка слишком короткая или содержит недопустимые символы')
+            if val is None:
                 config['account']['user_agent'] = ''
+                config['account']['user_agent_prompt_ok'] = True
+                cfgmod.AppConf.write('config', config)
+                self._log_status('skip', 'User-Agent не задан — возможны сбои запросов')
+                prompted = True
+            elif val:
+                if ut.ua_ok(val):
+                    config['account']['user_agent'] = val
+                    config['account']['user_agent_prompt_ok'] = True
+                    cfgmod.AppConf.write('config', config)
+                    self._log_status('success', 'User-Agent сохранён')
+                    prompted = True
+                else:
+                    self._log_status('error', 'Некорректный User-Agent')
+                    config['account']['user_agent'] = ''
 
-        config = cfg.get('config')
-        if was_prompted:
-            log.info(f'  {C_DIM}{"─" * 44}{Fore.RESET}\n')
-        _note('Проверяю соединения (Playerok, Telegram — до ~1 мин. при медленной сети)…')
-        _flush_out()
-        if _test_connections(config, verbose=was_prompted):
-            break
-        log.warning(
-            f'  {C_WARNING}↻  Проверка не прошла{Fore.RESET} {C_DIM}— сохранённый conf/config.json не изменён.{Fore.RESET}\n'
-        )
-        log.info(
-            f'  {C_DIM}Исправьте сеть, токены или прокси в conf/config.json и нажмите Enter для повторной проверки '
-            f'(Ctrl+C — выход).{Fore.RESET}\n'
+        config = cfgmod.AppConf.read('config')
+        self._log_status('note', 'Проверка сети и токенов…')
+        self._flush_output()
+        if await self._test_all_connections(config, quiet=not prompted):
+            return
+        self._log_status('warn', 'Проверка связи не пройдена — конфигурация не изменена')
+        self._log_status(
+            'dim',
+            'Исправьте токены, прокси или сеть. Enter — повторить, Ctrl+C — выход',
         )
         try:
-            input()
+            await asyncio.get_event_loop().run_in_executor(None, input)
         except (EOFError, KeyboardInterrupt):
             raise SystemExit(1) from None
+        await self._interactive_config()
+
+    async def _auto_maintenance(self) -> None:
+        while not self._shutdown_flag:
+            await asyncio.sleep(45)
+            try:
+                log_path = ut.get_bot_log_path()
+                conf = cfgmod.AppConf.read('config') or {}
+                max_mb = (conf.get('logs') or {}).get('max_mb', 300)
+                if os.path.exists(log_path):
+                    sz_mb = os.path.getsize(log_path) / (1024 * 1024)
+                    if sz_mb > max_mb:
+                        open(log_path, 'w').close()
+            except OSError:
+                pass
+
+    async def _launch_telegram_panel(self) -> None:
+        from ctrl.panel import Panel
+        panel = Panel()
+        try:
+            async def _panel_poll():
+                await panel.run_bot()
+            asyncio.create_task(_panel_poll(), name='tg_panel')
+        except TypeError:
+            asyncio.create_task(_panel_poll())
+        LOG.info('Панель Telegram запущена — лог: %s', ut.get_bot_log_path())
+
+    async def _launch_market_engine(self) -> None:
+        from bot.core import make_bridge
+        from pok.defs import RequestSendingError
+        try:
+            bridge = make_bridge()
+            await bridge.start()
+        except RequestSendingError as exc:
+            LOG.error('  %s✗%s  Playerok недоступен: проверьте прокси и сеть.', const.C_ERROR, Fore.RESET)
+            LOG.error('  %s%s', const.C_TEXT, str(exc)[:500])
+            LOG.error('  %sПроверьте account.proxy в conf/config.json%s', const.C_DIM, Fore.RESET)
+            raise SystemExit(1) from None
+
+    async def _run(self) -> None:
+        ut.clear_terminal()
+        quick_restart = os.environ.pop('CXH_FAST_REBOOT', None) == '1'
+        ut.check_requirements('requirements.txt')
+        ut.monkey_patch_http()
+        ut.setup_logging()
+        ut.set_console_title(f'CXH Playerok {const.VERSION}')
+
+        if quick_restart:
+            LOG.info('%s↻ Перезапуск%s %s%s', const.C_DIM, Fore.RESET, const.VERSION, Fore.RESET)
+        else:
+            LOG.info(
+                '%sCXH Playerok%s %s%s · автоматизация%s',
+                const.C_PRIMARY,
+                Fore.RESET,
+                const.C_DIM,
+                const.VERSION,
+                Fore.RESET,
+            )
+
+        await self._interactive_config()
+
+        extensions = extmod.discover_extensions()
+        extmod.register_extensions(extensions)
+        await extmod.activate_extensions(extensions)
+
+        engine_task = asyncio.create_task(self._launch_market_engine(), name='engine')
+        panel_task = asyncio.create_task(self._launch_telegram_panel(), name='panel')
+        maint_task = asyncio.create_task(self._auto_maintenance(), name='maintenance')
+
+        await busmod.fire('BOOT')
+
+        try:
+            await asyncio.gather(engine_task, panel_task, maint_task)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._shutdown_flag = True
+
+    def run(self) -> None:
+        try:
+            self.loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
+        colorama_init()
+        ut.bind_loop(self.loop)
+
+        def _shutdown_handler():
+            for task in asyncio.all_tasks(self.loop):
+                task.cancel()
+            self.loop.stop()
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                self.loop.add_signal_handler(sig, _shutdown_handler)
+            except NotImplementedError:
+                pass
+
+        try:
+            self.loop.run_until_complete(self._run())
+            self.loop.run_forever()
+        except KeyboardInterrupt:
+            LOG.info('%sЗавершение по Ctrl+C%s', const.C_WARNING, Fore.RESET)
+        finally:
+            self.loop.close()
 
 
 if __name__ == '__main__':
-    try:
-        clear_terminal()
-        _reboot = os.environ.pop('CXH_QUICK_REBOOT', None) == '1' or os.environ.pop('CHX_QUICK_REBOOT', None) == '1'
-        logging.getLogger('urllib3').setLevel(logging.WARNING)
-        logging.getLogger('urllib3.connectionpool').setLevel(logging.WARNING)
-        logging.getLogger('tls_requests').setLevel(logging.WARNING)
-        check_requirements('requirements.txt')
-        monkey_patch_http()
-        setup_logging()
-        set_console_title(f'CXH Playerok {VERSION}')
-        if _reboot:
-            log.info(f'\n  {C_DIM}↻  CXH Playerok  {VERSION}  перезапуск{Fore.RESET}\n')
-        else:
-            log.info(_header())
-        first_launch()
-        extensions = harvest_grafts()
-        publish_grafts(extensions)
-        main_loop.run_until_complete(ignite_grafts(extensions))
-
-        main_loop.run_until_complete(_start_engine())
-        main_loop.run_until_complete(_start_panel())
-        main_loop.create_task(_trim_log())
-        main_loop.run_until_complete(broadcast('BOOT_TAIL'))
-        main_loop.run_forever()
-    except Exception:
-        log.exception('Критическая ошибка. Проверьте конфигурацию и перезапустите.')
+    bot = CXHBot()
+    bot.run()

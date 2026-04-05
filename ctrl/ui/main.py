@@ -3,75 +3,76 @@ import html as html_module
 from urllib.parse import quote
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from uuid import UUID
-from keel.tone import VERSION
+from lib.consts import VERSION
 from lib.util import iso_to_display_str
-from keel.shelf import ConfigShelf as cfg
-from keel.graft import all_grafts, Graft, seek_graft
+from lib.cfg import AppConf as cfg
+from lib.ext import all_extensions, Extension, find_extension
 from .. import keys as calls
-from .settings import _tpl_label
+from ..cb import CX
+from .settings import fac_013
 
 
-def _brand_line() -> str:
+def fac_003() -> str:
     return f'<b>CXH Playerok</b>  <code>v{VERSION}</code>'
 
 
-def error_text(placeholder: str) -> str:
+def fac_018(placeholder: str) -> str:
     return (
         '⛔ <b>Что-то пошло не так</b>\n\n'
         f'<b>Подробности:</b>\n<blockquote>{placeholder}</blockquote>'
     )
 
 
-def back_kb(cb: str) -> InlineKeyboardMarkup:
+def fac_023(cb: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='⬅️ Назад', callback_data=cb)]])
 
 
-def confirm_kb(confirm_cb: str, cancel_cb: str) -> InlineKeyboardMarkup:
+def fac_024(confirm_cb: str, cancel_cb: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text='✅  Подтвердить', callback_data=confirm_cb),
         InlineKeyboardButton(text='✕  Отмена', callback_data=cancel_cb),
     ]])
 
 
-def destroy_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='✕  Закрыть', callback_data='destroy')]])
+def fac_016() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='✕  Закрыть', callback_data=CX.dismiss)]])
 
 
-def do_action_text(placeholder: str) -> str:
+def fac_017(placeholder: str) -> str:
     return f'✅ <b>Готово</b>\n\n{placeholder}'
 
 
-def log_text(title: str, text: str) -> str:
+def fac_034(title: str, text: str) -> str:
     return f'{title}\n\n{text}'
 
 
-def log_restore_ok_kb() -> InlineKeyboardMarkup:
+def fac_031() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text='♻️ Авто-восстановление', callback_data=calls.SettingsNavigation(to='restore').pack())],
+        [InlineKeyboardButton(text='♻️ Авто-восстановление', callback_data=calls.PduPrefsScope(to='restore').pack())],
     ])
 
 
-def log_bump_ok_kb() -> InlineKeyboardMarkup:
+def fac_025() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text='🔼 Авто-поднятие', callback_data=calls.SettingsNavigation(to='bump').pack())],
+        [InlineKeyboardButton(text='🔼 Авто-поднятие', callback_data=calls.PduPrefsScope(to='bump').pack())],
     ])
 
 
-def log_new_mess_kb(username: str, chat_id: str | None = None) -> InlineKeyboardMarkup:
+def fac_029(username: str, chat_id: str | None = None) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     if chat_id:
         rows.append([
             InlineKeyboardButton(text='↗  Перейти в чат', url=f'https://playerok.com/chats/{chat_id}'),
-            InlineKeyboardButton(text='📜  Больше', callback_data=calls.LogChatHistory(chat_id=chat_id, page=0).pack()),
+            InlineKeyboardButton(text='📜  Больше', callback_data=calls.PduLogChatScroll(chat_id=chat_id, page=0).pack()),
         ])
     rows.append([
-        InlineKeyboardButton(text='💬  Ответить', callback_data=calls.RememberUsername(name=username, do='send_mess').pack()),
-        InlineKeyboardButton(text='📋  Шаблоны', callback_data=calls.RememberUsername(name=username, do='tpl_list').pack()),
+        InlineKeyboardButton(text='💬  Ответить', callback_data=calls.PduNickMemo(name=username, do='send_mess').pack()),
+        InlineKeyboardButton(text='📋  Шаблоны', callback_data=calls.PduNickMemo(name=username, do='tpl_list').pack()),
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def log_chat_only_kb(chat_id: str | None) -> InlineKeyboardMarkup | None:
+def fac_027(chat_id: str | None) -> InlineKeyboardMarkup | None:
     if not chat_id:
         return None
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -79,8 +80,8 @@ def log_chat_only_kb(chat_id: str | None) -> InlineKeyboardMarkup | None:
     ])
 
 
-def chat_history_chunks(messages: list, our_user_id: str) -> list[str]:
-    from chamber.supervisor import message_body_html
+def fac_015(messages: list, our_user_id: str) -> list[str]:
+    from bot.core import message_body_html
     header = (
         '📜 <b>История чата</b>\n'
         'Ниже до <b>25</b> последних сообщений: от старых к новым, время — по часовому поясу вашего ПК.\n\n'
@@ -132,7 +133,7 @@ def chat_history_chunks(messages: list, our_user_id: str) -> list[str]:
     return chunks
 
 
-def log_chat_history_kb(chat_id: str, page: int, total_pages: int) -> InlineKeyboardMarkup:
+def fac_026(chat_id: str, page: int, total_pages: int) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     if total_pages > 1:
         prev_p = max(0, page - 1)
@@ -140,22 +141,22 @@ def log_chat_history_kb(chat_id: str, page: int, total_pages: int) -> InlineKeyb
         rows.append([
             InlineKeyboardButton(
                 text='◀️ Ранее',
-                callback_data=calls.LogChatHistory(chat_id=chat_id, page=prev_p).pack(),
+                callback_data=calls.PduLogChatScroll(chat_id=chat_id, page=prev_p).pack(),
             ),
             InlineKeyboardButton(
                 text=f'📄 {page + 1} / {total_pages}',
-                callback_data=calls.LogChatHistory(chat_id=chat_id, page=page).pack(),
+                callback_data=calls.PduLogChatScroll(chat_id=chat_id, page=page).pack(),
             ),
             InlineKeyboardButton(
                 text='Далее ▶️',
-                callback_data=calls.LogChatHistory(chat_id=chat_id, page=next_p).pack(),
+                callback_data=calls.PduLogChatScroll(chat_id=chat_id, page=next_p).pack(),
             ),
         ])
-    rows.append([InlineKeyboardButton(text='⬅️ К уведомлению', callback_data='back_to_notification')])
+    rows.append([InlineKeyboardButton(text='⬅️ К уведомлению', callback_data=CX.evt_back)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def log_templates_text(username: str, page: int, order: list[str]) -> str:
+def fac_033(username: str, page: int, order: list[str]) -> str:
     per_page = 7
     n = len(order)
     total_pages = max(1, math.ceil(n / per_page) if n else 1)
@@ -170,8 +171,8 @@ def log_templates_text(username: str, page: int, order: list[str]) -> str:
     return head
 
 
-def log_templates_kb(page: int, order: list[str]) -> InlineKeyboardMarkup:
-    messages = cfg.get('messages') or {}
+def fac_032(page: int, order: list[str]) -> InlineKeyboardMarkup:
+    messages = cfg.read('messages') or {}
     per_page = 7
     n = len(order)
     total_pages = max(1, math.ceil(n / per_page) if n else 1)
@@ -182,43 +183,43 @@ def log_templates_kb(page: int, order: list[str]) -> InlineKeyboardMarkup:
     for i, mess_id in enumerate(slice_):
         msg_idx = start_idx + i
         info = messages.get(mess_id, {})
-        label = _tpl_label(mess_id, info)
+        label = fac_013(mess_id, info)
         display = label if len(label) <= 36 else label[:33] + '…'
         rows.append([InlineKeyboardButton(
             text=f'📄 {display}',
-            callback_data=calls.LogTemplateSend(idx=msg_idx).pack(),
+            callback_data=calls.PduLogTplFire(idx=msg_idx).pack(),
         )])
     nav_row = []
     if page > 0:
-        nav_row.append(InlineKeyboardButton(text='◀ Пред.', callback_data=calls.LogTemplateMenu(page=page - 1).pack()))
+        nav_row.append(InlineKeyboardButton(text='◀ Пред.', callback_data=calls.PduLogTplMenu(page=page - 1).pack()))
     if page < total_pages - 1:
-        nav_row.append(InlineKeyboardButton(text='След. ▶', callback_data=calls.LogTemplateMenu(page=page + 1).pack()))
+        nav_row.append(InlineKeyboardButton(text='След. ▶', callback_data=calls.PduLogTplMenu(page=page + 1).pack()))
     if nav_row:
         rows.append(nav_row)
-    rows.append([InlineKeyboardButton(text='⬅️ К уведомлению', callback_data='back_to_notification')])
+    rows.append([InlineKeyboardButton(text='⬅️ К уведомлению', callback_data=CX.evt_back)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def log_new_deal_kb(username: str, deal_id: str) -> InlineKeyboardMarkup:
+def fac_028(username: str, deal_id: str) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = [
         [
-            InlineKeyboardButton(text='💬  Ответить', callback_data=calls.RememberUsername(name=username, do='send_mess').pack()),
-            InlineKeyboardButton(text='📋  Шаблоны', callback_data=calls.RememberUsername(name=username, do='tpl_list').pack()),
+            InlineKeyboardButton(text='💬  Ответить', callback_data=calls.PduNickMemo(name=username, do='send_mess').pack()),
+            InlineKeyboardButton(text='📋  Шаблоны', callback_data=calls.PduNickMemo(name=username, do='tpl_list').pack()),
         ],
     ]
-    rows.append([InlineKeyboardButton(text='✅  Закрыть сделку', callback_data=calls.RememberDealId(de_id=deal_id, do='complete').pack())])
-    rows.append([InlineKeyboardButton(text='↩️  Возврат', callback_data=calls.RememberDealId(de_id=deal_id, do='refund').pack())])
+    rows.append([InlineKeyboardButton(text='✅  Закрыть сделку', callback_data=calls.PduDealMemo(de_id=deal_id, do='complete').pack())])
+    rows.append([InlineKeyboardButton(text='↩️  Возврат', callback_data=calls.PduDealMemo(de_id=deal_id, do='refund').pack())])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def log_new_review_kb(username: str, deal_id: str) -> InlineKeyboardMarkup:
+def fac_030(username: str, deal_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text='⭐  К отзыву', callback_data=calls.RememberDealId(de_id=deal_id, do='answer_rev').pack()),
-        InlineKeyboardButton(text='💬  Написать', callback_data=calls.RememberUsername(name=username, do='send_mess').pack()),
+        InlineKeyboardButton(text='⭐  К отзыву', callback_data=calls.PduDealMemo(de_id=deal_id, do='answer_rev').pack()),
+        InlineKeyboardButton(text='💬  Написать', callback_data=calls.PduNickMemo(name=username, do='send_mess').pack()),
     ]])
 
 
-def sign_in_prompt_text() -> str:
+def fac_120() -> str:
     return (
         '🔐 <b>Вход в панель</b>\n\n'
         'Отправьте пароль, который вы задали при первом запуске бота.\n\n'
@@ -226,45 +227,63 @@ def sign_in_prompt_text() -> str:
     )
 
 
-def sign_text(placeholder: str) -> str:
+def fac_121(placeholder: str) -> str:
     return f'🔐 <b>Вход</b>\n\n{placeholder}'
 
 
-def call_seller_text(calling_name: str, chat_link: str) -> str:
+def fac_014(calling_name: str, chat_link: str) -> str:
     return f'🔔 <b>{calling_name}</b> вызывает вас в чат\n\n{chat_link}'
 
 
-def menu_text() -> str:
+def fac_040() -> str:
     return (
         '🏠 <b>Главное меню</b>\n\n'
-        f'{_brand_line()}\n\n'
+        f'{fac_003()}\n\n'
         'Профиль, уведомления и расширения — кнопками ниже. Настройки бота и статистика — в разделе «Настройки».'
     )
 
 
-def menu_kb() -> InlineKeyboardMarkup:
+def fac_039() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text='⚙️ Настройки', callback_data=calls.SettingsNavigation(to='index').pack()),
-            InlineKeyboardButton(text='👤 Профиль', callback_data=calls.MenuNavigation(to='profile').pack()),
+            InlineKeyboardButton(text='⚙️ Настройки', callback_data=calls.PduPrefsScope(to='index').pack()),
+            InlineKeyboardButton(text='👤 Профиль', callback_data=calls.PduRootNav(to='profile').pack()),
         ],
         [
-            InlineKeyboardButton(text='🔔 Уведомления', callback_data=calls.MenuNavigation(to='logger').pack()),
-            InlineKeyboardButton(text='🧩 Расширения', callback_data=calls.ExtPagination(page=0).pack()),
+            InlineKeyboardButton(text='🔔 Уведомления', callback_data=calls.PduRootNav(to='logger').pack()),
+            InlineKeyboardButton(text='🧩 Расширения', callback_data=calls.PduAddonGrid(page=0).pack()),
         ],
+        [
+            InlineKeyboardButton(text='📢 Наш канал', url='https://t.me/coxerhub_playerok'),
+            InlineKeyboardButton(text='🚀 Накрутка', url='https://neversmm.ru'),
+        ],
+        [InlineKeyboardButton(text='🐙 GitHub', url='https://github.com/exfador/playerok-api')],
+        [InlineKeyboardButton(text='🛒 Приобрести плагины', url='https://t.me/exfador')],
     ])
 
 
-def startup_text(playerok_ok: bool = True) -> str:
-    text = f'🚀 <b>Панель готова</b>\n\n{_brand_line()}'
+def fac_122(playerok_ok: bool = True) -> str:
+    text = (
+        f'🚀 <b>Панель готова</b>\n\n{fac_003()}\n\n'
+        f'Лучший сервис по накрутке — <a href="https://neversmm.ru">neversmm.ru</a>\n'
+        f'Канал по плеерку — <a href="https://t.me/coxerhub_playerok">t.me/coxerhub_playerok</a>\n\n'
+        f'Версия проекта: <code>v{VERSION}</code>'
+    )
     if not playerok_ok:
         text += '\n\n⚠️ Playerok не отвечает: проверьте токен в конфиге и прокси (если используете).'
     return text
 
 
-def profile_text() -> str:
-    from chamber.supervisor import active_supervisor
-    acc = active_supervisor().account.get()
+def fac_122_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='GitHub', url='https://github.com/exfador/playerok-api')],
+        [InlineKeyboardButton(text='Приобрести плагины', url='https://t.me/exfador')],
+    ])
+
+
+def fac_049() -> str:
+    from bot.core import live_bridge
+    acc = live_bridge().account.get()
     p = acc.profile
     bal = p.balance
     bal_total = f'{bal.value} ₽' if bal else '—'
@@ -301,13 +320,13 @@ def profile_text() -> str:
     )
 
 
-def profile_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='⬅️ Меню', callback_data=calls.MenuNavigation(to='default').pack())]])
+def fac_048() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='⬅️ Меню', callback_data=calls.PduRootNav(to='default').pack())]])
 
 
 
-def logs_text() -> str:
-    config = cfg.get('config')
+def fac_038() -> str:
+    config = cfg.read('config')
     max_mb = config['logs'].get('max_mb') or '—'
     return (
         '🗂 <b>Логи работы</b>\n\n'
@@ -316,46 +335,30 @@ def logs_text() -> str:
     )
 
 
-def logs_kb() -> InlineKeyboardMarkup:
-    config = cfg.get('config')
-    max_mb = config['logs'].get('max_mb') or '—'
+def fac_037() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f'📏  Лимит: {max_mb} МБ', callback_data='enter_logs_max_file_size')],
-        [InlineKeyboardButton(text='📥  Скачать фрагмент', callback_data='select_logs_file_lines')],
-        [InlineKeyboardButton(text='⬅️ Меню', callback_data=calls.MenuNavigation(to='default').pack())],
+        [InlineKeyboardButton(text='⬅️ Меню', callback_data=calls.PduRootNav(to='default').pack())],
     ])
 
 
-def logs_file_lines_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text='100 строк', callback_data=calls.SendLogsFile(lines=100).pack()),
-            InlineKeyboardButton(text='250 строк', callback_data=calls.SendLogsFile(lines=250).pack()),
-        ],
-        [
-            InlineKeyboardButton(text='1000 строк', callback_data=calls.SendLogsFile(lines=1000).pack()),
-            InlineKeyboardButton(text='Весь файл', callback_data=calls.SendLogsFile(lines=-1).pack()),
-        ],
-        [InlineKeyboardButton(text='⬅️ К логам', callback_data=calls.MenuNavigation(to='logs').pack())],
-    ])
 
 
-def logs_float_text(placeholder: str) -> str:
+def fac_036(placeholder: str) -> str:
     return f'🗂 <b>Логи</b>\n\n{placeholder}'
 
 
-def instruction_text() -> str:
+def fac_022() -> str:
     return '📖 <b>Справка</b>\n\nКратко о возможностях. Выберите тему ниже:'
 
 
-def instruction_kb() -> InlineKeyboardMarkup:
+def fac_021() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text='⌨️  Команды покупателя', callback_data=calls.InstructionNavigation(to='commands').pack())],
-        [InlineKeyboardButton(text='⬅️ Меню', callback_data=calls.MenuNavigation(to='default').pack())],
+        [InlineKeyboardButton(text='⌨️  Команды покупателя', callback_data=calls.PduHelpNav(to='commands').pack())],
+        [InlineKeyboardButton(text='⬅️ Меню', callback_data=calls.PduRootNav(to='default').pack())],
     ])
 
 
-def instruction_comms_text() -> str:
+def fac_020() -> str:
     return (
         '⌨️ <b>Команды в чате сделки</b>\n\n'
         '1. В <b>Настройки → Команды</b> добавьте триггер, например <code>!вызвать</code>.\n'
@@ -364,12 +367,12 @@ def instruction_comms_text() -> str:
     )
 
 
-def instruction_comms_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='⬅️ К командам', callback_data=calls.CustomCommandsPagination(page=0).pack())]])
+def fac_019() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='⬅️ К командам', callback_data=calls.PduCmdGrid(page=0).pack())]])
 
 
-def plugins_text() -> str:
-    loaded = all_grafts()
+def fac_047() -> str:
+    loaded = all_extensions()
     n = len(loaded)
     if n:
         hint = f'Папка <code>ext/</code>: загружено расширений — <code>{n}</code>. Нажмите на название, чтобы включить или выключить.'
@@ -378,27 +381,27 @@ def plugins_text() -> str:
     return f'🧩 <b>Расширения</b>\n\n{hint}'
 
 
-def plugins_kb(page: int = 0) -> InlineKeyboardMarkup:
-    loaded = all_grafts()
+def fac_046(page: int = 0) -> InlineKeyboardMarkup:
+    loaded = all_extensions()
     rows = []
     per_page = 7
     total_pages = max(1, math.ceil(len(loaded) / per_page))
     page = max(0, min(page, total_pages - 1))
     for ext in list(loaded)[page * per_page:(page + 1) * per_page]:
         status = '🟢' if ext.enabled else '⚫'
-        rows.append([InlineKeyboardButton(text=f'{status}  {ext.meta.name}  {ext.meta.version}', callback_data=calls.ExtPage(uuid=ext.uuid).pack())])
+        rows.append([InlineKeyboardButton(text=f'{status}  {ext.meta.name}  {ext.meta.version}', callback_data=calls.PduAddonOpen(uuid=ext.uuid).pack())])
     if total_pages > 1:
         rows.append([
-            InlineKeyboardButton(text='◀', callback_data=calls.ExtPagination(page=page - 1).pack()) if page > 0 else InlineKeyboardButton(text='·', callback_data='noop'),
-            InlineKeyboardButton(text=f'{page + 1} / {total_pages}', callback_data='enter_plugins_page'),
-            InlineKeyboardButton(text='▶', callback_data=calls.ExtPagination(page=page + 1).pack()) if page < total_pages - 1 else InlineKeyboardButton(text='·', callback_data='noop'),
+            InlineKeyboardButton(text='◀', callback_data=calls.PduAddonGrid(page=page - 1).pack()) if page > 0 else InlineKeyboardButton(text='·', callback_data=CX.noop),
+            InlineKeyboardButton(text=f'{page + 1} / {total_pages}', callback_data=CX.xt_pg),
+            InlineKeyboardButton(text='▶', callback_data=calls.PduAddonGrid(page=page + 1).pack()) if page < total_pages - 1 else InlineKeyboardButton(text='·', callback_data=CX.noop),
         ])
-    rows.append([InlineKeyboardButton(text='⬅️ Меню', callback_data=calls.MenuNavigation(to='default').pack())])
+    rows.append([InlineKeyboardButton(text='⬅️ Меню', callback_data=calls.PduRootNav(to='default').pack())])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def plugin_page_text(plugin_uuid: UUID) -> str:
-    ext: Graft = seek_graft(plugin_uuid)
+def fac_045(plugin_uuid: UUID) -> str:
+    ext: Extension = find_extension(plugin_uuid)
     if not ext:
         raise Exception('Расширение не найдено')
     status = '🟢 работает' if ext.enabled else '⚫ остановлено'
@@ -413,17 +416,17 @@ def plugin_page_text(plugin_uuid: UUID) -> str:
     )
 
 
-def plugin_page_kb(plugin_uuid: UUID, page: int = 0) -> InlineKeyboardMarkup:
-    ext: Graft = seek_graft(plugin_uuid)
+def fac_044(plugin_uuid: UUID, page: int = 0) -> InlineKeyboardMarkup:
+    ext: Extension = find_extension(plugin_uuid)
     if not ext:
         raise Exception('Расширение не найдено')
     toggle = '⚫  Остановить' if ext.enabled else '🟢  Запустить'
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=toggle, callback_data='toggle_ext_state')],
-        [InlineKeyboardButton(text='🔄  Перезапустить', callback_data='rearm_graft')],
-        [InlineKeyboardButton(text='⬅️ К расширениям', callback_data=calls.ExtPagination(page=page).pack())],
+        [InlineKeyboardButton(text=toggle, callback_data=CX.xt_on)],
+        [InlineKeyboardButton(text='🔄  Перезапустить', callback_data=CX.xt_rf)],
+        [InlineKeyboardButton(text='⬅️ К расширениям', callback_data=calls.PduAddonGrid(page=page).pack())],
     ])
 
 
-def plugin_page_float_text(placeholder: str) -> str:
+def fac_043(placeholder: str) -> str:
     return f'🧩 <b>Расширение</b>\n\n{placeholder}'

@@ -13,7 +13,7 @@ import secrets
 from keel.shelf import ConfigShelf as cfg, verify_password
 from keel.aliases import cc_get_items, cc_wrap_items, cc_new_item, cc_trigger_taken, cc_find_by_id
 from keel.graft import all_grafts
-from keel.kit import token_ok, ua_ok, proxy_ok, proxy_reachable, proxy_probe_html_suffix
+from lib.util import token_ok, ua_ok, proxy_ok, proxy_reachable, proxy_probe_html_suffix
 from . import ui as templ
 from . import states
 from . import keys as calls
@@ -77,7 +77,7 @@ async def handler_waiting_for_message_content(message: types.Message, state: FSM
         if message.text:
             if not message.text.strip():
                 raise Exception('Пустое сообщение')
-            last_sent = eng.send_message(chat.id, text=message.text.strip())
+            last_sent = eng._push(chat.id, text=message.text.strip())
             sent_msg = message.text
         elif message.photo:
             photo = message.photo[-1]
@@ -85,10 +85,10 @@ async def handler_waiting_for_message_content(message: types.Message, state: FSM
                 await message.bot.download(photo, destination=tmp.name)
                 tmp_path = tmp.name
             if caption_raw:
-                eng.send_message(chat.id, text=caption_raw)
+                eng._push(chat.id, text=caption_raw)
                 sent_msg += caption_raw + ' '
                 await asyncio.sleep(1)
-            last_sent = eng.send_message(chat.id, photo_file_path=tmp_path)
+            last_sent = eng._push(chat.id, photo_file_path=tmp_path)
             os.remove(tmp_path)
             sent_msg += '[фото]'
         preview = sent_msg[:60].replace('\n', ' ')

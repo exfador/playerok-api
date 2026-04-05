@@ -29,7 +29,7 @@ from moor.tapstream import (
     WireDisputeResolved,
 )
 from keel.tone import ACCENT_COLOR, VERSION, C_PRIMARY, C_SUCCESS, C_WARNING, C_ERROR, C_DIM, C_TEXT, C_BRIGHT, C_HIGHLIGHT
-from keel.kit import set_console_title, halt, spawn_async, draw_box, _b_top as _box_top, _b_bot as _box_bot, iso_to_display_str
+from lib.util import set_console_title, halt, spawn_async, draw_box, iso_to_display_str
 from keel.relay import hook_strata, hook_ingress, broadcast, broadcast_ingress
 from keel.shelf import DATA, ConfigShelf as cfg
 from keel.aliases import cc_get_items, cc_find_by_trigger
@@ -640,18 +640,14 @@ class Supervisor:
         text = _incoming_message_plain(message)
         if not text.strip():
             text = '[пустое сообщение]'
-        max_w = shutil.get_terminal_size((80, 20)).columns - 12
-        w = min(max_w, 58)
-        lines = [_box_top(f'СООБЩЕНИЕ ── {chat_user}', w)]
-        sender_line = f'{C_BRIGHT}{message.user.username}:{Fore.RESET}'
-        lines.append(f'{C_DIM}  │{Fore.RESET}  {sender_line}')
+        wrap_w = min(max(shutil.get_terminal_size((80, 20)).columns - 8, 40), 100)
+        lines = [f'{C_PRIMARY}Сообщение — {chat_user}{Fore.RESET}', f'  {C_BRIGHT}{message.user.username}:{Fore.RESET}']
         for raw in (text or '').split('\n'):
             if not raw.strip():
-                lines.append(f'{C_DIM}  │{Fore.RESET}')
+                lines.append('')
                 continue
-            for chunk in textwrap.wrap(raw, width=w - 6) or [raw]:
-                lines.append(f'{C_DIM}  │{Fore.RESET}  {C_TEXT}{chunk}{Fore.RESET}')
-        lines.append(_box_bot(w))
+            for chunk in textwrap.wrap(raw, width=wrap_w) or [raw]:
+                lines.append(f'  {C_TEXT}{chunk}{Fore.RESET}')
         logger.info('\n'.join(lines))
 
     def log_new_deal(self, deal: ItemDeal):
@@ -707,7 +703,7 @@ class Supervisor:
                     new_verbose = new_config.get('debug', {}).get('verbose', False)
                     self.config = new_config
                     if old_verbose != new_verbose:
-                        from keel.kit import apply_verbose
+                        from lib.util import apply_verbose
                         apply_verbose(new_verbose)
                 if cfg.get('messages') != self.messages:
                     self.messages = cfg.get('messages')
@@ -1116,7 +1112,7 @@ class Supervisor:
 
     async def operate(self):
         logger.debug('Движок запущен')
-        from keel.kit import apply_verbose
+        from lib.util import apply_verbose
         apply_verbose(self.config.get('debug', {}).get('verbose', False))
         nick = (self.account.username or '').strip() or '—'
         logger.info(f'  {C_SUCCESS}✓{Fore.RESET}  {C_BRIGHT}Playerok: авторизованы как «{nick}»{Fore.RESET}')
@@ -1130,7 +1126,7 @@ class Supervisor:
         acc_rows += [('Продажи', active_sales), ('Покупки', active_buys)]
         proxy = self.config['account']['proxy']
         if proxy:
-            from keel.kit import proxy_display_parts
+            from lib.util import proxy_display_parts
             draw_box('АККАУНТ', acc_rows, lead='\n')
             ip, port, user, password = proxy_display_parts(proxy)
             if ip and port:

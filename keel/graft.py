@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from logging import getLogger
 from keel.tone import C_BRIGHT, C_DIM
 from keel.relay import merge_strata, merge_ingress, prune_strata, prune_ingress, broadcast
-from keel.kit import check_requirements
+from lib.util import check_requirements
 
 logger = getLogger('keel.graft')
 ADDONS_DIR = 'ext'

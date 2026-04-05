@@ -2,19 +2,19 @@ import asyncio
 from aiogram import Router, types
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
-from keel.shelf import ConfigShelf as cfg
+from lib.cfg import AppConf as cfg
 from lib.util import reboot
-from .helpers import do_auth
+from .helpers import adm_gate
 
 router = Router()
 
 
 @router.message(Command('restart', 'reboot'))
-async def handler_restart(message: types.Message, state: FSMContext):
+async def on_cmd_restart(message: types.Message, state: FSMContext):
     await state.set_state(None)
-    config = cfg.get('config')
+    config = cfg.read('config')
     if message.from_user.id not in config['bot']['admins']:
-        return await do_auth(message, state)
+        return await adm_gate(message, state)
     try:
         await message.answer('🔄 Перезагружаюсь…')
     except Exception:

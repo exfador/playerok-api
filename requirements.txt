@@ -13,3 +13,4 @@ setuptools>=68.0
 tqdm==4.67.1
 beautifulsoup4>=4.12
 lxml>=5.0
+packaging>=23.0

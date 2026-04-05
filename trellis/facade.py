@@ -9,7 +9,7 @@ from keel.graft import all_grafts
 from keel.relay import broadcast
 from colorama import Fore
 from keel.tone import C_SUCCESS, C_BRIGHT
-from keel.kit import draw_box, proxy_url_for_aiogram
+from lib.util import draw_box, proxy_url_for_aiogram
 from . import router as main_router
 from . import ui as templ
 from .cmds import facade_command_blueprint
@@ -18,10 +18,10 @@ logger = logging.getLogger('trellis.face')
 
 _PANEL_BOT_DESCRIPTION = (
     '🛒 CXH Playerok — панель продавца на Playerok\n\n'
-    '✅ Автоподтверждение заказов\n'
-    '🔼 Автоподнятие лотов\n'
-    '♻️ Автовосстановление товаров на витрине\n'
-    '📦 Автовыдача\n'
+    '✅ Авто-подтверждение заказов\n'
+    '🔼 Авто-поднятие лотов\n'
+    '♻️ Авто-восстановление товаров на витрине\n'
+    '📦 Авто-выдача\n'
     '⌨️ Команды в чате\n'
     '💬 Уведомления в Telegram: ответ текстом или фото, шаблоны, закрытие сделки и возврат, '
     'профиль, статистика\n'
@@ -116,6 +116,11 @@ class Facade:
     async def _send_startup_message(self, playerok_ok: bool = True):
         try:
             config = cfg.get('config')
+            alerts = config.get('alerts', {})
+            if not alerts.get('enabled', True):
+                return
+            if not (alerts.get('on') or {}).get('startup', True):
+                return
             signed_users = config['bot']['admins']
             for user_id in signed_users:
                 try:
@@ -137,7 +142,7 @@ class Facade:
         logger.debug('Telegram-бот %s', uname)
         await self._send_startup_message(playerok_ok=True)
         if self.proxy:
-            from keel.kit import proxy_display_parts
+            from lib.util import proxy_display_parts
             ip, port, user, password = proxy_display_parts(self.proxy)
             if ip and port:
                 ip_parts = ip.split('.')

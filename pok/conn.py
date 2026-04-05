@@ -11,14 +11,14 @@ import certifi
 import tls_requests
 import curl_cffi
 from lib.util import proxy_url_for_requests
-from . import shapes as types
-from .kinds import *
-from .graphfrag import *
+from . import models as types
+from .defs import *
+from .gql import *
 
 
-def active_gate() -> SessionGate | None:
-    if hasattr(SessionGate, 'instance'):
-        return getattr(SessionGate, 'instance')
+def active_conn() -> Conn | None:
+    if hasattr(Conn, 'instance'):
+        return getattr(Conn, 'instance')
 
 
 def _is_transport_recoverable(exc: BaseException) -> bool:
@@ -27,8 +27,8 @@ def _is_transport_recoverable(exc: BaseException) -> bool:
     if isinstance(exc, OSError):
         err_no = getattr(exc, 'errno', None)
         if err_no is not None and err_no in (
-            10054, 10053, 10060,  
-            104, 110, 111, 113,  
+            10054, 10053, 10060,
+            104, 110, 111, 113,
         ):
             return True
     blob = f'{type(exc).__name__} {exc}'.lower()
@@ -44,7 +44,7 @@ def _is_transport_recoverable(exc: BaseException) -> bool:
 
 def _is_proxy_dial_failure_message(msg: str) -> bool:
     m = (msg or '').lower()
-    if any(x in m for x in ('curl: (28)', 'curl: (7)', 'curl: (56)')):
+    if any(x in m for x in ('curl: (7)', 'curl: (56)')):
         return True
     if any(x in m for x in ('failed to connect', 'could not connect', 'connection refused')):
         return True
@@ -57,19 +57,19 @@ def _proxy_dial_failure_hint(err: str) -> str:
     e = (err or '').lower()
     if 'curl: (28)' in e:
         return (
-            ' | Таймаут до прокси: проверьте IP/порт, что узел онлайн, тип прокси '
-            '(SOCKS5 — строка socks5h:… в config), фаервол и белый список IP у провайдера прокси.'
+            ' | Таймаут запроса (0 байт — часто сеть/фильтр/прокси): проверьте '
+            'доступ к playerok.com с этого хоста, account.proxy, account.timeout в config, фаервол и DNS.'
         )
     if 'curl: (7)' in e:
         return ' | Нет соединения с прокси: закрыт порт, неверный адрес или блокировка.'
     return ' | Проверьте account.proxy / bot.proxy в conf/config.json.'
 
 
-class SessionGate:
+class Conn:
 
-    def __new__(cls, *args, **kwargs) -> SessionGate:
+    def __new__(cls, *args, **kwargs) -> Conn:
         if not hasattr(cls, 'instance'):
-            cls.instance = super(SessionGate, cls).__new__(cls)
+            cls.instance = super(Conn, cls).__new__(cls)
         return getattr(cls, 'instance')
 
     def __init__(self, token: str, user_agent: str = '', proxy: str = None, requests_timeout: int = 15, request_max_retries: int = 5, **kwargs):
@@ -107,17 +107,17 @@ class SessionGate:
 
     def _refresh_clients(self):
         profile = self._IMPERSONATE_PROFILES[
-            SessionGate._profile_index % len(self._IMPERSONATE_PROFILES)
+            Conn._profile_index % len(self._IMPERSONATE_PROFILES)
         ]
-        SessionGate._profile_index += 1
+        Conn._profile_index += 1
         self.__tls_requests = tls_requests.Client(proxy=self.__proxy_string)
         self.__curl_session = curl_cffi.Session(impersonate=profile, timeout=10, proxy=self.__proxy_string, verify=self._ca_bundle)
 
     @property
     def _timeout(self) -> int:
         try:
-            from keel.shelf import ConfigShelf
-            t = ConfigShelf.get('config').get('account', {}).get('timeout')
+            from lib.cfg import AppConf
+            t = AppConf.read('config').get('account', {}).get('timeout')
             return int(t) if t else self.requests_timeout
         except Exception:
             return self.requests_timeout
@@ -125,8 +125,8 @@ class SessionGate:
     @property
     def _verbose(self) -> bool:
         try:
-            from keel.shelf import ConfigShelf
-            return bool(ConfigShelf.get('config').get('debug', {}).get('verbose', False))
+            from lib.cfg import AppConf
+            return bool(AppConf.read('config').get('debug', {}).get('verbose', False))
         except Exception:
             return False
 
@@ -148,6 +148,7 @@ class SessionGate:
             except Exception:
                 pass
         wallet_ops = ('verifiedCards', 'SbpBankMembers', 'requestWithdrawal')
+
         if x_gql_op in wallet_ops:
             path_attempts = [
                 ('/wallet', 'https://playerok.com/wallet'),
@@ -186,7 +187,7 @@ class SessionGate:
                                 err[:800],
                                 _proxy_dial_failure_hint(err),
                             )
-                            raise TransportShakeError(url, err)
+                            raise RequestSendingError(url, err)
                         self.logger.warning(
                             'Транспорт/TLS op=%s попытка %s/%s (без перезапуска процесса): %s',
                             x_gql_op,
@@ -198,7 +199,9 @@ class SessionGate:
                         continue
                     self.logger.debug('Ошибка при отправке запроса: %s', e)
                     self.logger.debug('Отправляю запрос повторно…')
-            raise TransportShakeError(url, err)
+            if err and 'curl: (28)' in err.lower():
+                err = f'{err}{_proxy_dial_failure_hint(err)}'
+            raise RequestSendingError(url, err)
 
         cf_sigs = ['<title>Just a moment...</title>', 'window._cf_chl_opt', 'Enable JavaScript and cookies to continue', 'Checking your browser before accessing', 'cf-browser-verification', 'Cloudflare Ray ID']
         max_cf_retries = 4
@@ -223,7 +226,7 @@ class SessionGate:
                 self._refresh_clients()
             else:
                 if resp is not None and any((sig in resp.text for sig in cf_sigs)):
-                    raise WafInterceptError(resp)
+                    raise CloudflareDetectedException(resp)
 
             json_data = {}
             try:
@@ -253,7 +256,7 @@ class SessionGate:
                         resp.status_code,
                         err_txt[:2000],
                     )
-                    raise UpstreamGraphError(resp)
+                    raise RequestApiError(resp)
                 self.logger.debug(
                     'GraphQL op=%s: отказ по доступу на path=%s — следующий referer/path…',
                     x_gql_op,
@@ -264,7 +267,7 @@ class SessionGate:
             if resp.status_code != 200:
                 if verbose:
                     self.logger.debug(f'⚠ HTTP {resp.status_code}  op={x_gql_op}  body={resp.text[:400]}')
-                raise HttpStatusError(resp)
+                raise RequestFailedError(resp)
             return resp
 
     @staticmethod
@@ -277,7 +280,7 @@ class SessionGate:
         except Exception:
             return None
 
-    def get(self) -> SessionGate:
+    def get(self) -> Conn:
         headers = {'accept': '*/*'}
         payload = {'operationName': 'viewer', 'query': QUERIES.get('viewer'), 'variables': {}}
         url = f'{self.base_url}/graphql'
@@ -286,7 +289,7 @@ class SessionGate:
             try:
                 r = self.request('post', url, headers, payload).json()
                 break
-            except TransportShakeError as e:
+            except RequestSendingError as e:
                 last_err = e
                 if attempt < 3:
                     self.logger.warning(
@@ -298,15 +301,15 @@ class SessionGate:
                     time.sleep(2)
                 continue
         else:
-            raise last_err  
+            raise last_err
         data: dict = r['data']['viewer']
         if data is None:
-            raise CredentialRejectedError()
+            raise UnauthorizedError()
         self.id = data.get('id')
         jwt_sub = self._decode_jwt_sub(self.token)
         if jwt_sub and self.id and jwt_sub != self.id:
             self.logger.warning(f'Ханипот: токен sub={jwt_sub}, вернули id={self.id}')
-            raise ShadowAccountError(returned_id=self.id, token_sub=jwt_sub)
+            raise HoneypotDetectedException(returned_id=self.id, token_sub=jwt_sub)
         self.username = data.get('username')
         self.email = data.get('email')
         self.role = data.get('role')
@@ -435,7 +438,7 @@ class SessionGate:
                 break
             next_cursor = chats.page_info.end_cursor
 
-    _CHAT_MESSAGES_PAGE = 10    
+    _CHAT_MESSAGES_PAGE = 10
 
     def load_messages(self, chat_id: str, count: int = 25, after_cursor: str | None = None) -> types.ChatMessageList:
         headers = {'accept': '*/*'}

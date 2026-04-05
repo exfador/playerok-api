@@ -41,7 +41,7 @@ def _runtime_sync_config() -> None:
         pass
 
 
-_ALERT_ON_KEYS = ('message', 'system', 'deal', 'review', 'problem', 'deal_changed', 'restore', 'bump')
+_ALERT_ON_KEYS = ('message', 'system', 'deal', 'review', 'problem', 'deal_changed', 'restore', 'bump', 'startup')
 
 
 def _alerts_all_off(on: dict) -> None:
@@ -71,8 +71,6 @@ async def callback_menu_navigation(callback: CallbackQuery, callback_data: calls
     to = callback_data.to
     if to == 'default':
         await throw_float_message(state, callback.message, templ.menu_text(), templ.menu_kb(), callback)
-    elif to == 'stats':
-        await throw_float_message(state, callback.message, templ.stats_text(), templ.stats_kb(), callback)
     elif to == 'profile':
         await throw_float_message(state, callback.message, templ.profile_text(), templ.profile_kb(), callback)
     elif to == 'logs':
@@ -631,7 +629,7 @@ async def callback_switch_debug_verbose(callback: CallbackQuery, state: FSMConte
         config['debug'] = {'verbose': False}
     config['debug']['verbose'] = not config['debug'].get('verbose', False)
     cfg.set('config', config)
-    from keel.kit import apply_verbose
+    from lib.util import apply_verbose
     apply_verbose(config['debug']['verbose'])
     return await callback_settings_navigation(callback, calls.SettingsNavigation(to='other'), state)
 
@@ -727,6 +725,14 @@ async def callback_switch_tg_logging_event_restore_ok(callback: CallbackQuery, s
 async def callback_switch_tg_logging_event_bump_ok(callback: CallbackQuery, state: FSMContext):
     config = cfg.get('config')
     _toggle_alert_type(config, 'bump', True)
+    cfg.set('config', config)
+    _runtime_sync_config()
+    return await callback_menu_navigation(callback, calls.MenuNavigation(to='logger'), state)
+
+@router.callback_query(F.data == 'switch_tg_logging_event_bot_startup')
+async def callback_switch_tg_logging_event_bot_startup(callback: CallbackQuery, state: FSMContext):
+    config = cfg.get('config')
+    _toggle_alert_type(config, 'startup', True)
     cfg.set('config', config)
     _runtime_sync_config()
     return await callback_menu_navigation(callback, calls.MenuNavigation(to='logger'), state)
@@ -1058,7 +1064,7 @@ async def callback_log_template_send(callback: CallbackQuery, callback_data: cal
         return
     try:
         chat = eng.find_chat_by_name(username)
-        last_sent = eng.send_message(chat.id, text)
+        last_sent = eng._push(chat.id, text)
         if not last_sent:
             raise Exception('Не удалось отправить в чат Playerok')
         preview = text[:120].replace('\n', ' ')
@@ -1289,7 +1295,7 @@ async def callback_add_new_auto_delivery(callback: CallbackQuery, state: FSMCont
         auto_deliveries = cfg.get('auto_deliveries')
         auto_deliveries.append({'piece': piece, 'keyphrases': keyphrases, 'message': message.splitlines() if message and (not piece) else '', 'goods': goods if goods and piece else []})
         cfg.set('auto_deliveries', auto_deliveries)
-        await throw_float_message(state=state, message=callback.message, text=templ.settings_new_deliv_float_text(f'✅ <b>Автовыдача</b> была успешно добавлена'), reply_markup=templ.back_kb(calls.AutoDeliveriesPagination(page=last_page).pack()))
+        await throw_float_message(state=state, message=callback.message, text=templ.settings_new_deliv_float_text(f'✅ <b>Авто-выдача</b> была успешно добавлена'), reply_markup=templ.back_kb(calls.AutoDeliveriesPagination(page=last_page).pack()))
     except Exception as e:
         await throw_float_message(state=state, message=callback.message, text=templ.settings_new_deliv_float_text(e), reply_markup=templ.back_kb(calls.AutoDeliveriesPagination(page=last_page).pack()))
 
@@ -1318,7 +1324,7 @@ async def callback_delete_auto_delivery(callback: CallbackQuery, state: FSMConte
         auto_deliveries = cfg.get('auto_deliveries')
         del auto_deliveries[index]
         cfg.set('auto_deliveries', auto_deliveries)
-        await throw_float_message(state=state, message=callback.message, text=templ.settings_deliv_page_float_text('✅ <b>Автовыдача</b> удалена'), reply_markup=templ.back_kb(calls.AutoDeliveriesPagination(page=last_page).pack()))
+        await throw_float_message(state=state, message=callback.message, text=templ.settings_deliv_page_float_text('✅ <b>Авто-выдача</b> удалена'), reply_markup=templ.back_kb(calls.AutoDeliveriesPagination(page=last_page).pack()))
     except Exception as e:
         await throw_float_message(state=state, message=callback.message, text=templ.settings_deliv_page_float_text(e), reply_markup=templ.back_kb(calls.AutoDeliveriesPagination(page=last_page).pack()))
 
@@ -1399,20 +1405,3 @@ async def callback_confirm_bump_items(callback: CallbackQuery, state: FSMContext
     await throw_float_message(state=state, message=callback.message, text=templ.settings_bump_float_text('Подтвердите <b>обновление позиций</b> ↓'), reply_markup=templ.confirm_kb('bump_items', calls.SettingsNavigation(to='bump').pack()))
 
 
-@router.callback_query(F.data == 'confirm_reset_stats')
-async def callback_confirm_reset_stats(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(None)
-    await throw_float_message(state=state, message=callback.message, text=templ.stats_reset_confirm_text(), reply_markup=templ.stats_reset_confirm_kb())
-
-@router.callback_query(F.data == 'reset_stats')
-async def callback_reset_stats(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(None)
-    from chamber.supervisor import set_stats, get_stats, Stats
-    s = get_stats()
-    set_stats(Stats(bot_launch_time=s.bot_launch_time, deals_completed=0, deals_refunded=0, earned_money=0))
-    await throw_float_message(state=state, message=callback.message, text=templ.stats_text(), reply_markup=templ.stats_kb())
-
-@router.callback_query(F.data == 'back_to_stats')
-async def callback_back_to_stats(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(None)
-    await throw_float_message(state=state, message=callback.message, text=templ.stats_text(), reply_markup=templ.stats_kb())
