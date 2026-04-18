@@ -138,15 +138,28 @@ class Conn:
             x_gql_op = 'viewer'
         x_gql_path = '/'
         referer = 'https://playerok.com/'
-        if x_gql_op == 'chatMessages' and isinstance(payload, dict) and payload.get('variables'):
-            try:
-                vars_ = json.loads(payload['variables'])
-                cid = (vars_.get('filter') or {}).get('chatId')
+        if isinstance(payload, dict) and payload.get('variables'):
+            raw_vars = payload['variables']
+            vars_: dict | None
+            if isinstance(raw_vars, dict):
+                vars_ = raw_vars
+            else:
+                try:
+                    vars_ = json.loads(raw_vars)
+                except Exception:
+                    vars_ = None
+            if vars_ is not None:
+                cid = None
+                if x_gql_op == 'chat':
+                    cid = vars_.get('id')
+                elif x_gql_op == 'chatMessages':
+                    cid = (vars_.get('filter') or {}).get('chatId')
+                elif x_gql_op == 'userChats':
+                    x_gql_path = '/chats'
+                    referer = 'https://playerok.com/chats'
                 if cid:
                     x_gql_path = '/chats/[id]'
                     referer = f'https://playerok.com/chats/{cid}'
-            except Exception:
-                pass
         wallet_ops = ('verifiedCards', 'SbpBankMembers', 'requestWithdrawal')
 
         if x_gql_op in wallet_ops:
@@ -417,13 +430,30 @@ class Conn:
 
     def load_chats(self, count: int = 24, type: RoomKind | None = None, status: RoomState | None = None, after_cursor: str | None = None) -> types.ChatList:
         headers = {'accept': '*/*'}
-        payload = {'operationName': 'userChats', 'variables': json.dumps({'pagination': {'first': count, 'after': after_cursor}, 'filter': {'userId': self.id, 'type': type.name if type else None, 'status': status.name if status else None}, 'hasSupportAccess': False}), 'extensions': json.dumps({'persistedQuery': {'version': 1, 'sha256Hash': PERSISTED_QUERIES.get('userChats')}})}
+        pag: dict = {'first': count}
+        if after_cursor is not None:
+            pag['after'] = after_cursor
+        flt: dict = {'userId': self.id}
+        if type is not None:
+            flt['type'] = type.name
+        if status is not None:
+            flt['status'] = status.name
+        variables = {'pagination': pag, 'filter': flt}
+        payload = {
+            'operationName': 'userChats',
+            'variables': json.dumps(variables),
+            'extensions': json.dumps({'persistedQuery': {'version': 1, 'sha256Hash': PERSISTED_QUERIES.get('userChats')}}),
+        }
         r = self.request('get', f'{self.base_url}/graphql', headers, payload).json()
         return chat_list(r['data']['chats'])
 
     def load_chat(self, chat_id: str) -> types.Chat:
         headers = {'accept': '*/*'}
-        payload = {'operationName': 'chat', 'variables': json.dumps({'id': chat_id, 'hasSupportAccess': False}), 'extensions': json.dumps({'persistedQuery': {'version': 1, 'sha256Hash': PERSISTED_QUERIES.get('chat')}})}
+        payload = {
+            'operationName': 'chat',
+            'variables': json.dumps({'id': chat_id, 'hasSupportAccess': False}),
+            'extensions': json.dumps({'persistedQuery': {'version': 1, 'sha256Hash': PERSISTED_QUERIES.get('chat')}}),
+        }
         r = self.request('get', f'{self.base_url}/graphql', headers, payload).json()
         return chat(r['data']['chat'])
 
@@ -440,8 +470,29 @@ class Conn:
 
     _CHAT_MESSAGES_PAGE = 10
 
-    def load_messages(self, chat_id: str, count: int = 25, after_cursor: str | None = None) -> types.ChatMessageList:
+    def _chat_messages_one_page(self, chat_id: str, pag: dict, show_forbidden: bool, method: Literal['get', 'post']) -> dict:
         headers = {'accept': '*/*'}
+        vars_d = {
+            'pagination': pag,
+            'filter': {'chatId': chat_id},
+            'hasSupportAccess': False,
+            'showForbiddenImage': show_forbidden,
+        }
+        if method == 'post':
+            payload = {
+                'operationName': 'chatMessages',
+                'variables': vars_d,
+                'extensions': {'persistedQuery': {'version': 1, 'sha256Hash': PERSISTED_QUERIES.get('chatMessages')}},
+            }
+            return self.request('post', f'{self.base_url}/graphql', headers, payload).json()
+        payload = {
+            'operationName': 'chatMessages',
+            'variables': json.dumps(vars_d),
+            'extensions': json.dumps({'persistedQuery': {'version': 1, 'sha256Hash': PERSISTED_QUERIES.get('chatMessages')}}),
+        }
+        return self.request('get', f'{self.base_url}/graphql', headers, payload).json()
+
+    def load_messages(self, chat_id: str, count: int = 25, after_cursor: str | None = None) -> types.ChatMessageList:
         collected: list = []
         cursor = after_cursor
         last_list: types.ChatMessageList | None = None
@@ -450,8 +501,27 @@ class Conn:
             pag: dict = {'first': batch}
             if cursor is not None:
                 pag['after'] = cursor
-            payload = {'operationName': 'chatMessages', 'variables': json.dumps({'pagination': pag, 'filter': {'chatId': chat_id}, 'hasSupportAccess': False, 'showForbiddenImage': True}), 'extensions': json.dumps({'persistedQuery': {'version': 1, 'sha256Hash': PERSISTED_QUERIES.get('chatMessages')}})}
-            r = self.request('get', f'{self.base_url}/graphql', headers, payload).json()
+            r = None
+            last_err: RequestFailedError | None = None
+            # Как в веб-клиенте: GET + showForbiddenImage=true; при 5xx пробуем остальные комбинации.
+            for method, show_forbidden in (('get', True), ('get', False), ('post', True), ('post', False)):
+                try:
+                    r = self._chat_messages_one_page(chat_id, pag, show_forbidden, method)
+                    break
+                except RequestFailedError as e:
+                    last_err = e
+                    sc = getattr(e, 'status_code', 0) or 0
+                    if sc >= 500:
+                        self.logger.debug(
+                            'chatMessages %s showForbiddenImage=%s -> HTTP %s, следующий вариант…',
+                            method,
+                            show_forbidden,
+                            sc,
+                        )
+                        continue
+                    raise
+            if r is None and last_err is not None:
+                raise last_err
             lst = chat_message_list(r['data']['chatMessages'])
             last_list = lst
             collected.extend(lst.messages)
