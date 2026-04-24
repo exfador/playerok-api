@@ -1,0 +1,36 @@
+2026-04-24 (2.0.2)
+
+Добавлено
+- Обход DDoS-Guard через Cookie-авторизацию (вместо голого токена).
+- Ввод Cookie через conf/cookies.json (экспорт Cookie-Editor → JSON → ввести `true`); в Telegram-панели — принимается JSON-файл документом, JSON-текстом или классическая Header String.
+- Автопроверка релизов на GitHub, push-уведомление админам о новой версии.
+- Инлайн-кнопка «Загрузить и применить» — скачивает zip релиза, заменяет файлы проекта (сохраняя conf/, db/, logs/, __pycache__, .git, .venv), перезапускает процесс.
+- Пункт «🛠 Система» в /start: текущая версия, статус обновления, время последней проверки, кнопки «Загрузить», «Что нового», «Проверить», «GitHub».
+- Exception BotCheckDetectedException на срабатывание DDoS-Guard (с подсказкой обновить Cookie).
+- Bundled cacert.pem для работы независимо от certifi.
+- pyrightconfig.json — проект проходит статический анализ без ошибок и предупреждений.
+
+Изменено
+- GraphQL-запросы и SHA-хеши обновлены под актуальную схему playerok.com (добавлены images, automationObtainingFields, isAttachmentsForbidden, spbBankName, autoClaimedAt, fragmentUsername и др.).
+- Отправка фото в чат теперь через двухшаговый flow: uploadChatImageIntoTemporaryStore → createChatMessage с imagesIds. send_message принимает и один путь, и список путей.
+- WS-подписка chatMessageCreated теперь передаёт showForbiddenImage: true (без неё Playerok возвращал пустой images[] для входящих фото).
+- Входящие фото-сообщения теперь проходят гидратацию и показываются в Telegram как «📷 изображение» (раньше гонка с chatUpdated побеждала и Telegram показывал «нет текста»).
+- check_requirements больше не запускает pip install на старте (на Windows падал WinError 5 из-за залоченного curl_cffi DLL). Теперь только warning про отсутствующие пакеты.
+- CA bundle автоматически копируется в ASCII-путь (C:\cxh\cxh_cacert.pem или fallback), если путь до исходного содержит не-ASCII символы (типично C:\Users\андрей\...) — libcurl больше не падает curl: (77).
+- Конфиг сбрасывается на defaults при повреждении структуры (например, верхний уровень = список вместо dict) с бэкапом в .corrupt.bak.
+- URL для скачивания релиза: приоритет asset → github.com/{repo}/archive/refs/tags/{tag}.zip → zipball_url.
+- Исправлена env-переменная для перезапуска: CXH_QUICK_REBOOT → CXH_FAST_REBOOT (совпала с чтением в main.py, баннер «↻ Перезапуск» теперь появляется).
+- Кнопка «Загрузить обновление» теперь инлайн-callback, а не URL — скачивание и замена идут внутри бота.
+- Мастер первого запуска принимает Cookie через JSON-файл вместо длинной вставки в консоль.
+
+Исправлено
+- Главный баг: платное восстановление лотов срабатывало даже при выключенной галке «💎 Платное (PREMIUM)». Теперь при отсутствии бесплатного тира и выключенном PREMIUM лот пропускается (с логом), деньги не списываются.
+- TypeError «list indices must be integers or slices, not str» при повреждённом conf/config.json.
+- curl: (77) error setting certificate verify locations на системах с кириллицей в пути (через короткий 8.3-путь + копия в ASCII-локацию).
+- WinError 5 «Отказано в доступе» по curl_cffi/_wrapper.pyd при авто-установке зависимостей.
+- Опечатка в коде: `user.__account = ...` из-за name-mangling создавала мёртвый атрибут `_MarketBridge__account` (удалена).
+- Сигнатуры типов в ключевых методах: _push возвращает ChatMessage | None, _elevate корректно сужает тип через isinstance, ItemDeal.item расширен до Item | MyItem | ItemProfile.
+
+Удалено
+- Legacy-запрос createChatMessageWithFile (старая схема отправки фото одним запросом, заменена новым двухшаговым flow).
+- Авто-pip-install на старте (теперь только warning).

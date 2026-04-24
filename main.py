@@ -4,7 +4,7 @@ import logging
 import os
 import signal
 import sys
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, overload, Literal
 
 from colorama import Fore, init as colorama_init
 
@@ -118,8 +118,14 @@ class CXHBot:
 
     async def _interactive_config(self) -> None:
         config = cfgmod.AppConf.read('config')
+        if not isinstance(config, dict) or not isinstance(config.get('account'), dict) or not isinstance(config.get('bot'), dict):
+            import copy as _copy
+            self._log_status('warn', 'conf/config.json: структура повреждена — восстанавливаю из defaults')
+            config = _copy.deepcopy(cfgmod._DEFAULTS)
+            cfgmod.AppConf.write('config', config)
 
-        if config['bot'].get('token') and config['bot'].get('password_hash') and config['account'].get('token'):
+        has_pl_auth = bool((config['account'].get('cookies') or '') or (config['account'].get('token') or ''))
+        if config['bot'].get('token') and config['bot'].get('password_hash') and has_pl_auth:
             patched = False
             if not (config['bot'].get('proxy') or '') and not config['bot'].get('proxy_prompt_ok'):
                 config['bot']['proxy_prompt_ok'] = True
@@ -141,7 +147,7 @@ class CXHBot:
                 n += 1
             if not (c['bot'].get('proxy') or '') and not c['bot'].get('proxy_prompt_ok'):
                 n += 1
-            if not c['account']['token']:
+            if not c['account'].get('cookies') and not c['account'].get('token'):
                 n += 1
             if not (c['account'].get('proxy') or '') and not c['account'].get('proxy_prompt_ok'):
                 n += 1
@@ -153,7 +159,11 @@ class CXHBot:
         step = 0
         prompted = False
 
-        def ask_step(label: str, desc: List[str], example: str = '', skip_allowed: bool = False) -> Optional[str]:
+        @overload
+        def ask_step(label: str, desc: List[str], example: str = ..., *, skip_allowed: Literal[True]) -> Optional[str]: ...
+        @overload
+        def ask_step(label: str, desc: List[str], example: str = ..., *, skip_allowed: Literal[False] = ...) -> str: ...
+        def ask_step(label: str, desc: List[str], example: str = '', *, skip_allowed: bool = False) -> Optional[str]:
             nonlocal step
             step += 1
             raw = ut.setup_prompt(step, total_fields, label, desc, example)
@@ -217,22 +227,40 @@ class CXHBot:
                     self._log_status('error', 'Некорректный формат прокси')
                     config['bot']['proxy'] = ''
 
-        while not config['account']['token']:
+        while not config['account'].get('cookies') and not config['account'].get('token'):
+            created = ut.ensure_cookies_json(ut.COOKIES_JSON_PATH)
+            if created:
+                self._log_status('note', f'Создан шаблон «{ut.COOKIES_JSON_PATH}» — откройте его')
             val = ask_step(
-                'JWT Playerok (из cookie)',
+                'Cookie Playerok (для обхода DDoS-Guard)',
                 [
-                    'playerok.com → расширение Cookie-Editor → поле «token»',
+                    f'Откройте «{ut.COOKIES_JSON_PATH}» в редакторе',
+                    'playerok.com → Cookie-Editor → Export → JSON — вставьте всё в файл',
+                    'Когда вставили — введите здесь `true` для проверки',
+                    'Важно: те же IP и User-Agent, что и в браузере',
                 ],
-                example='eyJ...',
+                example='true',
             )
-            if ut.token_ok(val):
-                config['account']['token'] = val
-                cfgmod.AppConf.write('config', config)
-                self._log_status('success', 'Токен Playerok сохранён')
-                prompted = True
-            else:
+            if (val or '').strip().lower() not in ('true', 'да', 'y', 'yes', 'ok', '1'):
                 step -= 1
-                self._log_status('error', 'Строка не похожа на корректный JWT')
+                self._log_status('error', 'Введите `true` после того, как вставите Cookie в JSON-файл')
+                continue
+            jar, err = ut.load_cookies_json(ut.COOKIES_JSON_PATH)
+            if err:
+                step -= 1
+                self._log_status('error', err)
+                continue
+            config['account']['cookies'] = ut.cookie_header_from_jar(jar)
+            config['account']['token'] = jar.get('token', '')
+            config['account']['ddg5'] = jar.get('__ddg5_', '')
+            config['account']['cookies_prompt_ok'] = True
+            cfgmod.AppConf.write('config', config)
+            self._log_status(
+                'success',
+                f'Cookie Playerok загружены из «{ut.COOKIES_JSON_PATH}» ({len(jar)} полей, token найден, '
+                f'__ddg5_ {"есть" if jar.get("__ddg5_") else "нет"})',
+            )
+            prompted = True
 
         if not (config['account'].get('proxy') or '') and not config['account'].get('proxy_prompt_ok'):
             val = ask_step(
