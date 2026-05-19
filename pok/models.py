@@ -135,7 +135,7 @@ class Event:
 
 class ItemDeal:
 
-    def __init__(self, id: str, status: DealStage, status_expiration_date: str | None, status_description: str | None, direction: DealFlow, obtaining: str | None, has_problem: bool, report_problem_enabled: bool | None, completed_user: UserProfile | None, props: str | None, previous_status: DealStage | None, completed_at: str, created_at: str, logs: list[ItemLog] | None, transaction: Transaction | None, user: UserProfile, chat: Chat | None, item: Item, review: Review | None, obtaining_fields: list[GameCategoryDataField] | None, comment_from_buyer: str | None):
+    def __init__(self, id: str, status: DealStage, status_expiration_date: str | None, status_description: str | None, direction: DealFlow, obtaining: str | None, has_problem: bool, report_problem_enabled: bool | None, completed_user: UserProfile | None, props: str | None, previous_status: DealStage | None, completed_at: str, created_at: str, logs: list[ItemLog] | None, transaction: Transaction | None, user: UserProfile, chat: Chat | None, item: 'Item | MyItem | ItemProfile', review: Review | None, obtaining_fields: list[GameCategoryDataField] | None, comment_from_buyer: str | None):
         self.id: str = id
         self.status: DealStage = status
         self.status_expiration_date: str | None = status_expiration_date
@@ -153,7 +153,7 @@ class ItemDeal:
         self.transaction: Transaction | None = transaction
         self.user: UserProfile = user
         self.chat: Chat | None = chat
-        self.item: Item = item
+        self.item: 'Item | MyItem | ItemProfile' = item
         self.review: Review | None = review
         self.obtaining_fields: list[GameCategoryDataField] | None = obtaining_fields
         self.comment_from_buyer: str | None = comment_from_buyer
@@ -596,6 +596,15 @@ class ChatMessageButton:
         self.type: ChatMessageButtonTypes = type
         self.url: str | None = url
         self.text: str = text
+
+class TemporaryAttachmentUploadOutput:
+
+    def __init__(self, id: str, url: str, chat_id: str, client_attachment_id: str, expires_at: str | None):
+        self.id: str = id
+        self.url: str = url
+        self.chat_id: str = chat_id
+        self.client_attachment_id: str = client_attachment_id
+        self.expires_at: str | None = expires_at
 
 class ChatMessage:
 

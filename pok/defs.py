@@ -161,6 +161,34 @@ class CloudflareDetectedException(Exception):
         msg = f'Ошибка: CloudFlare заметил подозрительную активность при отправке запроса на сайт Playerok.\nКод ошибки: {self.status_code}\nОтвет: {self.html_text}'
         return msg
 
+
+class BotCheckDetectedException(Exception):
+    """
+    Запрос на playerok.com заблокирован защитой DDoS-Guard.
+
+    Обычно это значит, что Cookie `__ddg5_` из `conf/config.json → account.cookies`
+    недействительна: она «умирает» при смене IP, User-Agent / TLS fingerprint
+    или обновлении ключей сервера.
+
+    Что делать:
+      1. Авторизуйтесь на playerok.com в браузере с того же IP.
+      2. Скопируйте все Cookie (расширение Cookie-Editor → Export → Header String).
+      3. Вставьте их в `account.cookies` целиком.
+    """
+
+    def __init__(self, response=None):
+        self.response = response
+        self.status_code = getattr(response, 'status_code', None) if response is not None else None
+        self.html_text = getattr(response, 'text', '') if response is not None else ''
+
+    def __str__(self):
+        extra = f'\nКод ответа: {self.status_code}' if self.status_code else ''
+        return (
+            'DDoS-Guard обнаружил бота: Cookie `__ddg5_` истекла или не подходит '
+            'для текущего IP/UA. Обновите `account.cookies` в conf/config.json '
+            '(экспортируйте полные Cookie из браузера, где вы авторизованы).' + extra
+        )
+
 class RequestFailedError(Exception):
 
     def __init__(self, response: requests.Response):

@@ -9,11 +9,12 @@ import asyncio
 import re
 import html
 import secrets
+import shutil
 
 from lib.cfg import AppConf as cfg, verify_password
 from lib.custom_commands import cc_get_items, cc_wrap_items, cc_new_item, cc_trigger_taken, cc_find_by_id
 from lib.ext import all_extensions
-from lib.util import token_ok, ua_ok, proxy_ok, proxy_reachable, proxy_probe_html_suffix
+from lib.util import token_ok, cookies_ok, parse_cookies_string, ua_ok, proxy_ok, proxy_reachable, proxy_probe_html_suffix
 from . import ui as templ
 from . import states
 from . import keys as calls
@@ -191,19 +192,91 @@ async def rx_009(message: types.Message, state: FSMContext):
                 return
         await message.answer(f'❌ Ошибка: {e}', reply_markup=kb, parse_mode='HTML')
 
+async def _apply_cookie_jar_from_bot(jar: dict, state: FSMContext, message: types.Message, source: str) -> None:
+    config = cfg.read('config')
+    config['account']['cookies'] = '; '.join(f'{k}={v}' for k, v in jar.items() if v)
+    config['account']['token'] = jar.get('token', '')
+    config['account']['ddg5'] = jar.get('__ddg5_', '')
+    config['account']['cookies_prompt_ok'] = True
+    cfg.write('config', config)
+    pretty = f"{source} · всего Cookie: {len(jar)} · __ddg5_ {'✓' if jar.get('__ddg5_') else '—'}"
+    await emit_overlay(
+        state=state, message=message,
+        text=templ.fac_050(f'✅ <b>Cookie</b> Playerok сохранены ({pretty})'),
+        reply_markup=templ.fac_023(calls.PduPrefsScope(to='auth').pack()),
+    )
+
+
+@router.message(states.PduConnGrp.pdu_golden_key, F.document)
+async def rx_032_doc(message: types.Message, state: FSMContext):
+    try:
+        await state.set_state(None)
+        from lib.util import cookies_from_json_list, _extract_cookie_list
+        from tempfile import NamedTemporaryFile
+        import json as _json
+        with NamedTemporaryFile(delete=False, suffix='.json') as tmp:
+            await message.bot.download(message.document, destination=tmp.name)
+            tmp_path = tmp.name
+        try:
+            with open(tmp_path, encoding='utf-8-sig') as fh:
+                data = _json.load(fh)
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        items = _extract_cookie_list(data)
+        jar = cookies_from_json_list(items)
+        if not jar.get('token') or not token_ok(jar['token']):
+            raise Exception('В документе не найден валидный Cookie `token=` для playerok.com')
+        await _apply_cookie_jar_from_bot(jar, state, message, source='из документа')
+    except Exception as e:
+        await emit_overlay(state=state, message=message, text=templ.fac_050(f'❌ {e}'), reply_markup=templ.fac_023(calls.PduPrefsScope(to='auth').pack()))
+
+
 @router.message(states.PduConnGrp.pdu_golden_key, F.text)
 async def rx_032(message: types.Message, state: FSMContext):
     try:
         await state.set_state(None)
-        token = message.text
-        if not token_ok(token):
-            raise Exception('❌ Неверный формат токена. Пример: eyJhbGciOiJIUzI1NiIsInR5cCI1IkpXVCJ9')
+        from lib.util import cookies_from_json_list, _extract_cookie_list, load_cookies_json, COOKIES_JSON_PATH
+        import json as _json
+        raw = (message.text or '').strip()
+        low = raw.lower()
+        if low in ('true', 'да', 'y', 'yes', 'ok', '1'):
+            jar, err = load_cookies_json(COOKIES_JSON_PATH)
+            if err:
+                raise Exception(err)
+            await _apply_cookie_jar_from_bot(jar, state, message, source=f'из «{COOKIES_JSON_PATH}»')
+            return
+        if raw.startswith('[') or raw.startswith('{'):
+            try:
+                data = _json.loads(raw)
+            except _json.JSONDecodeError as e:
+                raise Exception(f'Некорректный JSON: {e.msg} (строка {e.lineno})')
+            items = _extract_cookie_list(data)
+            jar = cookies_from_json_list(items)
+            if not jar.get('token') or not token_ok(jar['token']):
+                raise Exception('В JSON не найден валидный Cookie `token=` для playerok.com')
+            await _apply_cookie_jar_from_bot(jar, state, message, source='из JSON-текста')
+            return
+        if cookies_ok(raw):
+            jar = parse_cookies_string(raw)
+            await _apply_cookie_jar_from_bot(jar, state, message, source='из Header String')
+            return
+        if not token_ok(raw):
+            raise Exception(
+                f'Варианты:\n'
+                f'• вставьте Cookie в <code>{COOKIES_JSON_PATH}</code> (Cookie-Editor → Export → JSON) и отправьте сюда <code>true</code>\n'
+                f'• или пришлите JSON-файл документом\n'
+                f'• или вставьте JSON-массив прямо в сообщение\n'
+                f'• или Header String (<code>token=...; __ddg5_=...</code>)'
+            )
         config = cfg.read('config')
-        config['account']['token'] = token
+        config['account']['token'] = raw
         cfg.write('config', config)
-        await emit_overlay(state=state, message=message, text=templ.fac_050(f'✅ <b>Токен</b> был успешно изменён на <b>{token}</b>'), reply_markup=templ.fac_023(calls.PduPrefsScope(to='auth').pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_050('✅ <b>Токен</b> сохранён (без Cookie — возможны блокировки DDoS-Guard)'), reply_markup=templ.fac_023(calls.PduPrefsScope(to='auth').pack()))
     except Exception as e:
-        await emit_overlay(state=state, message=message, text=templ.fac_050(e), reply_markup=templ.fac_023(calls.PduPrefsScope(to='auth').pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_050(f'❌ {e}'), reply_markup=templ.fac_023(calls.PduPrefsScope(to='auth').pack()))
 
 @router.message(states.PduConnGrp.pdu_browser_ua, F.text)
 async def rx_033(message: types.Message, state: FSMContext):
@@ -855,3 +928,98 @@ async def rx_001(message: types.Message, state: FSMContext):
         await emit_overlay(state=state, message=message, text=templ.fac_094(f'✅ <b>{len(goods)} товаров</b> успешно добавлено в автовыдачу'), reply_markup=templ.fac_023(calls.PduFulfillFilesPage(page=last_page).pack()))
     except Exception as e:
         await emit_overlay(state=state, message=message, text=templ.fac_094(e), reply_markup=templ.fac_023(calls.PduFulfillFilesPage(page=last_page).pack()))
+
+
+@router.message(
+    states.PduAddonGrp.pdu_addon_import_file,
+    F.document.file_name.lower().endswith('.zip'),
+)
+async def rx_addon_import(message: types.Message, state: FSMContext):
+    import zipfile
+    import tempfile
+
+    last_page = 0
+    try:
+        await state.set_state(None)
+        data = await state.get_data()
+        last_page = data.get('last_page', 0)
+
+        file_name = message.document.file_name or 'extension.zip'
+        with tempfile.NamedTemporaryFile(suffix='.zip', delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            await message.bot.download(message.document, destination=tmp_path)
+
+            try:
+                zf = zipfile.ZipFile(tmp_path)
+            except zipfile.BadZipFile:
+                raise Exception('❌ Архив повреждён или не является zip-файлом.')
+
+            with zf:
+                names = [n for n in zf.namelist() if not n.startswith('__MACOSX/')]
+                for n in names:
+                    if n.startswith(('/', '..', '\\')) or '..' in n.replace('\\', '/').split('/'):
+                        raise Exception(f'❌ Опасный путь в архиве: {n!r}')
+
+                os.makedirs('ext', exist_ok=True)
+
+                top_entries = {n.split('/', 1)[0] for n in names if n.strip()}
+                root_files = [n for n in names if '/' not in n.rstrip('/') and n]
+                has_root_init = any(n == '__init__.py' for n in root_files)
+
+                if has_root_init:
+                    module_name = re.sub(r'[^A-Za-z0-9_]+', '_', os.path.splitext(file_name)[0]).strip('_') or 'extension'
+                    dest = os.path.join('ext', module_name)
+                    if os.path.isdir(dest):
+                        shutil.rmtree(dest, ignore_errors=True)
+                    os.makedirs(dest, exist_ok=True)
+                    zf.extractall(dest)
+                    added = [module_name]
+                else:
+                    root_dirs = {n.rstrip('/').split('/', 1)[0] for n in names if '/' in n}
+                    valid_dirs = []
+                    for d in root_dirs:
+                        if any(n == f'{d}/__init__.py' or n.startswith(f'{d}/') and n.endswith('/__init__.py') and n.count('/') == 1 for n in names):
+                            valid_dirs.append(d)
+                    if not valid_dirs:
+                        valid_dirs = [d for d in root_dirs if any(n == f'{d}/__init__.py' for n in names)]
+                    if not valid_dirs:
+                        raise Exception(
+                            '❌ В архиве не найдено ни одной папки расширения с <code>__init__.py</code> внутри.'
+                        )
+                    with tempfile.TemporaryDirectory(prefix='cxh_ext_') as extract_tmp:
+                        zf.extractall(extract_tmp)
+                        added = []
+                        for d in valid_dirs:
+                            src = os.path.join(extract_tmp, d)
+                            dst = os.path.join('ext', d)
+                            if os.path.isdir(dst):
+                                shutil.rmtree(dst, ignore_errors=True)
+                            shutil.move(src, dst)
+                            added.append(d)
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+        if len(added) == 1:
+            body = f'✅ Расширение <b>{html.escape(added[0])}</b> распаковано в <code>ext/</code>.'
+        else:
+            list_html = '\n'.join(f'• <b>{html.escape(n)}</b>' for n in added)
+            body = f'✅ Импортировано расширений: <b>{len(added)}</b>:\n\n{list_html}'
+        await emit_overlay(
+            state=state,
+            message=message,
+            text=templ.fac_043(
+                f'{body}\n\n❗ Для подключения <b>необходим перезапуск</b> бота.'
+            ),
+            reply_markup=templ.fac_023(calls.PduAddonGrid(page=last_page).pack()),
+        )
+    except Exception as e:
+        await emit_overlay(
+            state=state,
+            message=message,
+            text=templ.fac_043(str(e)),
+            reply_markup=templ.fac_023(calls.PduAddonGrid(page=last_page).pack()),
+        )

@@ -100,3 +100,11 @@ class CX:
 
     dl_rf = 'cx_26'
     dl_ok = 'cx_27'
+
+    sys_chk = 'cx_2a'
+    sys_dl_do = 'cx_2b'
+
+    upd_auto = 'cx_2c'
+    upd_notify = 'cx_2d'
+
+    xt_imp = 'cx_2e'

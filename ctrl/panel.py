@@ -8,6 +8,7 @@ from aiogram import BaseMiddleware, Bot, Dispatcher
 from aiogram.dispatcher.event.bases import UNHANDLED
 from aiogram.types import (
     CallbackQuery,
+    InlineKeyboardButton,
     InlineKeyboardMarkup,
     LinkPreviewOptions,
     MenuButtonCommands,
@@ -253,6 +254,34 @@ class Panel:
         config = cfg.read('config')
         for user_id in config['bot']['admins']:
             await self.bot.send_message(chat_id=user_id, text=templ.fac_014(calling_name, f'https://playerok.com/chats/{chat_id}'), reply_markup=templ.fac_016(), parse_mode='HTML')
+
+    async def notify_update(self, tag: str, html_url: str, download_url: str, body: str = '', current_version: str = '') -> None:
+        import html as _html
+        from .cb import CX
+        title = _html.escape(tag or 'обновление')
+        cur = _html.escape(current_version or '')
+        notes = (body or '').strip()
+        if len(notes) > 600:
+            notes = notes[:600].rstrip() + '…'
+        notes_html = _html.escape(notes)
+        text = (
+            f'🆕 <b>Вышло обновление CXH Playerok</b> — <code>{title}</code>\n'
+            f'Текущая версия: <code>{cur or "—"}</code>\n\n'
+            f'{notes_html if notes_html else "<i>Описание в релизе — см. ссылку ниже.</i>"}'
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text='📥 Загрузить и применить', callback_data=CX.sys_dl_do)],
+            [InlineKeyboardButton(text='📝 Что нового', url=html_url)],
+        ])
+        config = cfg.read('config')
+        for user_id in config.get('bot', {}).get('admins') or []:
+            try:
+                await self.bot.send_message(
+                    chat_id=user_id, text=text, reply_markup=kb, parse_mode='HTML',
+                    link_preview_options=LinkPreviewOptions(is_disabled=True),
+                )
+            except Exception:
+                logger.debug('notify_update: не удалось отправить user=%s', user_id)
 
     async def log_event(self, text: str, kb: InlineKeyboardMarkup | None = None, link_preview_url: str | None = None):
         config = cfg.read('config')

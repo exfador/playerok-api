@@ -254,6 +254,9 @@ def fac_039() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text='🧩 Расширения', callback_data=calls.PduAddonGrid(page=0).pack()),
         ],
         [
+            InlineKeyboardButton(text='🛠 Система', callback_data=calls.PduRootNav(to='system').pack()),
+        ],
+        [
             InlineKeyboardButton(text='📢 Наш канал', url='https://t.me/coxerhub_playerok'),
             InlineKeyboardButton(text='💬 Чат', url='https://t.me/coxerhub_ch'),
         ],
@@ -263,6 +266,46 @@ def fac_039() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text='🐙 GitHub', url='https://github.com/exfador/playerok-api')],
         [InlineKeyboardButton(text='🛒 Приобрести плагины', url='https://t.me/exfador')],
     ])
+
+
+def fac_system_text() -> str:
+    from lib.db import AppDb as _db
+    from lib.updater import is_newer
+    state = _db.get('updater_state') or {}
+    latest = (state.get('latest_tag') or '').strip()
+    checked = (state.get('checked_at') or '').strip()
+    if latest and is_newer(latest, VERSION):
+        status = f'🆕 <b>Доступно обновление:</b> <code>{html_module.escape(latest)}</code>'
+    elif latest:
+        status = '✅ <b>У вас последняя версия</b>'
+    else:
+        status = '⏳ <i>Ещё не проверяли — нажмите «Проверить».</i>'
+    checked_line = f'\n🕒 Последняя проверка: <code>{iso_to_display_str(checked)}</code>' if checked else ''
+    return (
+        '🛠 <b>Система</b>\n\n'
+        f'• Текущая версия: <code>v{VERSION}</code>\n'
+        f'• {status}'
+        f'{checked_line}\n\n'
+        'Бот автоматически проверяет релизы в репозитории и пришлёт уведомление, '
+        'когда появится новая версия. Вручную — кнопкой ниже.'
+    )
+
+
+def fac_system_kb() -> InlineKeyboardMarkup:
+    from lib.db import AppDb as _db
+    from lib.updater import is_newer
+    state = _db.get('updater_state') or {}
+    latest = (state.get('latest_tag') or '').strip()
+    html_url = (state.get('latest_html_url') or '').strip()
+    rows: list[list[InlineKeyboardButton]] = []
+    if latest and is_newer(latest, VERSION):
+        rows.append([InlineKeyboardButton(text=f'📥 Загрузить и применить {latest}', callback_data=CX.sys_dl_do)])
+        if html_url:
+            rows.append([InlineKeyboardButton(text='📝 Что нового', url=html_url)])
+    rows.append([InlineKeyboardButton(text='🔄 Проверить обновления', callback_data=CX.sys_chk)])
+    rows.append([InlineKeyboardButton(text='🐙 GitHub', url='https://github.com/exfador/playerok-api/releases')])
+    rows.append([InlineKeyboardButton(text='⬅️ Меню', callback_data=calls.PduRootNav(to='default').pack())])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def fac_122(playerok_ok: bool = True) -> str:
@@ -378,9 +421,18 @@ def fac_047() -> str:
     loaded = all_extensions()
     n = len(loaded)
     if n:
-        hint = f'Папка <code>ext/</code>: загружено расширений — <code>{n}</code>. Нажмите на название, чтобы включить или выключить.'
+        hint = (
+            f'Папка <code>ext/</code>: загружено расширений — <code>{n}</code>. '
+            'Нажмите на название, чтобы включить или выключить.\n\n'
+            'Можно также <b>импортировать</b> расширение прямо отсюда — кнопка ниже '
+            'принимает zip-архив с папкой расширения.'
+        )
     else:
-        hint = 'Список пуст. Положите модуль в папку <code>ext/</code> и перезапустите бота — оно появится здесь.'
+        hint = (
+            'Список пуст. Положите модуль в папку <code>ext/</code> и перезапустите бота — оно появится здесь.\n\n'
+            'Либо нажмите <b>«Импортировать»</b> ниже и пришлите zip-архив — '
+            'бот сам распакует его в <code>ext/</code>.'
+        )
     return f'🧩 <b>Расширения</b>\n\n{hint}'
 
 
@@ -399,6 +451,7 @@ def fac_046(page: int = 0) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text=f'{page + 1} / {total_pages}', callback_data=CX.xt_pg),
             InlineKeyboardButton(text='▶', callback_data=calls.PduAddonGrid(page=page + 1).pack()) if page < total_pages - 1 else InlineKeyboardButton(text='·', callback_data=CX.noop),
         ])
+    rows.append([InlineKeyboardButton(text='➕ Импортировать', callback_data=CX.xt_imp)])
     rows.append([InlineKeyboardButton(text='⬅️ Меню', callback_data=calls.PduRootNav(to='default').pack())])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 

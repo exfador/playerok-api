@@ -95,7 +95,7 @@ def clear_terminal() -> None:
 
 
 def reboot() -> None:
-    os.environ['CXH_QUICK_REBOOT'] = '1'
+    os.environ['CXH_FAST_REBOOT'] = '1'
     try:
         sys.stdout.flush()
         sys.stderr.flush()
@@ -367,10 +367,11 @@ def _ensure_packaging() -> None:
         )
 
 
-def _requirement_line_satisfied(req_line: str) -> bool:
+def _requirement_status(req_line: str) -> str:
+    """Возвращает 'ok' / 'missing' / 'mismatch' / 'skip' (комментарий или не для этой платформы)."""
     req_line = req_line.strip()
     if not req_line or req_line.startswith(('#', '-')):
-        return True
+        return 'skip'
     from packaging.requirements import Requirement
     from packaging.markers import default_environment
     from importlib.metadata import PackageNotFoundError, version
@@ -378,35 +379,55 @@ def _requirement_line_satisfied(req_line: str) -> bool:
     try:
         req = Requirement(req_line)
     except Exception:
-        return True
+        return 'skip'
     try:
         if req.marker and not req.marker.evaluate(default_environment()):
-            return True
+            return 'skip'
     except Exception:
-        return True
+        return 'skip'
     try:
         installed_v = parse_version(version(req.name))
     except PackageNotFoundError:
-        return False
-    return req.specifier.contains(installed_v, prereleases=True)
+        return 'missing'
+    return 'ok' if req.specifier.contains(installed_v, prereleases=True) else 'mismatch'
 
 
 def check_requirements(requirements_path: str) -> None:
+    """
+    Проверяет requirements.txt и только **сообщает** о проблемах — авто-установку
+    не делаем: на Windows она регулярно падает с WinError 5, когда уже загружены
+    curl_cffi/_wrapper.pyd или tls_requests DLL. Ставьте руками из отдельной
+    консоли: `pip install -r requirements.txt`.
+    """
     try:
         if not os.path.exists(requirements_path):
             return
         _ensure_packaging()
         with open(requirements_path, encoding='utf-8') as f:
-            lines = f.readlines()
-        needs_install = any(
-            not _requirement_line_satisfied(ln.strip())
-            for ln in lines
-            if ln.strip() and not ln.strip().startswith(('#', '-'))
-        )
-        if needs_install:
-            subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', '-r', requirements_path])
+            lines = [ln.strip() for ln in f.readlines()]
+        missing: list[str] = []
+        mismatched: list[str] = []
+        for ln in lines:
+            if not ln or ln.startswith(('#', '-')):
+                continue
+            st = _requirement_status(ln)
+            if st == 'missing':
+                missing.append(ln)
+            elif st == 'mismatch':
+                mismatched.append(ln)
+        if missing:
+            logger.warning(
+                'Отсутствуют пакеты: %s. Запустите `pip install -r %s` из отдельной консоли.',
+                ', '.join(missing), requirements_path,
+            )
+        if mismatched:
+            logger.warning(
+                'Версии пакетов не совпадают с requirements.txt: %s. '
+                'Это не критично, пока импорты работают.',
+                ', '.join(mismatched),
+            )
     except Exception as e:
-        logger.error('Не удалось установить зависимости из «%s»: %s', requirements_path, e)
+        logger.debug('check_requirements: %s', e)
 
 
 def monkey_patch_http() -> None:
@@ -488,6 +509,205 @@ def token_ok(token: str) -> bool:
         return False
 
 
+def parse_cookies_string(cookies: str) -> dict[str, str]:
+    jar: dict[str, str] = {}
+    for chunk in (cookies or '').split(';'):
+        chunk = chunk.strip()
+        if not chunk or '=' not in chunk:
+            continue
+        k, v = chunk.split('=', 1)
+        k = k.strip()
+        if k:
+            jar[k] = v.strip()
+    return jar
+
+
+def cookies_ok(cookies: str) -> bool:
+    if not cookies or not isinstance(cookies, str) or len(cookies) > 32768:
+        return False
+    jar = parse_cookies_string(cookies)
+    tok = jar.get('token')
+    return bool(tok and token_ok(tok))
+
+
+COOKIES_JSON_PATH = 'conf/cookies.json'
+
+_COOKIES_JSON_TEMPLATE = (
+    '{\n'
+    '  "_hint": "Откройте playerok.com → расширение Cookie-Editor → Export → JSON. '
+    'Либо замените весь этот файл скопированным массивом [...] целиком, либо вставьте '
+    'его в поле \\"cookies\\" ниже и поставьте \\"ready\\": true. Затем введите `true` в мастере/боте.",\n'
+    '  "ready": false,\n'
+    '  "cookies": []\n'
+    '}\n'
+)
+
+
+def ensure_cookies_json(path: str = COOKIES_JSON_PATH) -> bool:
+    """Создаёт шаблон cookies.json, если файла нет. Возвращает True, если создали."""
+    import os as _os
+    if _os.path.exists(path):
+        return False
+    _os.makedirs(_os.path.dirname(path) or '.', exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as fh:
+        fh.write(_COOKIES_JSON_TEMPLATE)
+    return True
+
+
+def _extract_cookie_list(data) -> list[dict]:
+    if isinstance(data, list):
+        return [c for c in data if isinstance(c, dict)]
+    if isinstance(data, dict):
+        for key in ('cookies', 'items', 'data'):
+            if isinstance(data.get(key), list):
+                return [c for c in data[key] if isinstance(c, dict)]
+    return []
+
+
+def cookies_from_json_list(items: list[dict]) -> dict[str, str]:
+    jar: dict[str, str] = {}
+    for c in items:
+        name = str(c.get('name') or '').strip()
+        if not name:
+            continue
+        domain = str(c.get('domain') or '').lower()
+        if domain and 'playerok.com' not in domain:
+            continue
+        value = c.get('value')
+        if value is None:
+            continue
+        jar[name] = str(value)
+    return jar
+
+
+def load_cookies_json(path: str = COOKIES_JSON_PATH) -> tuple[dict[str, str], str | None]:
+    """
+    Читает conf/cookies.json. Возвращает (cookie_jar, error_message).
+    error_message == None → всё хорошо.
+    """
+    import json as _json
+    import os as _os
+    if not _os.path.exists(path):
+        return {}, f'Файл «{path}» не найден. Мастер создал пустой шаблон — заполните его и повторите.'
+    try:
+        with open(path, encoding='utf-8-sig') as fh:
+            raw = fh.read().strip()
+    except OSError as e:
+        return {}, f'Не удалось открыть «{path}»: {e}'
+    if not raw:
+        return {}, f'Файл «{path}» пустой. Вставьте экспорт Cookie-Editor.'
+    try:
+        data = _json.loads(raw)
+    except _json.JSONDecodeError as e:
+        return {}, f'«{path}»: некорректный JSON ({e.msg} на строке {e.lineno}).'
+    if isinstance(data, dict) and data.get('ready') is False:
+        return {}, f'В «{path}» стоит "ready": false — исправьте на true после вставки Cookie.'
+    items = _extract_cookie_list(data)
+    if not items:
+        return {}, f'В «{path}» не нашлось списка Cookie. Ожидался массив [{{name, value, domain, ...}}, ...].'
+    jar = cookies_from_json_list(items)
+    if not jar:
+        return {}, f'В «{path}» нет Cookie для playerok.com.'
+    token = jar.get('token')
+    if not token or not token_ok(token):
+        return {}, f'В «{path}» нет валидного Cookie `token=` (JWT) для playerok.com.'
+    return jar, None
+
+
+def cookie_header_from_jar(jar: dict[str, str]) -> str:
+    return '; '.join(f'{k}={v}' for k, v in jar.items() if v)
+
+
+def _path_is_ascii(p: str) -> bool:
+    try:
+        p.encode('ascii')
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
+def _get_short_path_windows(long_path: str) -> str | None:
+    if sys.platform != 'win32':
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes as _wt
+        fn = ctypes.windll.kernel32.GetShortPathNameW
+        fn.argtypes = [_wt.LPCWSTR, _wt.LPWSTR, _wt.DWORD]
+        fn.restype = _wt.DWORD
+        buf = ctypes.create_unicode_buffer(520)
+        needed = fn(long_path, buf, 520)
+        if needed == 0:
+            return None
+        if needed > 520:
+            buf = ctypes.create_unicode_buffer(needed + 1)
+            fn(long_path, buf, needed + 1)
+        out = buf.value
+        return out or None
+    except Exception:
+        return None
+
+
+def _cacert_source_path() -> str:
+    """Возвращает путь к исходному CA bundle. Приоритет — bundled lib/cacert.pem."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    bundled = os.path.join(here, 'cacert.pem')
+    if os.path.exists(bundled):
+        return bundled
+    try:
+        import certifi
+        return certifi.where()
+    except Exception:
+        return ''
+
+
+def _is_file_readable(path: str) -> bool:
+    try:
+        with open(path, 'rb') as fh:
+            fh.read(64)
+        return True
+    except OSError:
+        return False
+
+
+def ascii_safe_ca_bundle() -> str:
+    """
+    Возвращает путь к CA bundle, гарантированно без не-ASCII символов.
+    libcurl под Windows падает `curl: (77) error setting certificate verify locations`,
+    если в пути есть кириллица (типично: C:\\Users\\андрей\\...).
+    Стратегия: если путь уже ASCII — используем его; иначе КОПИРУЕМ в ASCII-локацию
+    (C:\\cxh / C:\\ProgramData\\cxh / C:\\Windows\\Temp) и проверяем, что файл читается.
+    Fallback — GetShortPathNameW.
+    """
+    src = _cacert_source_path()
+    if not src:
+        return ''
+    if _path_is_ascii(src) and _is_file_readable(src):
+        return src
+    if sys.platform == 'win32':
+        for base in ('C:\\cxh', 'C:\\ProgramData\\cxh', 'C:\\Windows\\Temp', os.environ.get('TEMP') or '', os.environ.get('TMP') or ''):
+            if not base or not _path_is_ascii(base):
+                continue
+            try:
+                os.makedirs(base, exist_ok=True)
+                dst = os.path.join(base, 'cxh_cacert.pem')
+                if not os.path.exists(dst) or os.path.getsize(dst) != os.path.getsize(src):
+                    shutil.copyfile(src, dst)
+                if _path_is_ascii(dst) and _is_file_readable(dst):
+                    return dst
+            except OSError:
+                continue
+        short = _get_short_path_windows(src)
+        if short and _path_is_ascii(short) and _is_file_readable(short):
+            return short
+    logger.warning(
+        'Не удалось найти ASCII-путь для CA bundle. Исходный путь: %s. '
+        'Если libcurl ругается curl: (77) — создайте вручную C:\\cxh, дайте туда запись.',
+        src,
+    )
+    return src
+
+
 def account_reachable() -> bool:
     try:
         _load_conn_pok()
@@ -500,7 +720,14 @@ def _load_conn_pok():
     from pok.conn import Conn
     from lib.cfg import AppConf
     c = AppConf.read('config')['account']
-    Conn(token=c['token'], user_agent=c.get('user_agent') or '', requests_timeout=int(c.get('timeout') or 30), proxy=c.get('proxy') or None).get()
+    Conn(
+        token=c.get('token') or None,
+        cookies=c.get('cookies') or None,
+        ddg5=c.get('ddg5') or '',
+        user_agent=c.get('user_agent') or '',
+        requests_timeout=int(c.get('timeout') or 30),
+        proxy=c.get('proxy') or None,
+    ).get()
 
 
 def account_banned() -> bool:
@@ -514,7 +741,14 @@ def _load_conn_pok_acc():
     from pok.conn import Conn
     from lib.cfg import AppConf
     c = AppConf.read('config')['account']
-    return Conn(token=c['token'], user_agent=c.get('user_agent') or '', requests_timeout=int(c.get('timeout') or 30), proxy=c.get('proxy') or None).get()
+    return Conn(
+        token=c.get('token') or None,
+        cookies=c.get('cookies') or None,
+        ddg5=c.get('ddg5') or '',
+        user_agent=c.get('user_agent') or '',
+        requests_timeout=int(c.get('timeout') or 30),
+        proxy=c.get('proxy') or None,
+    ).get()
 
 
 def ua_ok(ua: str) -> bool:

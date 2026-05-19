@@ -27,8 +27,10 @@ class _CfgFile:
 
 _DEFAULTS: dict[str, Any] = {
     'account': {
-        'token': '', 'user_agent': '', 'proxy': '',
+        'token': '', 'cookies': '', 'ddg5': '',
+        'user_agent': '', 'proxy': '',
         'proxy_prompt_ok': False, 'user_agent_prompt_ok': False,
+        'cookies_prompt_ok': False,
         'timeout': 30, 'listener_delay': None,
     },
     'bot': {
@@ -53,8 +55,10 @@ _DEFAULTS: dict[str, Any] = {
         'on': {
             'message': True, 'system': True, 'deal': True, 'review': True,
             'problem': True, 'deal_changed': True, 'restore': True, 'bump': True, 'startup': True,
+            'update': True,
         },
     },
+    'updater': {'enabled': True, 'interval_sec': 3600, 'auto_update': False, 'notify': True},
     'logs':    {'max_mb': 300},
     'debug':   {'verbose': False},
     'display': {'timezone': ''},
@@ -115,6 +119,25 @@ def _load(path: str, default: Any, need_restore: bool = True) -> Any:
         raw = copy.deepcopy(default)
         _save(path, raw)
         return raw
+
+    if isinstance(default, dict) and not isinstance(raw, dict):
+        backup = path + '.corrupt.bak'
+        try:
+            os.replace(path, backup)
+        except OSError:
+            pass
+        fresh = copy.deepcopy(default)
+        _save(path, fresh)
+        return fresh
+    if isinstance(default, list) and not isinstance(raw, list):
+        backup = path + '.corrupt.bak'
+        try:
+            os.replace(path, backup)
+        except OSError:
+            pass
+        fresh = copy.deepcopy(default)
+        _save(path, fresh)
+        return fresh
 
     if need_restore and isinstance(raw, dict) and isinstance(default, dict):
         merged = _restore(raw, default)

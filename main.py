@@ -330,6 +330,57 @@ class CXHBot:
             raise SystemExit(1) from None
         await self._interactive_config()
 
+    async def _startup_auto_update(self) -> None:
+        config = cfgmod.AppConf.read('config') or {}
+        upd = (config.get('updater') or {})
+        if not upd.get('enabled', True) or not upd.get('auto_update', False):
+            return
+        try:
+            from lib.updater import fetch_latest_release, is_newer, GITHUB_REPO as _REPO
+            from lib.updater_apply import download_to_file, extract_zip, apply_update, schedule_reboot, project_root
+            from lib.db import AppDb as _db
+            import tempfile as _tempfile
+            import shutil as _shutil
+            import os as _os
+            from datetime import datetime as _dt
+        except Exception as exc:
+            LOG.debug('Авто-обновление: не удалось импортировать модули — %s', exc)
+            return
+
+        proxy = (config.get('bot') or {}).get('proxy') or None
+        try:
+            rel = await asyncio.to_thread(fetch_latest_release, proxy)
+        except Exception:
+            return
+        if not rel or not rel.tag or not is_newer(rel.tag, const.VERSION):
+            return
+
+        self._log_status('warn', f'Доступна новая версия {rel.tag} (текущая {const.VERSION}) — устанавливаю…')
+        url = rel.download_url or f'https://github.com/{_REPO}/archive/refs/tags/{rel.tag}.zip'
+        tmp_root = _tempfile.mkdtemp(prefix='cxh_update_')
+        zip_path = _os.path.join(tmp_root, f'{rel.tag}.zip')
+        extract_dir = _os.path.join(tmp_root, 'extract')
+        try:
+            await asyncio.to_thread(download_to_file, url, zip_path, proxy)
+            src_root = await asyncio.to_thread(extract_zip, zip_path, extract_dir)
+            stats = await asyncio.to_thread(apply_update, src_root, project_root())
+            st = _db.get('updater_state') or {}
+            st['last_applied_tag'] = rel.tag
+            st['applied_at'] = _dt.now().isoformat(timespec='seconds')
+            _db.set('updater_state', st)
+            self._log_status(
+                'success',
+                f'Обновление {rel.tag} установлено '
+                f'(файлов: {stats.get("copied", 0)}, ошибок: {len(stats.get("errors") or [])}). '
+                f'Перезапуск…',
+            )
+            schedule_reboot(2.0)
+            await asyncio.sleep(5)
+        except Exception as exc:
+            self._log_status('error', f'Авто-обновление не выполнено: {exc}')
+        finally:
+            _shutil.rmtree(tmp_root, ignore_errors=True)
+
     async def _auto_maintenance(self) -> None:
         while not self._shutdown_flag:
             await asyncio.sleep(45)
@@ -388,6 +439,8 @@ class CXHBot:
             )
 
         await self._interactive_config()
+
+        await self._startup_auto_update()
 
         extensions = extmod.discover_extensions()
         extmod.register_extensions(extensions)

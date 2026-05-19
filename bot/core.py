@@ -167,10 +167,12 @@ class MarketBridge:
         self.latest_events_times  = db.get('latest_events_times')
         self.stats                = counters()
         self.account = self.bot_account = Conn(
-            token=self.config['account']['token'],
-            user_agent=self.config['account']['user_agent'],
-            requests_timeout=self.config['account']['timeout'],
-            proxy=self.config['account']['proxy'] or None,
+            token=self.config['account'].get('token') or None,
+            cookies=self.config['account'].get('cookies') or None,
+            ddg5=self.config['account'].get('ddg5') or '',
+            user_agent=self.config['account'].get('user_agent') or '',
+            requests_timeout=self.config['account'].get('timeout') or 30,
+            proxy=self.config['account'].get('proxy') or None,
         ).get()
         self._thread_chat_handles:        dict[str, object]  = {}
         self._chat_msg_history:           dict[str, deque]   = {}
@@ -309,7 +311,7 @@ class MarketBridge:
         )
 
     def _push(self, chat_id: str, text: str | None = None, photo_file_path: str | None = None,
-               read_chat: bool = None, exclude_watermark: bool = False, max_attempts: int = 3) -> ChatMessage:
+               read_chat: bool | None = None, exclude_watermark: bool = False, max_attempts: int = 3) -> ChatMessage | None:
         if not text and not photo_file_path:
             return None
         logger.debug('[_push] chat=%s  text=%r  photo=%s', chat_id, (text or '')[:60], bool(photo_file_path))
@@ -367,7 +369,6 @@ class MarketBridge:
         ud = data.pop('user')
         ud['role'] = AccountRole.__members__.get(ud['role']) if ud['role'] else None
         user = UserProfile(**ud)
-        user.__account = self.account
         data['user'] = user
         ad = data.pop('attachment')
         data['attachment'] = FileObject(**ad)
@@ -424,23 +425,28 @@ class MarketBridge:
             if not all_b and not included:
                 logger.debug('[elevate] пропуск «%s»: нет совпадения с белым списком', name_short)
                 return 'skip_phrases'
-            if not isinstance(item, MyItem):
+            my_item: MyItem | None = item if isinstance(item, MyItem) else None
+            if my_item is None:
                 try:
-                    item = self.account.load_listing(item.id)
+                    loaded = self.account.load_listing(item.id)
                 except Exception:
                     logger.debug('[elevate] пропуск «%s»: не удалось загрузить карточку', name_short)
                     return 'skip_load'
+                if not isinstance(loaded, MyItem):
+                    logger.debug('[elevate] пропуск «%s»: карточка не MyItem', name_short)
+                    return 'skip_load'
+                my_item = loaded
             time.sleep(1)
-            statuses = self.bot_account.load_boost_tiers(item.id, item.raw_price)
+            statuses = self.bot_account.load_boost_tiers(my_item.id, my_item.raw_price)
             try:
                 prem_status = next(s for s in statuses if s.type == BoostLevel.PREMIUM or s.price > 0)
             except StopIteration:
                 raise Exception('PREMIUM статус не найден')
             time.sleep(1)
-            self.bot_account.apply_boost(item.id, prem_status.id)
-            short = item.name[:32] + ('...' if len(item.name) > 32 else '')
-            logger.info('%s«%s»%s поднят  %s%s%s → %s1%s', C_BRIGHT, short, Fore.RESET, C_DIM, item.sequence, Fore.RESET, C_SUCCESS, Fore.RESET)
-            self._notify_elevated(item.name, item.id)
+            self.bot_account.apply_boost(my_item.id, prem_status.id)
+            short = my_item.name[:32] + ('...' if len(my_item.name) > 32 else '')
+            logger.info('%s«%s»%s поднят  %s%s%s → %s1%s', C_BRIGHT, short, Fore.RESET, C_DIM, my_item.sequence, Fore.RESET, C_SUCCESS, Fore.RESET)
+            self._notify_elevated(my_item.name, my_item.id)
             return 'bumped'
         except Exception as e:
             logger.error('Ошибка при поднятии «%s»: %s', item.name, e)
@@ -485,6 +491,7 @@ class MarketBridge:
                     item = self.account.load_listing(item.id)
                 except Exception:
                     return
+            premium_allowed = bool((self.config.get('auto', {}).get('restore') or {}).get('premium', False))
             delays = retry_delays if retry_delays is not None else [5, 15, 30]
             short = item.name[:32] + ('...' if len(item.name) > 32 else '')
             for attempt, delay in enumerate(delays, 1):
@@ -499,7 +506,7 @@ class MarketBridge:
                         return
                     logger.warning('Попытка %d: «%s» — статус %s, повтор...', attempt, short, new_item.status.name)
                 except Exception as free_err:
-                    logger.debug('Восстановление «%s»: бесплатная публикация не сработала (%s), пробую с тиром...', item.name[:32], free_err)
+                    logger.debug('Восстановление «%s»: бесплатная публикация не сработала (%s), проверяю тиры...', item.name[:32], free_err)
                     try:
                         tiers = self.account.load_boost_tiers(item.id, item.raw_price)
                         if not tiers:
@@ -509,15 +516,24 @@ class MarketBridge:
                                 logger.error('Ошибка при восстановлении «%s»: не удалось получить тиры', short)
                             continue
                         free_tier = next((s for s in tiers if s.type == BoostLevel.DEFAULT or s.price == 0), None)
-                        tier = free_tier if free_tier else tiers[0]
-                        if free_tier:
-                            logger.debug('Восстановление «%s»: тир %s (0₽)', item.name[:32], tier.id)
+                        if free_tier is not None:
+                            tier = free_tier
+                            logger.debug('Восстановление «%s»: бесплатный тир %s (0₽)', item.name[:32], tier.id)
+                        elif premium_allowed:
+                            tier = tiers[0]
+                            logger.info('Восстановление «%s»: платный тир «%s» (%s₽) — PREMIUM разрешён',
+                                        item.name[:32],
+                                        tier.name if hasattr(tier, 'name') else tier.id,
+                                        getattr(tier, 'price', '?'))
                         else:
-                            logger.info('Восстановление «%s»: платный тир «%s» (%s₽)', item.name[:32], tier.name if hasattr(tier, 'name') else tier.id, tier.price)
+                            logger.info('%s«%s»%s пропущен: нет бесплатного тира, платное восстановление выключено',
+                                        C_DIM, short, Fore.RESET)
+                            return
                         time.sleep(1)
                         new_item = self.account.activate_listing(item.id, tier.id)
                         if new_item.status in (ListingStage.PENDING_APPROVAL, ListingStage.APPROVED):
-                            logger.info('%s«%s»%s восстановлен', C_BRIGHT, short, Fore.RESET)
+                            label = 'бесплатно' if free_tier is not None else 'PREMIUM'
+                            logger.info('%s«%s»%s восстановлен (%s)', C_BRIGHT, short, Fore.RESET, label)
                             self._notify_reactivated(item.name, item.id)
                             return
                         logger.warning('Попытка %d: «%s» — статус %s, повтор...', attempt, short, new_item.status.name)
@@ -706,7 +722,50 @@ class MarketBridge:
                         logger.error('Ошибка автоподнятия: %s', traceback.format_exc())
                 time.sleep(3)
 
-        for target in (_sync_loop, _refresh_profile_loop, _access_check_loop, _reactivate_expired_loop, _reactivate_poll_loop, _elevate_loop):
+        def _update_check_loop():
+            from lib.updater import fetch_latest_release, is_newer
+            from lib.consts import VERSION as _VERSION
+            time.sleep(20)
+            while True:
+                upd_cfg = (self.config.get('updater') or {})
+                iv = max(300, int(upd_cfg.get('interval_sec') or 3600))
+                if not upd_cfg.get('enabled', True):
+                    time.sleep(iv)
+                    continue
+                try:
+                    rel = fetch_latest_release(self.config.get('bot', {}).get('proxy') or None)
+                    if rel and rel.tag:
+                        state = db.get('updater_state') or {}
+                        state.update({
+                            'latest_tag': rel.tag,
+                            'latest_html_url': rel.html_url,
+                            'latest_download_url': rel.download_url,
+                            'checked_at': datetime.now().isoformat(timespec='seconds'),
+                        })
+                        db.set('updater_state', state)
+                        alerts = self.config.get('alerts') or {}
+                        alerts_on = alerts.get('enabled', True) and (alerts.get('on') or {}).get('update', True)
+                        notify_on = bool((self.config.get('updater') or {}).get('notify', True))
+                        if alerts_on and notify_on and is_newer(rel.tag, _VERSION) and state.get('last_notified_tag') != rel.tag:
+                            panel = _get_panel()
+                            loop = _get_panel_loop()
+                            if panel is not None and loop is not None:
+                                asyncio.run_coroutine_threadsafe(
+                                    panel.notify_update(
+                                        tag=rel.tag, html_url=rel.html_url,
+                                        download_url=rel.download_url, body=rel.body,
+                                        current_version=_VERSION,
+                                    ),
+                                    loop,
+                                )
+                                state['last_notified_tag'] = rel.tag
+                                db.set('updater_state', state)
+                                logger.info('Доступно обновление: %s (текущая %s)', rel.tag, _VERSION)
+                except Exception:
+                    logger.debug('Ошибка проверки обновлений: %s', traceback.format_exc())
+                time.sleep(iv)
+
+        for target in (_sync_loop, _refresh_profile_loop, _access_check_loop, _reactivate_expired_loop, _reactivate_poll_loop, _elevate_loop, _update_check_loop):
             Thread(target=target, daemon=True).start()
 
     def _exec_cmd(self, raw_text: str, chat_id: str, username: str) -> None:

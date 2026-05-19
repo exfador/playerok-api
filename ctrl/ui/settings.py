@@ -102,7 +102,34 @@ def fac_080() -> InlineKeyboardMarkup:
         ],
         [InlineKeyboardButton(text='🔑 Авторизация', callback_data=calls.PduPrefsScope(to='auth').pack())],
         [InlineKeyboardButton(text='©️ Ватермарк', callback_data=calls.PduPrefsScope(to='watermark').pack())],
+        [InlineKeyboardButton(text='🔃 Обновления', callback_data=calls.PduPrefsScope(to='updates').pack())],
         [fac_009()],
+    ])
+
+
+def fac_upd_text() -> str:
+    config = cfg.read('config')
+    upd = (config.get('updater') or {})
+    auto_update = bool(upd.get('auto_update', False))
+    notify = bool(upd.get('notify', True))
+    return (
+        '🔃 <b>Обновления</b>\n\n'
+        f'<b>⬇️ Авто-установка:</b> {fac_004(auto_update)}\n'
+        '<blockquote>Бот сам поставит новую версию на старте, если она доступна. Во время работы обновление не запускается.</blockquote>\n\n'
+        f'<b>🔔 Оповещать:</b> {fac_004(notify)}\n'
+        '<blockquote>При выходе новой версии вам придёт уведомление сюда в Telegram с кнопкой «Загрузить и применить».</blockquote>'
+    )
+
+
+def fac_upd_kb() -> InlineKeyboardMarkup:
+    config = cfg.read('config')
+    upd = (config.get('updater') or {})
+    auto_update = bool(upd.get('auto_update', False))
+    notify = bool(upd.get('notify', True))
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f'⬇️ Авто-установка: {fac_004(auto_update)}', callback_data=CX.upd_auto)],
+        [InlineKeyboardButton(text=f'🔔 Оповещать: {fac_004(notify)}', callback_data=CX.upd_notify)],
+        [InlineKeyboardButton(text='⬅️ Назад', callback_data=calls.PduPrefsScope(to='index').pack())],
     ])
 
 
@@ -120,22 +147,32 @@ def fac_008(val: str | None) -> str:
 
 def fac_052() -> str:
     config = cfg.read('config')
-    token = fac_007(config['account']['token'])
-    timeout = config['account']['timeout'] or '—'
+    acc = config['account']
+    has_cookies = bool((acc.get('cookies') or '').strip())
+    has_ddg5 = '__ddg5_=' in (acc.get('cookies') or '') or bool(acc.get('ddg5'))
+    token = fac_007(acc.get('token'))
+    timeout = acc.get('timeout') or '—'
+    status_cookie = '✅ Cookie загружены' if has_cookies else '⚠️ Cookie не заданы'
+    status_ddg = 'есть <code>__ddg5_</code>' if has_ddg5 else '<b>нет <code>__ddg5_</code></b>'
     return (
         '🔑 <b>Вход на Playerok</b>\n\n'
-        f'• JWT-токен аккаунта: {token}\n'
+        f'• {status_cookie} · {status_ddg}\n'
+        f'• JWT-токен (внутри Cookie): {token}\n'
         f'• Таймаут одного запроса к сайту: <code>{timeout} с</code>\n\n'
-        'Токен берётся в личном кабинете Playerok; без него бот не сможет работать с аккаунтом.'
+        'С обходом DDoS-Guard нужны полные Cookie из браузера '
+        '(Cookie-Editor → Export → Header String). Cookie привязаны к IP и User-Agent: '
+        'при их смене <code>__ddg5_</code> инвалидируется.'
     )
 
 
 def fac_051() -> InlineKeyboardMarkup:
     config = cfg.read('config')
-    token = fac_008(config['account']['token'])
-    timeout = config['account']['timeout'] or '—'
+    acc = config['account']
+    has_cookies = bool((acc.get('cookies') or '').strip())
+    label = 'Cookie: заданы' if has_cookies else f'Токен: {fac_008(acc.get("token"))}'
+    timeout = acc.get('timeout') or '—'
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f'🔑  Токен: {token}', callback_data=CX.pl_tk)],
+        [InlineKeyboardButton(text=f'🔑  {label}', callback_data=CX.pl_tk)],
         [InlineKeyboardButton(text=f'⏱  Таймаут: {timeout} с', callback_data=CX.pl_to)],
         [InlineKeyboardButton(text='⬅️ Назад', callback_data=calls.PduPrefsScope(to='index').pack())],
     ])

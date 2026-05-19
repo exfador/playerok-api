@@ -1,6 +1,6 @@
 from colorama import Fore
 
-BUILD = '2.0.0'
+BUILD = '2.0.3'
 VERSION = BUILD
 ACCENT_COLOR = Fore.CYAN
 C_PRIMARY   = Fore.CYAN

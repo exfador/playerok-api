@@ -85,6 +85,153 @@ async def hx_061(callback: CallbackQuery, callback_data: calls.PduRootNav, state
             templ.fac_082(),
             callback,
         )
+    elif to == 'system':
+        await emit_overlay(state, callback.message, templ.fac_system_text(), templ.fac_system_kb(), callback)
+
+
+@router.callback_query(F.data == CX.sys_chk)
+async def hx_sys_chk(callback: CallbackQuery, state: FSMContext):
+    from lib.updater import fetch_latest_release
+    from lib.db import AppDb as _db
+    from datetime import datetime as _dt
+    try:
+        await callback.answer('Проверяю…')
+    except Exception:
+        pass
+    try:
+        proxy = (cfg.read('config').get('bot') or {}).get('proxy') or None
+        rel = await asyncio.to_thread(fetch_latest_release, proxy)
+    except Exception:
+        rel = None
+    state_d = _db.get('updater_state') or {}
+    if rel and rel.tag:
+        state_d.update({
+            'latest_tag': rel.tag,
+            'latest_html_url': rel.html_url,
+            'latest_download_url': rel.download_url,
+            'checked_at': _dt.now().isoformat(timespec='seconds'),
+        })
+        _db.set('updater_state', state_d)
+    await emit_overlay(state, callback.message, templ.fac_system_text(), templ.fac_system_kb(), callback)
+
+
+@router.callback_query(F.data == CX.upd_auto)
+async def hx_upd_auto(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(None)
+    config = cfg.read('config')
+    upd = config.setdefault('updater', {})
+    upd['auto_update'] = not bool(upd.get('auto_update', False))
+    cfg.write('config', config)
+    _runtime_sync_config()
+    await emit_overlay(state, callback.message, templ.fac_upd_text(), templ.fac_upd_kb(), callback)
+
+
+@router.callback_query(F.data == CX.upd_notify)
+async def hx_upd_notify(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(None)
+    config = cfg.read('config')
+    upd = config.setdefault('updater', {})
+    upd['notify'] = not bool(upd.get('notify', True))
+    cfg.write('config', config)
+    _runtime_sync_config()
+    await emit_overlay(state, callback.message, templ.fac_upd_text(), templ.fac_upd_kb(), callback)
+
+
+@router.callback_query(F.data == CX.sys_dl_do)
+async def hx_sys_dl_do(callback: CallbackQuery, state: FSMContext):
+    import html as _html
+    import os as _os
+    import tempfile as _tempfile
+    import shutil as _shutil
+    from datetime import datetime as _dt
+    from lib.db import AppDb as _db
+    from lib.updater_apply import download_to_file, extract_zip, apply_update, schedule_reboot, project_root
+    try:
+        await callback.answer('Запускаю обновление…')
+    except Exception:
+        pass
+
+    st = _db.get('updater_state') or {}
+    tag = (st.get('latest_tag') or '').strip()
+    if not tag:
+        await emit_overlay(state, callback.message, templ.fac_050('❌ Нет информации о релизе. Нажмите «🔄 Проверить обновления».'), templ.fac_system_kb(), callback)
+        return
+    from lib.updater import GITHUB_REPO as _REPO
+    url = (st.get('latest_download_url') or '').strip() or f'https://github.com/{_REPO}/archive/refs/tags/{tag}.zip'
+
+    msg = callback.message
+    bot = msg.bot
+    chat_id = msg.chat.id
+    msg_id = msg.message_id
+
+    async def set_status(text: str) -> None:
+        try:
+            await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, parse_mode='HTML')
+        except Exception:
+            pass
+
+    await set_status(f'⏳ <b>Скачиваю</b> {_html.escape(tag)}…')
+    proxy = (cfg.read('config').get('bot') or {}).get('proxy') or None
+
+    tmp_root = _tempfile.mkdtemp(prefix='cxh_update_')
+    zip_path = _os.path.join(tmp_root, f'{tag}.zip')
+    extract_dir = _os.path.join(tmp_root, 'extract')
+    progress_state = {'pct': -1}
+
+    def on_progress(done: int, total: int) -> None:
+        if not total:
+            return
+        pct = int(done * 100 / total)
+        if pct == progress_state['pct'] or pct % 10 != 0:
+            return
+        progress_state['pct'] = pct
+        try:
+            import asyncio as _aio
+            _aio.run_coroutine_threadsafe(
+                set_status(f'⏳ <b>Скачиваю</b> {_html.escape(tag)}… <code>{pct}%</code>'),
+                bot.session._loop if hasattr(bot, 'session') and hasattr(bot.session, '_loop') else _aio.get_event_loop(),
+            )
+        except Exception:
+            pass
+
+    try:
+        await asyncio.to_thread(download_to_file, url, zip_path, proxy, on_progress)
+    except Exception as e:
+        await set_status(f'❌ Ошибка скачивания: {_html.escape(str(e))}')
+        _shutil.rmtree(tmp_root, ignore_errors=True)
+        return
+
+    await set_status(f'📦 <b>Распаковываю</b>…')
+    try:
+        src_root = await asyncio.to_thread(extract_zip, zip_path, extract_dir)
+    except Exception as e:
+        await set_status(f'❌ Ошибка распаковки: {_html.escape(str(e))}')
+        _shutil.rmtree(tmp_root, ignore_errors=True)
+        return
+
+    await set_status(f'🔧 <b>Применяю</b> обновление…')
+    try:
+        stats = await asyncio.to_thread(apply_update, src_root, project_root())
+    except Exception as e:
+        await set_status(f'❌ Ошибка применения: {_html.escape(str(e))}')
+        _shutil.rmtree(tmp_root, ignore_errors=True)
+        return
+    finally:
+        _shutil.rmtree(tmp_root, ignore_errors=True)
+
+    st['last_applied_tag'] = tag
+    st['applied_at'] = _dt.now().isoformat(timespec='seconds')
+    _db.set('updater_state', st)
+
+    err_count = len(stats.get('errors', []))
+    await set_status(
+        f'✅ <b>Обновление {_html.escape(tag)} установлено</b>\n'
+        f'Скопировано файлов: <code>{stats.get("copied", 0)}</code>\n'
+        f'Пропущено (conf/db/logs): <code>{stats.get("skipped", 0)}</code>\n'
+        f'Ошибок: <code>{err_count}</code>\n\n'
+        f'♻️ Перезапускаюсь через 3 секунды…'
+    )
+    schedule_reboot(3.0)
 
 @router.callback_query(calls.PduHelpNav.filter())
 async def hx_057(callback: CallbackQuery, callback_data: calls.PduHelpNav, state: FSMContext):
@@ -124,6 +271,8 @@ async def hx_079(callback: CallbackQuery, callback_data: calls.PduPrefsScope, st
         await emit_overlay(state, callback.message, templ.fac_119(), templ.fac_118(), callback)
     elif to == 'other':
         await emit_overlay(state, callback.message, templ.fac_099(), templ.fac_098(), callback)
+    elif to == 'updates':
+        await emit_overlay(state, callback.message, templ.fac_upd_text(), templ.fac_upd_kb(), callback)
 
 @router.callback_query(F.data.in_((CX.nv_rs, CX.nv_bi, CX.nv_bx)))
 async def hx_064(callback: CallbackQuery, state: FSMContext):
@@ -214,6 +363,25 @@ async def hx_066(callback: CallbackQuery, callback_data: calls.PduAddonGrid, sta
     await state.update_data(last_page=page)
     await emit_overlay(state=state, message=callback.message, text=templ.fac_047(), reply_markup=templ.fac_046(page), callback=callback)
 
+
+@router.callback_query(F.data == CX.xt_imp)
+async def hx_xt_imp(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    last_page = data.get('last_page', 0)
+    await state.set_state(states.PduAddonGrp.pdu_addon_import_file)
+    await emit_overlay(
+        state=state,
+        message=callback.message,
+        text=templ.fac_043(
+            '🗂 Пришлите <b>zip-архив</b> с папкой расширения документом.\n\n'
+            '• Архив должен содержать одну папку с <code>__init__.py</code> внутри (структура расширения).\n'
+            '• Или сам <code>__init__.py</code> на верхнем уровне — тогда имя папки возьмётся из имени архива.\n\n'
+            '❗ Чтобы расширение подключилось, потребуется перезапуск.'
+        ),
+        reply_markup=templ.fac_023(calls.PduAddonGrid(page=last_page).pack()),
+        callback=callback,
+    )
+
 @router.callback_query(calls.PduCmdOpen.filter())
 async def hx_015(callback: CallbackQuery, callback_data: calls.PduCmdOpen, state: FSMContext):
     await state.set_state(None)
@@ -272,10 +440,26 @@ async def hx_065(callback: CallbackQuery, callback_data: calls.PduAddonOpen, sta
 
 @router.callback_query(F.data == CX.pl_tk)
 async def hx_049(callback: CallbackQuery, state: FSMContext):
+    from lib.util import COOKIES_JSON_PATH
     await state.set_state(states.PduConnGrp.pdu_golden_key)
     config = cfg.read('config')
-    golden_key = config['account']['token'] or '❌ Не задано'
-    await emit_overlay(state=state, message=callback.message, text=templ.fac_050(f'🔐 Введите новый <b>токен</b> вашего аккаунта:\n・ Текущее: <code>{golden_key}</code>'), reply_markup=templ.fac_023(calls.PduPrefsScope(to='auth').pack()))
+    cookies_raw = (config['account'].get('cookies') or '').strip()
+    token_raw = (config['account'].get('token') or '').strip()
+    if cookies_raw:
+        current = f'Cookie (…{cookies_raw[-12:]})' if len(cookies_raw) > 16 else cookies_raw
+    elif token_raw:
+        current = f'JWT (…{token_raw[-8:]}) · без Cookie DDoS-Guard может блокировать'
+    else:
+        current = '❌ Не задано'
+    await emit_overlay(state=state, message=callback.message, text=templ.fac_050(
+        f'🔐 <b>Cookie Playerok</b>. Сейчас: <code>{current}</code>\n\n'
+        f'Вариант 1 — <b>файл</b>:\n'
+        f'• откройте <code>{COOKIES_JSON_PATH}</code>,\n'
+        f'• вставьте экспорт Cookie-Editor → JSON,\n'
+        f'• отправьте сюда <code>true</code>.\n\n'
+        f'Вариант 2 — <b>документом</b>: пришлите сам JSON-файл.\n'
+        f'Вариант 3 — <b>текстом</b>: JSON-массив или Header String <code>token=…; __ddg5_=…</code>.'
+    ), reply_markup=templ.fac_023(calls.PduPrefsScope(to='auth').pack()))
 
 @router.callback_query(F.data == CX.pl_ua)
 async def hx_050(callback: CallbackQuery, state: FSMContext):

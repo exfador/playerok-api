@@ -6,11 +6,12 @@ import json
 import os
 import ssl
 import time
+import uuid
 import base64
 import certifi
 import tls_requests
 import curl_cffi
-from lib.util import proxy_url_for_requests
+from lib.util import proxy_url_for_requests, ascii_safe_ca_bundle
 from . import models as types
 from .defs import *
 from .gql import *
@@ -72,14 +73,25 @@ class Conn:
             cls.instance = super(Conn, cls).__new__(cls)
         return getattr(cls, 'instance')
 
-    def __init__(self, token: str, user_agent: str = '', proxy: str = None, requests_timeout: int = 15, request_max_retries: int = 5, **kwargs):
-        self.token = token
+    def __init__(self, token: str | None = None, user_agent: str = '', proxy: str = None, requests_timeout: int = 15, request_max_retries: int = 5, cookies: str | dict[str, str] | None = None, ddg5: str = '', **kwargs):
+        if not token and not cookies:
+            raise TypeError('Нужен token или cookies (с полем `token=...`). Экспортируйте Cookie из браузера, где вы авторизованы на playerok.com.')
+        self.token = token or ''
+        self.ddg5 = ddg5 or ''
         self.user_agent = user_agent or 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36'
         self.requests_timeout = requests_timeout
         self.proxy = proxy
         self.__proxy_string = proxy_url_for_requests(self.proxy) if self.proxy else None
         self.request_max_retries = request_max_retries
         self.base_url = 'https://playerok.com'
+        self.cookies: dict[str, str] = self._build_cookie_jar(cookies)
+        self._cookies_lock = __import__('threading').Lock()
+        if not self.token:
+            self.token = self.cookies.get('token', '')
+        else:
+            self.cookies.setdefault('token', self.token)
+        if self.ddg5:
+            self.cookies.setdefault('__ddg5_', self.ddg5)
         self.id: str | None = None
         self.username: str | None = None
         self.email: str | None = None
@@ -95,13 +107,13 @@ class Conn:
         self.has_confirmed_phone_number: bool | None = None
         self.can_publish_items: bool | None = None
         self.profile: AccountProfile | None = None
-        self._ca_bundle = certifi.where()
+        self._ca_bundle = ascii_safe_ca_bundle() or certifi.where()
         self._refresh_clients()
         self.logger = getLogger('pl.conn')
 
     _IMPERSONATE_PROFILES = [
-        'chrome124', 'chrome131', 'chrome120', 'chrome123', 'chrome116',
-        'chrome119', 'chrome107', 'chrome110', 'chrome104',
+        'chrome', 'chrome131', 'chrome124', 'chrome123', 'chrome120',
+        'chrome119', 'chrome116', 'chrome110', 'chrome107', 'chrome104',
     ]
     _profile_index: int = 0
 
@@ -112,6 +124,74 @@ class Conn:
         Conn._profile_index += 1
         self.__tls_requests = tls_requests.Client(proxy=self.__proxy_string)
         self.__curl_session = curl_cffi.Session(impersonate=profile, timeout=10, proxy=self.__proxy_string, verify=self._ca_bundle)
+
+    @staticmethod
+    def _build_cookie_jar(cookies: str | dict[str, str] | None) -> dict[str, str]:
+        if cookies is None:
+            return {}
+        if isinstance(cookies, dict):
+            return {str(k).strip(): str(v).strip() for k, v in cookies.items() if k}
+        jar: dict[str, str] = {}
+        for chunk in str(cookies).split(';'):
+            chunk = chunk.strip()
+            if not chunk or '=' not in chunk:
+                continue
+            k, v = chunk.split('=', 1)
+            k, v = k.strip(), v.strip()
+            if k:
+                jar[k] = v
+        return jar
+
+    def _cookie_header(self) -> str:
+        with self._cookies_lock:
+            return '; '.join(f'{k}={v}' for k, v in self.cookies.items() if v)
+
+    def _ingest_set_cookie(self, resp) -> None:
+        try:
+            headers = resp.headers
+        except Exception:
+            return
+        pairs: list[tuple[str, str]] = []
+        multi = getattr(headers, 'multi_items', None)
+        if callable(multi):
+            try:
+                pairs = [(k, v) for k, v in multi()]
+            except Exception:
+                pairs = []
+        if not pairs:
+            get_list = getattr(headers, 'get_list', None) or getattr(headers, 'getlist', None)
+            if callable(get_list):
+                try:
+                    pairs = [('set-cookie', v) for v in get_list('set-cookie')]
+                except Exception:
+                    pairs = []
+        if not pairs:
+            try:
+                raw = headers.get('set-cookie') or headers.get('Set-Cookie')
+            except Exception:
+                raw = None
+            if raw:
+                pairs = [('set-cookie', raw)]
+        if not pairs:
+            return
+        updates: dict[str, str] = {}
+        for k, v in pairs:
+            if not k or k.lower() != 'set-cookie' or not v:
+                continue
+            first = v.split(';', 1)[0].strip()
+            if '=' not in first:
+                continue
+            name, value = first.split('=', 1)
+            name = name.strip()
+            if name:
+                updates[name] = value.strip()
+        if not updates:
+            return
+        with self._cookies_lock:
+            self.cookies.update(updates)
+            tok = updates.get('token')
+            if tok:
+                self.token = tok
 
     @property
     def _timeout(self) -> int:
@@ -217,17 +297,27 @@ class Conn:
             raise RequestSendingError(url, err)
 
         cf_sigs = ['<title>Just a moment...</title>', 'window._cf_chl_opt', 'Enable JavaScript and cookies to continue', 'Checking your browser before accessing', 'cf-browser-verification', 'Cloudflare Ray ID']
+        ddg_sigs = ['DDoS-Guard', 'DDOS-GUARD', 'ddos-guard.net', 'check.ddos-guard', '__ddg1_', '__ddg5_']
         max_cf_retries = 4
 
         for attempt_i, (pth, ref) in enumerate(path_attempts):
-            _headers = {'accept': '*/*', 'accept-language': 'ru,en;q=0.9,en-GB;q=0.8,en-US;q=0.7', 'access-control-allow-headers': 'sentry-trace, baggage', 'apollo-require-preflight': 'true', 'apollographql-client-name': 'web', 'content-type': 'application/json', 'cookie': f'token={self.token}', 'origin': 'https://playerok.com', 'priority': 'u=1, i', 'referer': ref, 'sec-ch-ua': '"Chromium";v="144", "Google Chrome";v="144", "Not_A Brand";v="99"', 'sec-ch-ua-arch': '"x86"', 'sec-ch-ua-bitness': '"64"', 'sec-ch-ua-full-version': '"144.0.7559.110"', 'sec-ch-ua-full-version-list': 'Not(A:Brand";v="8.0.0.0", "Chromium";v="144.0.7559.110", "Google Chrome";v="144.0.7559.110"', 'sec-ch-ua-mobile': '?0', 'sec-ch-ua-model': '""', 'sec-ch-ua-platform': '"Windows"', 'sec-ch-ua-platform-version': '"19.0.0"', 'sec-fetch-dest': 'empty', 'sec-fetch-mode': 'cors', 'sec-fetch-site': 'same-origin', 'user-agent': self.user_agent, 'x-gql-op': x_gql_op, 'x-gql-path': pth, 'x-timezone-offset': '-180'}
+            _headers = {'accept': '*/*', 'accept-language': 'ru,en;q=0.9,en-GB;q=0.8,en-US;q=0.7', 'access-control-allow-headers': 'sentry-trace, baggage', 'apollo-require-preflight': 'true', 'apollographql-client-name': 'web', 'content-type': 'application/json', 'cookie': self._cookie_header() or f'token={self.token}', 'origin': 'https://playerok.com', 'priority': 'u=1, i', 'referer': ref, 'sec-ch-ua': '"Chromium";v="144", "Google Chrome";v="144", "Not_A Brand";v="99"', 'sec-ch-ua-arch': '"x86"', 'sec-ch-ua-bitness': '"64"', 'sec-ch-ua-full-version': '"144.0.7559.110"', 'sec-ch-ua-full-version-list': 'Not(A:Brand";v="8.0.0.0", "Chromium";v="144.0.7559.110", "Google Chrome";v="144.0.7559.110"', 'sec-ch-ua-mobile': '?0', 'sec-ch-ua-model': '""', 'sec-ch-ua-platform': '"Windows"', 'sec-ch-ua-platform-version': '"19.0.0"', 'sec-fetch-dest': 'empty', 'sec-fetch-mode': 'cors', 'sec-fetch-site': 'same-origin', 'user-agent': self.user_agent, 'x-apollo-operation-name': x_gql_op, 'x-gql-op': x_gql_op, 'x-gql-path': pth, 'x-timezone-offset': '-180'}
             req_headers = {k: v for k, v in _headers.items() if k not in caller_hdr.keys()}
             resp = None
             for cf_i in range(max_cf_retries):
                 resp = make_req(req_headers)
-                if not any((sig in resp.text for sig in cf_sigs)):
+                body = resp.text or ''
+                if any(sig in body for sig in ddg_sigs):
+                    snippet = body[:240].replace('\n', ' ').replace('\r', '')
+                    self.logger.warning(
+                        'DDoS-Guard op=%s path=%s — Cookie __ddg5_ просрочена или не подходит; тело: %s',
+                        x_gql_op, pth, snippet,
+                    )
+                    raise BotCheckDetectedException(resp)
+                if not any(sig in body for sig in cf_sigs):
+                    self._ingest_set_cookie(resp)
                     break
-                snippet = (resp.text or '')[:240].replace('\n', ' ').replace('\r', '')
+                snippet = body[:240].replace('\n', ' ').replace('\r', '')
                 self.logger.warning(
                     'Ответ похож на Cloudflare challenge op=%s path=%s — новая TLS-сессия, повтор %s/%s (без перезапуска). Начало тела: %s',
                     x_gql_op,
@@ -539,21 +629,48 @@ class Conn:
         r = self.request('post', f'{self.base_url}/graphql', headers, payload).json()
         return chat(r['data']['markChatAsRead'])
 
-    def send_message(self, chat_id: str, text: str | None = None, photo_file_path: str | None = None, read_chat: bool = False) -> types.ChatMessage:
-        if not any([text, photo_file_path]):
+    def upload_chat_image(self, photo_file_path: str, chat_id: str) -> types.TemporaryAttachmentUploadOutput:
+        headers = {'accept': '*/*'}
+        operations = {
+            'operationName': 'uploadChatImageIntoTemporaryStore',
+            'query': QUERIES.get('uploadChatImageIntoTemporaryStore'),
+            'variables': {
+                'file': None,
+                'input': {'chatId': chat_id, 'clientAttachmentId': str(uuid.uuid4())},
+            },
+        }
+        with open(photo_file_path, 'rb') as fh:
+            files = {'1': fh}
+            payload = {'operations': json.dumps(operations), 'map': json.dumps({'1': ['variables.file']})}
+            r = self.request('post', f'{self.base_url}/graphql', headers, payload, files).json()
+        return temporary_attachment_upload_output(r['data']['uploadChatImageIntoTemporaryStore'])
+
+    def send_message(self, chat_id: str, text: str | None = None, photo_file_path: str | list[str] | None = None, read_chat: bool = False) -> types.ChatMessage:
+        if not text and not photo_file_path:
             raise TypeError('Не был передан ни один из обязательных аргументов: text, photo_file_path')
         if read_chat:
             self.read_chat(chat_id=chat_id)
+        image_paths: list[str]
+        if photo_file_path is None:
+            image_paths = []
+        elif isinstance(photo_file_path, str):
+            image_paths = [photo_file_path]
+        else:
+            image_paths = list(photo_file_path)
+        images_ids: list[str] = []
+        for p in image_paths:
+            uploaded = self.upload_chat_image(p, chat_id)
+            if uploaded and getattr(uploaded, 'id', None):
+                images_ids.append(uploaded.id)
         headers = {'accept': '*/*'}
-        operations = {'operationName': 'createChatMessage', 'query': QUERIES.get('createChatMessageWithFile') if photo_file_path else QUERIES.get('createChatMessage'), 'variables': {'input': {'chatId': chat_id}}}
-        if photo_file_path:
-            operations['variables']['file'] = None
-        elif text:
-            operations['variables']['input']['text'] = text
-        files = {'1': open(photo_file_path, 'rb')} if photo_file_path else None
-        map_data = {'1': ['variables.file']} if photo_file_path else None
-        payload = operations if not files else {'operations': json.dumps(operations), 'map': json.dumps(map_data)}
-        r = self.request('post', f'{self.base_url}/graphql', headers, payload, files).json()
+        payload = {
+            'operationName': 'createChatMessage',
+            'query': QUERIES.get('createChatMessage'),
+            'variables': {
+                'input': {'chatId': chat_id, 'imagesIds': images_ids, 'text': text or ''},
+            },
+        }
+        r = self.request('post', f'{self.base_url}/graphql', headers, payload).json()
         return chat_message(r['data']['createChatMessage'])
 
     def new_listing(self, game_category_id: str, obtaining_type_id: str, name: str, price: int, description: str, options: list[GameCategoryOption], data_fields: list[GameCategoryDataField], attachments: list[str]) -> types.Item:

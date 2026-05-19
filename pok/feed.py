@@ -251,7 +251,7 @@ class Feed:
     def _subscribe_chat_message_created(self, chat_id):
         _uuid = str(uuid.uuid4())
         self.chat_subscriptions[_uuid] = chat_id
-        self.ws.send(json.dumps({'id': _uuid, 'payload': {'extensions': {}, 'operationName': 'chatMessageCreated', 'query': QUERIES.get('chatMessageCreated'), 'variables': {'filter': {'chatId': chat_id}}}, 'type': 'subscribe'}))
+        self.ws.send(json.dumps({'id': _uuid, 'payload': {'extensions': {}, 'operationName': 'chatMessageCreated', 'query': QUERIES.get('chatMessageCreated'), 'variables': {'filter': {'chatId': chat_id}, 'showForbiddenImage': True}}, 'type': 'subscribe'}))
 
     def _is_chat_subscribed(self, chat_id):
         for _, sub_chat_id in self.chat_subscriptions.items():
@@ -323,6 +323,7 @@ class Feed:
             self._subscribe_chat_message_created(chat_obj.id)
             if is_new_chat:
                 events.append(RoomSnapshotReady(chat_obj))
+        message = self._hydrate_message_if_needed(message, chat_obj.id)
         events.extend(self._events_for_chat_message(chat_obj, message))
         return events
 
@@ -365,7 +366,7 @@ class Feed:
             self.logger.debug(f'Ошибка обработки сообщения в WebSocket`е: {traceback.format_exc()}')
 
     def listen_new_messages(self):
-        headers = {'accept-encoding': 'gzip, deflate, br, zstd', 'accept-language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7', 'cache-control': 'no-cache', 'connection': 'Upgrade', 'origin': 'https://playerok.com', 'pragma': 'no-cache', 'sec-websocket-extensions': 'permessage-deflate; client_max_window_bits', 'cookie': f'token={self.conn.token}', 'user-agent': self.conn.user_agent}
+        base_headers = {'accept-encoding': 'gzip, deflate, br, zstd', 'accept-language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7', 'cache-control': 'no-cache', 'connection': 'Upgrade', 'origin': 'https://playerok.com', 'pragma': 'no-cache', 'sec-websocket-extensions': 'permessage-deflate; client_max_window_bits', 'user-agent': self.conn.user_agent}
         try:
             self.chats = self.conn.load_chats(count=24).chats
         except Exception:
@@ -374,6 +375,8 @@ class Feed:
             yield RoomSnapshotReady(chat_)
         while True:
             try:
+                cookie_hdr = self.conn._cookie_header() or f'token={self.conn.token}'
+                headers = {**base_headers, 'cookie': cookie_hdr}
                 self.ws = websocket.WebSocket(sslopt={'ca_certs': self.conn._ca_bundle})
                 self.ws.connect(url='wss://ws.playerok.com/graphql', header=[f'{k}: {v}' for k, v in headers.items()], subprotocols=['graphql-transport-ws'])
                 self._send_connection_init()

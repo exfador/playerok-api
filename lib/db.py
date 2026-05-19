@@ -16,8 +16,9 @@ _USERS  = _DbFile('initialized_users',  'db/initialized_users.json',  [])
 _ITEMS  = _DbFile('saved_items',         'db/saved_items.json',         [])
 _EVENTS = _DbFile('latest_events_times', 'db/latest_events_times.json', {'auto_bump_items': None})
 _STATS  = _DbFile('stats',               'db/stats.json',               {'deals_completed': 0, 'deals_refunded': 0, 'earned_money': 0})
+_UPD    = _DbFile('updater_state',       'db/updater_state.json',       {'last_notified_tag': '', 'latest_tag': '', 'latest_html_url': '', 'latest_download_url': '', 'checked_at': ''})
 
-_ALL: list[_DbFile] = [_USERS, _ITEMS, _EVENTS, _STATS]
+_ALL: list[_DbFile] = [_USERS, _ITEMS, _EVENTS, _STATS, _UPD]
 
 
 def _read(path: str, default: Any) -> Any:

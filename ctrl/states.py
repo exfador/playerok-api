@@ -29,6 +29,7 @@ class PduTplGrp(StatesGroup):
 
 class PduAddonGrp(StatesGroup):
     pdu_addon_sheet = State()
+    pdu_addon_import_file = State()
 
 
 class PduReviveGrp(StatesGroup):
