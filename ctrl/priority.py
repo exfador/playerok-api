@@ -22,5 +22,5 @@ async def on_cmd_restart(message: types.Message, state: FSMContext):
     await asyncio.sleep(0.6)
     try:
         reboot()
-    except OSError as e:
+    except Exception as e:
         await message.answer(f'❌ Не удалось перезапустить процесс: {e}')

@@ -2,6 +2,7 @@ from aiogram.types import BotCommand
 
 PANEL_COMMANDS: dict[str, tuple[str, str]] = {
     'start': ('on_cmd_start', '🏠 Меню и панель'),
+    'status': ('on_cmd_status', '🟢 Состояние 24/7'),
     'logs': ('on_cmd_logs', '📁 Скачать логи'),
     'restart': ('on_cmd_restart', '🔄 Перезапуск бота'),
 }

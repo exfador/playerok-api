@@ -74,7 +74,7 @@ class AccountProfile:
         self.system_chat_id: str = system_chat_id
         self.has_frozen_balance: bool = has_frozen_balance
         self.has_enabled_notifications: bool = has_enabled_notifications
-        self.unread_chats_counter: bool | None = unread_chats_counter
+        self.unread_chats_counter: int | None = unread_chats_counter
 
 class UserProfile:
 
@@ -89,7 +89,7 @@ class UserProfile:
         self.reviews_count: int = reviews_count
         self.support_chat_id: str | None = support_chat_id
         self.system_chat_id: str | None = system_chat_id
-        self.created_at: str = created_at
+        self.created_at: str | None = created_at
 
     def load_listings(self, count: int=24, game_id: str | None=None, category_id: str | None=None, statuses: list[ListingStage] | None=None, after_cursor: str | None=None) -> ItemProfileList:
         from .client import get_account
@@ -124,7 +124,7 @@ class UserProfile:
             if max_item_price is not None:
                 item_price['max'] = max_item_price
             filters['itemPrice'] = item_price
-        payload = {'operationName': 'testimonials', 'variables': json.dumps({'pagination': {'first': count, 'after': after_cursor}, 'filter': filters, 'sort': {'direction': sort_direction.name if sort_direction else None, 'field': sort_field}}), 'extensions': json.dumps({'persistedQuery': {'version': 1, 'sha256Hash': PERSISTED_QUERIES.get('testimonials')}})}
+        payload = {'operationName': 'testimonials', 'variables': json.dumps({'pagination': {'first': count, 'after': after_cursor}, 'filter': filters, 'sort': {'direction': sort_direction.name if sort_direction else None, 'field': sort_field}, 'hasSupportAccess': False}), 'extensions': json.dumps({'persistedQuery': {'version': 1, 'sha256Hash': PERSISTED_QUERIES.get('testimonials')}})}
         r = account.request('get', f'{account.base_url}/graphql', headers, payload).json()
         return parser.review_list(r['data']['testimonials'])
 
@@ -135,7 +135,7 @@ class Event:
 
 class ItemDeal:
 
-    def __init__(self, id: str, status: DealStage, status_expiration_date: str | None, status_description: str | None, direction: DealFlow, obtaining: str | None, has_problem: bool, report_problem_enabled: bool | None, completed_user: UserProfile | None, props: str | None, previous_status: DealStage | None, completed_at: str, created_at: str, logs: list[ItemLog] | None, transaction: Transaction | None, user: UserProfile, chat: Chat | None, item: 'Item | MyItem | ItemProfile', review: Review | None, obtaining_fields: list[GameCategoryDataField] | None, comment_from_buyer: str | None):
+    def __init__(self, id: str, status: DealStage, status_expiration_date: str | None, status_description: str | None, direction: DealFlow, obtaining: str | None, has_problem: bool, report_problem_enabled: bool | None, completed_user: UserProfile | None, props: str | None, previous_status: DealStage | None, completed_at: str | None, created_at: str | None, logs: list[ItemLog] | None, transaction: Transaction | None, user: UserProfile, chat: Chat | None, item: 'Item | MyItem | ItemProfile', review: Review | None, obtaining_fields: list[GameCategoryDataField] | None, comment_from_buyer: str | None):
         self.id: str = id
         self.status: DealStage = status
         self.status_expiration_date: str | None = status_expiration_date
@@ -179,7 +179,7 @@ class GameCategoryAgreement:
         self.id: str = id
         self.description: str = description
         self.icontype: GameCategoryAgreementIconTypes = icontype
-        self.sequence: str = sequence
+        self.sequence: int = sequence
 
 class GameCategoryAgreementPageInfo:
 
@@ -223,7 +223,7 @@ class GameCategoryObtainingTypeList:
 
     def __init__(self, obtaining_types: list[GameCategoryObtainingType], page_info: GameCategoryObtainingTypePageInfo, total_count: int):
         self.obtaining_types: list[GameCategoryObtainingType] = obtaining_types
-        self.page_info: GameCategoryAgreementPageInfo = page_info
+        self.page_info: GameCategoryObtainingTypePageInfo = page_info
         self.total_count: int = total_count
 
 class GameCategoryDataField:
@@ -301,7 +301,7 @@ class GameCategory:
         self.game_id: str | None = game_id
         self.obtaining: str | None = obtaining
         self.options: list[GameCategoryOption] | None = options
-        self.props: str | None = props
+        self.props: GameCategoryProps | None = props
         self.no_comment_from_buyer: bool | None = no_comment_from_buyer
         self.instruction_for_buyer: str | None = instruction_for_buyer
         self.instruction_for_seller: str | None = instruction_for_seller
@@ -329,7 +329,7 @@ class GameProfile:
         self.id: str = id
         self.slug: str = slug
         self.name: str = name
-        self.type: GameTypes = id
+        self.type: GameTypes = type
         self.logo: FileObject = logo
 
 class GamePageInfo:
@@ -344,12 +344,12 @@ class GameList:
 
     def __init__(self, games: list[Game], page_info: GamePageInfo, total_count: int):
         self.games: list[Game] = games
-        self.page_info: ChatPageInfo = page_info
+        self.page_info: GamePageInfo = page_info
         self.total_count: int = total_count
 
 class ItemPriorityStatusPriceRange:
 
-    def __init__(self, min: int, max: str):
+    def __init__(self, min: int, max: int):
         self.min: int = min
         self.max: int = max
 
@@ -424,7 +424,7 @@ class MyItem:
         self.sequence: int | None = sequence
         self.status_expiration_date: str | None = status_expiration_date
         self.status_description: str | None = status_description
-        self.status_payment: str | None = status_payment
+        self.status_payment: Transaction | None = status_payment
         self.views_counter: int = views_counter
         self.is_editable: bool = is_editable
         self.approval_date: str | None = approval_date
@@ -475,12 +475,12 @@ class SBPBankMember:
 
 class TransactionPaymentMethod:
 
-    def __init__(self, id: PayMethod, name: str, fee: int, provider_id: PayGateway, account: AccountProfile | None, props: TransactionProviderProps, limits: TransactionProviderLimits):
+    def __init__(self, id: PayMethod, name: str, fee: int, provider_id: PayGateway, account: TransactionProviderAccount | None, props: TransactionProviderProps, limits: TransactionProviderLimits):
         self.id: PayMethod = id
         self.name: str = name
         self.fee: int = fee
         self.provider_id: PayGateway = provider_id
-        self.account: AccountProfile | None = account
+        self.account: TransactionProviderAccount | None = account
         self.props: TransactionProviderProps = props
         self.limits: TransactionProviderLimits = limits
 
@@ -509,9 +509,18 @@ class TransactionProviderProps:
         self.required_user_data: TransactionProviderRequiredUserData = required_user_data
         self.tooltip: str | None = tooltip
 
+class TransactionProviderAccount:
+
+    def __init__(self, id: str, value: str, user_id: str, provider_id: PayGateway, payment_method_id: PayMethod | None):
+        self.id: str = id
+        self.value: str = value
+        self.user_id: str = user_id
+        self.provider_id: PayGateway = provider_id
+        self.payment_method_id: PayMethod | None = payment_method_id
+
 class TransactionProvider:
 
-    def __init__(self, id: PayGateway, name: str, fee: int, min_fee_amount: int | None, description: str | None, account: AccountProfile | None, props: TransactionProviderProps, limits: TransactionProviderLimits, payment_methods: list[TransactionPaymentMethod]):
+    def __init__(self, id: PayGateway, name: str, fee: int, min_fee_amount: int | None, description: str | None, account: TransactionProviderAccount | None, props: TransactionProviderProps, limits: TransactionProviderLimits, payment_methods: list[TransactionPaymentMethod]):
         self.id: PayGateway = id
         self.name: str = name
         self.fee: int = fee
@@ -524,7 +533,7 @@ class TransactionProvider:
 
 class Transaction:
 
-    def __init__(self, id: str, operation: TxKind, direction: TransactionDirections, provider_id: PayGateway, provider: TransactionProvider, user: UserProfile, creator: UserProfile, status: TxStage, status_description: str | None, status_expiration_date: str | None, value: int, fee: int, created_at: str, verified_at: str | None, verified_by: UserProfile | None, completed_at: str | None, completed_by: UserProfile | None, payment_method_id: str | None, is_suspicious: bool | None, sbp_bank_name: str | None):
+    def __init__(self, id: str, operation: TxKind, direction: TransactionDirections, provider_id: PayGateway, provider: TransactionProvider, user: UserProfile, creator: UserProfile | None, status: TxStage, status_description: str | None, status_expiration_date: str | None, value: int, fee: int, created_at: str, verified_at: str | None, verified_by: UserProfile | None, completed_at: str | None, completed_by: UserProfile | None, payment_method_id: PayMethod | None, is_suspicious: bool | None, sbp_bank_name: str | None, props: dict | None = None, auto_claimed_at: str | None = None):
         self.id: str = id
         self.operation: TxKind = operation
         self.direction: TransactionDirections = direction
@@ -542,9 +551,11 @@ class Transaction:
         self.verified_by: UserProfile | None = verified_by
         self.completed_at: str | None = completed_at
         self.completed_by: UserProfile | None = completed_by
-        self.payment_method_id: str | None = payment_method_id
+        self.payment_method_id: PayMethod | None = payment_method_id
         self.is_suspicious: bool | None = is_suspicious
         self.sbp_bank_name: str | None = sbp_bank_name
+        self.props: dict | None = props
+        self.auto_claimed_at: str | None = auto_claimed_at
 
 class TransactionPageInfo:
 
@@ -623,7 +634,7 @@ class ChatMessage:
         self.deal: ItemDeal | None = deal
         self.item: ItemProfile | None = item
         self.transaction: Transaction | None = transaction
-        self.moderator: Moderator = moderator
+        self.moderator: Moderator | None = moderator
         self.event_by_user: UserProfile | None = event_by_user
         self.event_to_user: UserProfile | None = event_to_user
         self.is_auto_response: bool = is_auto_response
@@ -654,7 +665,7 @@ class Chat:
         self.unread_messages_counter: int = unread_messages_counter
         self.bookmarked: bool | None = bookmarked
         self.is_texting_allowed: bool | None = is_texting_allowed
-        self.owner: UserProfile = owner
+        self.owner: UserProfile | None = owner
         self.deals: list[ItemDeal] | None = deals
         self.last_message: ChatMessage | None = last_message
         self.users: list[UserProfile] = users

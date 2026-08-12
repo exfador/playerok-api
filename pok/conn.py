@@ -3,14 +3,15 @@ from typing import *
 from logging import getLogger
 from typing import Literal
 import json
-import os
 import ssl
-import time
+import threading
 import uuid
 import base64
 import certifi
+import requests
 import tls_requests
 import curl_cffi
+from contextlib import ExitStack
 from lib.util import proxy_url_for_requests, ascii_safe_ca_bundle
 from . import models as types
 from .defs import *
@@ -66,6 +67,16 @@ def _proxy_dial_failure_hint(err: str) -> str:
     return ' | Проверьте account.proxy / bot.proxy в conf/config.json.'
 
 
+def _rewind_upload_files(files: dict[str, Any]) -> None:
+    for value in files.values():
+        stream = value
+        if isinstance(value, (tuple, list)) and len(value) > 1:
+            stream = value[1]
+        seek = getattr(stream, 'seek', None)
+        if callable(seek):
+            seek(0)
+
+
 class Conn:
 
     def __new__(cls, *args, **kwargs) -> Conn:
@@ -85,7 +96,8 @@ class Conn:
         self.request_max_retries = request_max_retries
         self.base_url = 'https://playerok.com'
         self.cookies: dict[str, str] = self._build_cookie_jar(cookies)
-        self._cookies_lock = __import__('threading').Lock()
+        self._cookies_lock = threading.Lock()
+        self._request_lock = threading.RLock()
         if not self.token:
             self.token = self.cookies.get('token', '')
         else:
@@ -118,12 +130,13 @@ class Conn:
     _profile_index: int = 0
 
     def _refresh_clients(self):
-        profile = self._IMPERSONATE_PROFILES[
-            Conn._profile_index % len(self._IMPERSONATE_PROFILES)
-        ]
-        Conn._profile_index += 1
-        self.__tls_requests = tls_requests.Client(proxy=self.__proxy_string)
-        self.__curl_session = curl_cffi.Session(impersonate=profile, timeout=10, proxy=self.__proxy_string, verify=self._ca_bundle)
+        with self._request_lock:
+            profile = self._IMPERSONATE_PROFILES[
+                Conn._profile_index % len(self._IMPERSONATE_PROFILES)
+            ]
+            Conn._profile_index += 1
+            self.__tls_requests = tls_requests.Client(proxy=self.__proxy_string)
+            self.__curl_session = curl_cffi.Session(impersonate=profile, timeout=10, proxy=self.__proxy_string, verify=self._ca_bundle)
 
     @staticmethod
     def _build_cookie_jar(cookies: str | dict[str, str] | None) -> dict[str, str]:
@@ -210,7 +223,9 @@ class Conn:
         except Exception:
             return False
 
-    def request(self, method: Literal['get', 'post'], url: str, headers: dict[str, str], payload: dict[str, str] | None = None, files: dict | None = None) -> requests.Response:
+    def request(self, method: Literal['get', 'post'], url: str, headers: dict[str, str], payload: dict[str, Any] | None = None, files: dict | None = None) -> requests.Response:
+        if method not in ('get', 'post'):
+            raise ValueError(f'Неподдерживаемый HTTP-метод: {method}')
         caller_hdr = dict(headers or {})
         try:
             x_gql_op = payload.get('operationName', 'viewer')
@@ -254,21 +269,43 @@ class Conn:
         verbose = self._verbose
 
         if verbose:
-            safe_payload = {k: v for k, v in (payload or {}).items() if k != 'query'} if isinstance(payload, dict) else payload
-            self.logger.debug(f'→ {method.upper()} {url}  op={x_gql_op}  payload={safe_payload}')
+            payload_keys = sorted((payload or {}).keys()) if isinstance(payload, dict) else []
+            variable_keys: list[str] = []
+            if isinstance(payload, dict):
+                raw_variables = payload.get('variables')
+                if isinstance(raw_variables, str):
+                    try:
+                        raw_variables = json.loads(raw_variables)
+                    except Exception:
+                        raw_variables = None
+                if isinstance(raw_variables, dict):
+                    variable_keys = sorted(raw_variables.keys())
+            self.logger.debug(
+                '→ %s %s op=%s payload_keys=%s variable_keys=%s',
+                method.upper(),
+                url,
+                x_gql_op,
+                payload_keys,
+                variable_keys,
+            )
 
         def make_req(req_headers: dict[str, str]):
             err = ''
-            max_try = 8
+            try:
+                max_try = max(1, int(self.request_max_retries))
+            except (TypeError, ValueError):
+                max_try = 1
             for attempt in range(max_try):
                 try:
-                    if method == 'get':
-                        r = self.__curl_session.get(url=url, params=payload, headers=req_headers, timeout=self._timeout)
-                    elif method == 'post':
-                        if files:
-                            r = self.__tls_requests.post(url=url, json=payload if not files else None, data=payload if files else None, headers=req_headers, files=files, timeout=self._timeout)
-                        else:
-                            r = self.__curl_session.post(url=url, json=payload, headers=req_headers, timeout=self._timeout)
+                    with self._request_lock:
+                        if method == 'get':
+                            r = self.__curl_session.get(url=url, params=payload, headers=req_headers, timeout=self._timeout)
+                        elif method == 'post':
+                            if files:
+                                _rewind_upload_files(files)
+                                r = self.__tls_requests.post(url=url, json=None, data=payload, headers=req_headers, files=files, timeout=self._timeout)
+                            else:
+                                r = self.__curl_session.post(url=url, json=payload, headers=req_headers, timeout=self._timeout)
                     return r
                 except Exception as e:
                     err = str(e)
@@ -290,8 +327,12 @@ class Conn:
                         )
                         self._refresh_clients()
                         continue
-                    self.logger.debug('Ошибка при отправке запроса: %s', e)
-                    self.logger.debug('Отправляю запрос повторно…')
+                    self.logger.warning(
+                        'Невосстановимая ошибка запроса op=%s: %s',
+                        x_gql_op,
+                        err[:800],
+                    )
+                    raise RequestSendingError(url, err) from e
             if err and 'curl: (28)' in err.lower():
                 err = f'{err}{_proxy_dial_failure_hint(err)}'
             raise RequestSendingError(url, err)
@@ -301,8 +342,18 @@ class Conn:
         max_cf_retries = 4
 
         for attempt_i, (pth, ref) in enumerate(path_attempts):
-            _headers = {'accept': '*/*', 'accept-language': 'ru,en;q=0.9,en-GB;q=0.8,en-US;q=0.7', 'access-control-allow-headers': 'sentry-trace, baggage', 'apollo-require-preflight': 'true', 'apollographql-client-name': 'web', 'content-type': 'application/json', 'cookie': self._cookie_header() or f'token={self.token}', 'origin': 'https://playerok.com', 'priority': 'u=1, i', 'referer': ref, 'sec-ch-ua': '"Chromium";v="144", "Google Chrome";v="144", "Not_A Brand";v="99"', 'sec-ch-ua-arch': '"x86"', 'sec-ch-ua-bitness': '"64"', 'sec-ch-ua-full-version': '"144.0.7559.110"', 'sec-ch-ua-full-version-list': 'Not(A:Brand";v="8.0.0.0", "Chromium";v="144.0.7559.110", "Google Chrome";v="144.0.7559.110"', 'sec-ch-ua-mobile': '?0', 'sec-ch-ua-model': '""', 'sec-ch-ua-platform': '"Windows"', 'sec-ch-ua-platform-version': '"19.0.0"', 'sec-fetch-dest': 'empty', 'sec-fetch-mode': 'cors', 'sec-fetch-site': 'same-origin', 'user-agent': self.user_agent, 'x-apollo-operation-name': x_gql_op, 'x-gql-op': x_gql_op, 'x-gql-path': pth, 'x-timezone-offset': '-180'}
-            req_headers = {k: v for k, v in _headers.items() if k not in caller_hdr.keys()}
+            _headers = {'accept': '*/*', 'accept-language': 'ru,en;q=0.9,en-GB;q=0.8,en-US;q=0.7', 'apollo-require-preflight': 'true', 'apollographql-client-name': 'web', 'content-type': 'application/json', 'cookie': self._cookie_header() or f'token={self.token}', 'origin': 'https://playerok.com', 'priority': 'u=1, i', 'referer': ref, 'sec-ch-ua': '"Chromium";v="144", "Google Chrome";v="144", "Not_A Brand";v="99"', 'sec-ch-ua-arch': '"x86"', 'sec-ch-ua-bitness': '"64"', 'sec-ch-ua-full-version': '"144.0.7559.110"', 'sec-ch-ua-full-version-list': 'Not(A:Brand";v="8.0.0.0", "Chromium";v="144.0.7559.110", "Google Chrome";v="144.0.7559.110"', 'sec-ch-ua-mobile': '?0', 'sec-ch-ua-model': '""', 'sec-ch-ua-platform': '"Windows"', 'sec-ch-ua-platform-version': '"19.0.0"', 'sec-fetch-dest': 'empty', 'sec-fetch-mode': 'cors', 'sec-fetch-site': 'same-origin', 'user-agent': self.user_agent, 'x-apollo-operation-name': x_gql_op, 'x-gql-op': x_gql_op, 'x-gql-path': pth, 'x-timezone-offset': '-180'}
+            if files:
+                _headers.pop('content-type', None)
+            req_headers = dict(_headers)
+            for key, value in caller_hdr.items():
+                old_key = next((h for h in req_headers if h.lower() == key.lower()), None)
+                if old_key is not None and old_key != key:
+                    del req_headers[old_key]
+                req_headers[key] = value
+            if files:
+                for key in [key for key in req_headers if key.lower() == 'content-type']:
+                    del req_headers[key]
             resp = None
             for cf_i in range(max_cf_retries):
                 resp = make_req(req_headers)
@@ -338,26 +389,42 @@ class Conn:
                 pass
 
             if verbose:
-                self.logger.debug(f'← {resp.status_code}  op={x_gql_op}  path={pth}  json={json.dumps(json_data, ensure_ascii=False)[:800]}')
+                data = json_data.get('data') if isinstance(json_data, dict) else None
+                data_keys = sorted(data.keys()) if isinstance(data, dict) else []
+                error_count = len(json_data.get('errors') or []) if isinstance(json_data, dict) else 0
+                self.logger.debug(
+                    '← %s op=%s path=%s data_keys=%s errors=%s',
+                    resp.status_code,
+                    x_gql_op,
+                    pth,
+                    data_keys,
+                    error_count,
+                )
 
             if 'errors' in json_data:
-                msg = str((json_data.get('errors') or [{}])[0].get('message', '')).lower()
+                errors = json_data.get('errors') or []
+                msg = str((errors or [{}])[0].get('message', '')).lower()
                 permissionish = any(x in msg for x in ('доступ', 'access denied', 'permission', 'forbidden'))
                 last_attempt = attempt_i >= len(path_attempts) - 1
                 if x_gql_op not in wallet_ops or not permissionish or last_attempt:
-                    if verbose:
-                        self.logger.debug(f'⚠ API error  op={x_gql_op}  errors={json_data["errors"]}')
-                    try:
-                        err_txt = json.dumps(json_data.get('errors'), ensure_ascii=False)
-                    except Exception:
-                        err_txt = str(json_data.get('errors'))
+                    safe_errors = []
+                    for error in errors[:5]:
+                        if isinstance(error, dict):
+                            extensions = error.get('extensions') or {}
+                            safe_errors.append({
+                                'message': str(error.get('message', ''))[:500],
+                                'code': extensions.get('code'),
+                                'path': error.get('path'),
+                            })
+                        else:
+                            safe_errors.append({'message': str(error)[:500]})
                     self.logger.warning(
                         'GraphQL ошибка op=%s x-gql-path=%s referer=%s http=%s errors=%s',
                         x_gql_op,
                         pth,
                         ref,
                         resp.status_code,
-                        err_txt[:2000],
+                        safe_errors,
                     )
                     raise RequestApiError(resp)
                 self.logger.debug(
@@ -387,24 +454,7 @@ class Conn:
         headers = {'accept': '*/*'}
         payload = {'operationName': 'viewer', 'query': QUERIES.get('viewer'), 'variables': {}}
         url = f'{self.base_url}/graphql'
-        last_err: BaseException | None = None
-        for attempt in range(1, 4):
-            try:
-                r = self.request('post', url, headers, payload).json()
-                break
-            except RequestSendingError as e:
-                last_err = e
-                if attempt < 3:
-                    self.logger.warning(
-                        'viewer: сеть/прокси (%s/%s) — %s; повтор через 2 с…',
-                        attempt,
-                        3,
-                        str(e)[:200],
-                    )
-                    time.sleep(2)
-                continue
-        else:
-            raise last_err
+        r = self.request('post', url, headers, payload).json()
         data: dict = r['data']['viewer']
         if data is None:
             raise UnauthorizedError()
@@ -549,6 +599,7 @@ class Conn:
 
     def find_chat_by_name(self, username: str) -> types.Chat | None:
         next_cursor = None
+        seen_cursors: set[str] = set()
         while True:
             chats = self.load_chats(count=24, after_cursor=next_cursor)
             for chat_item in chats.chats:
@@ -556,7 +607,13 @@ class Conn:
                     return chat_item
             if not chats.page_info.has_next_page:
                 break
-            next_cursor = chats.page_info.end_cursor
+            new_cursor = chats.page_info.end_cursor
+            if not new_cursor or new_cursor == next_cursor or new_cursor in seen_cursors:
+                self.logger.warning('Playerok вернул повторяющийся cursor при поиске чата %s', username)
+                break
+            seen_cursors.add(new_cursor)
+            next_cursor = new_cursor
+        return None
 
     _CHAT_MESSAGES_PAGE = 10
 
@@ -593,7 +650,6 @@ class Conn:
                 pag['after'] = cursor
             r = None
             last_err: RequestFailedError | None = None
-            # Как в веб-клиенте: GET + showForbiddenImage=true; при 5xx пробуем остальные комбинации.
             for method, show_forbidden in (('get', True), ('get', False), ('post', True), ('post', False)):
                 try:
                     r = self._chat_messages_one_page(chat_id, pag, show_forbidden, method)
@@ -642,7 +698,7 @@ class Conn:
         with open(photo_file_path, 'rb') as fh:
             files = {'1': fh}
             payload = {'operations': json.dumps(operations), 'map': json.dumps({'1': ['variables.file']})}
-            r = self.request('post', f'{self.base_url}/graphql', headers, payload, files).json()
+            r = self.request('post', f'{self.base_url}/graphql', headers, payload if files else operations, files if files else None).json()
         return temporary_attachment_upload_output(r['data']['uploadChatImageIntoTemporaryStore'])
 
     def send_message(self, chat_id: str, text: str | None = None, photo_file_path: str | list[str] | None = None, read_chat: bool = False) -> types.ChatMessage:
@@ -679,12 +735,13 @@ class Conn:
         headers = {'accept': '*/*'}
         operations = {'operationName': 'createItem', 'query': QUERIES.get('createItem'), 'variables': {'input': {'gameCategoryId': game_category_id, 'obtainingTypeId': obtaining_type_id, 'name': name, 'price': int(price), 'description': description, 'attributes': payload_attributes, 'dataFields': payload_data_fields}, 'attachments': [None] * len(attachments)}}
         map_data = {}
-        files = {}
-        for i, att in enumerate(attachments, start=1):
-            map_data[str(i)] = [f'variables.attachments.{i - 1}']
-            files[str(i)] = open(att, 'rb')
-        payload = {'operations': json.dumps(operations), 'map': json.dumps(map_data)}
-        r = self.request('post', f'{self.base_url}/graphql', headers, payload, files).json()
+        with ExitStack() as stack:
+            files = {}
+            for i, att in enumerate(attachments, start=1):
+                map_data[str(i)] = [f'variables.attachments.{i - 1}']
+                files[str(i)] = stack.enter_context(open(att, 'rb'))
+            payload = {'operations': json.dumps(operations), 'map': json.dumps(map_data)}
+            r = self.request('post', f'{self.base_url}/graphql', headers, payload if files else operations, files if files else None).json()
         return item(r['data']['createItem'])
 
     def edit_listing(self, id: str, name: str | None = None, price: int | None = None, description: str | None = None, options: list[GameCategoryOption] | None = None, data_fields: list[GameCategoryDataField] | None = None, remove_attachments: list[str] | None = None, add_attachments: list[str] | None = None) -> types.Item:
@@ -692,26 +749,27 @@ class Conn:
         payload_data_fields = [{'fieldId': field.id, 'value': field.value} for field in data_fields] if data_fields is not None else None
         headers = {'accept': '*/*'}
         operations = {'operationName': 'updateItem', 'query': QUERIES.get('updateItem'), 'variables': {'input': {'id': id}, 'addedAttachments': [None] * len(add_attachments) if add_attachments else None}}
-        if name:
+        if name is not None:
             operations['variables']['input']['name'] = name
-        if price:
+        if price is not None:
             operations['variables']['input']['price'] = int(price)
-        if description:
+        if description is not None:
             operations['variables']['input']['description'] = description
-        if options:
+        if options is not None:
             operations['variables']['input']['attributes'] = payload_attributes
-        if data_fields:
+        if data_fields is not None:
             operations['variables']['input']['dataFields'] = payload_data_fields
-        if remove_attachments:
+        if remove_attachments is not None:
             operations['variables']['input']['removedAttachments'] = remove_attachments
         map_data = {}
-        files = {}
-        if add_attachments:
-            for i, att in enumerate(add_attachments, start=1):
-                map_data[str(i)] = [f'variables.addedAttachments.{i - 1}']
-                files[str(i)] = open(att, 'rb')
-        payload = {'operations': json.dumps(operations), 'map': json.dumps(map_data)}
-        r = self.request('post', f'{self.base_url}/graphql', headers, payload if files else operations, files if files else None).json()
+        with ExitStack() as stack:
+            files = {}
+            if add_attachments:
+                for i, att in enumerate(add_attachments, start=1):
+                    map_data[str(i)] = [f'variables.addedAttachments.{i - 1}']
+                    files[str(i)] = stack.enter_context(open(att, 'rb'))
+            payload = {'operations': json.dumps(operations), 'map': json.dumps(map_data)}
+            r = self.request('post', f'{self.base_url}/graphql', headers, payload if files else operations, files if files else None).json()
         return item(r['data']['updateItem'])
 
     def delete_listing(self, id: str) -> bool:
@@ -779,11 +837,11 @@ class Conn:
         payload = {'operationName': 'transactions', 'variables': {'pagination': {'first': count, 'after': after_cursor}, 'filter': {'userId': self.id}, 'hasSupportAccess': False}, 'extensions': {'persistedQuery': {'version': 1, 'sha256Hash': PERSISTED_QUERIES.get('transactions')}}}
         if operation:
             payload['variables']['filter']['operation'] = [operation.name]
-        if min_value or max_value:
+        if min_value is not None or max_value is not None:
             payload['variables']['filter']['value'] = {}
-            if min_value:
+            if min_value is not None:
                 payload['variables']['filter']['value']['min'] = str(min_value)
-            if max_value:
+            if max_value is not None:
                 payload['variables']['filter']['value']['max'] = str(max_value)
         if provider_id:
             payload['variables']['filter']['providerId'] = [provider_id.name]

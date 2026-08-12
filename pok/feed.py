@@ -6,16 +6,27 @@ import traceback
 from datetime import datetime, timezone
 from logging import getLogger
 from typing import Generator
-from threading import Thread, Lock
-from queue import Queue
+from threading import Thread, Lock, current_thread
+from queue import Empty, Queue
 from threading import Event as ThreadingEvent
+from concurrent.futures import ThreadPoolExecutor
 import websocket
 from .conn import Conn
-from .models import ChatMessage, Chat, ItemDeal
+from .models import ChatMessage, Chat
 from .defs import MarketEvent, RoomKind
 from .gql import chat, chat_message, QUERIES
 from . import models as types
 import time as time_module
+
+
+def _parse_api_datetime(value: str) -> datetime:
+    raw = (value or '').strip()
+    if raw.endswith('Z'):
+        raw = raw[:-1] + '+00:00'
+    parsed = datetime.fromisoformat(raw)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 class StreamCell:
@@ -121,8 +132,9 @@ class ListingShippedNotice(StreamCell):
 
 class Feed:
 
-    def __init__(self, conn: Conn):
+    def __init__(self, conn: Conn, ws_path: str = '/chats'):
         self.conn: Conn = conn
+        self.ws_path = '/' + (ws_path or 'chats').strip('/')
         self.chat_subscriptions = {}
         self.review_check_deals = []
         self.review_watch_deals = []
@@ -135,16 +147,82 @@ class Feed:
         self.last_st_deal_times = {}
         self.ws = None
         self.q = None
+        self._stop_event = ThreadingEvent()
+        self._worker_threads: list[Thread] = []
+        self._health_lock = Lock()
+        self._connected = False
+        self._connected_at: float | None = None
+        self._last_message_at: float | None = None
+        self._last_ping_at: float | None = None
+        self._last_pong_at: float | None = None
+        self._last_disconnect_at: float | None = None
+        self._last_error: str | None = None
+        self._reconnect_count = 0
+        self._consecutive_failures = 0
+        self._pending_ping_nonce: str | None = None
         self._possible_new_chat = ThreadingEvent()
         self._last_chat_check = 0
         self._parsed_ws_message_ids: set = set()
         self._ws_message_dedupe_lock = Lock()
+        self._ws_send_lock = Lock()
+        self._ws_generation_lock = Lock()
+        self._ws_generation = 0
+        self._ws_generation_socket = None
+        self._ws_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='playerok-ws')
+        from threading import BoundedSemaphore
+        self._ws_capacity = BoundedSemaphore(32)
         self._deal_event_cooldown: dict[str, float] = {}
         self.logger = getLogger('pl.feed')
 
+    @staticmethod
+    def _timezone_offset_minutes() -> int:
+        if time.localtime().tm_isdst and time.daylight:
+            offset_seconds = -time.altzone
+        else:
+            offset_seconds = -time.timezone
+        return int(-(offset_seconds // 60))
+
+    def health(self) -> dict:
+        with self._health_lock:
+            return {
+                'connected': self._connected,
+                'connected_at': self._connected_at,
+                'last_message_at': self._last_message_at,
+                'last_ping_at': self._last_ping_at,
+                'last_pong_at': self._last_pong_at,
+                'last_disconnect_at': self._last_disconnect_at,
+                'last_error': self._last_error,
+                'reconnect_count': self._reconnect_count,
+                'subscriptions': len(self.chat_subscriptions),
+                'stopping': self._stop_event.is_set(),
+            }
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        with self._ws_generation_lock:
+            self._ws_generation += 1
+            self._ws_generation_socket = None
+            closing_ws = self.ws
+            self.ws = None
+        if closing_ws is not None:
+            try:
+                closing_ws.close()
+            except Exception:
+                pass
+        self._ws_executor.shutdown(wait=False, cancel_futures=True)
+        deadline = time.monotonic() + 2
+        for worker in self._worker_threads:
+            if worker is current_thread() or not worker.is_alive():
+                continue
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
+
+    def _sleep(self, seconds: float) -> bool:
+        return self._stop_event.wait(seconds)
+
     def _get_actual_message(self, message_id: str, chat_id: str):
         for _ in range(3):
-            time.sleep(6)
+            if self._sleep(6):
+                return
             try:
                 msg_list = self.conn.load_messages(chat_id, count=12)
             except Exception:
@@ -170,8 +248,8 @@ class Feed:
             return message
         delays = (0.0, 0.15, 0.3, 0.5, 0.8)
         for d in delays:
-            if d:
-                time.sleep(d)
+            if d and self._sleep(d):
+                return message
             try:
                 msg_list = self.conn.load_messages(chat_id, count=24)
             except Exception:
@@ -236,22 +314,49 @@ class Feed:
                 return [DealDisputeCleared(actual_msg.deal, chat_obj, resolver_username=ru)]
         return [ChatIngress(message, chat_obj)]
 
-    def _send_connection_init(self):
-        self.ws.send(json.dumps({'type': 'connection_init', 'payload': {'x-gql-op': 'ws-subscription', 'x-gql-path': '/self.chats/[id]', 'x-timezone-offset': -180}}))
+    def _generation_is_current(self, generation: int | None) -> bool:
+        if generation is None:
+            return True
+        with self._ws_generation_lock:
+            return generation == self._ws_generation and self.ws is self._ws_generation_socket
 
-    def _subscribe_chat_updated(self):
-        self.ws.send(json.dumps({'id': str(uuid.uuid4()), 'payload': {'extensions': {}, 'operationName': 'chatUpdated', 'query': QUERIES.get('chatUpdated'), 'variables': {'filter': {'userId': self.conn.id}, 'showForbiddenImage': True}}, 'type': 'subscribe'}))
+    def _send_ws(self, payload: dict, generation: int | None = None) -> bool:
+        if not self._generation_is_current(generation):
+            return False
+        encoded = json.dumps(payload)
+        with self._ws_send_lock:
+            if not self._generation_is_current(generation):
+                return False
+            ws = self.ws
+            if ws is None:
+                raise ConnectionError('WebSocket is not connected')
+            ws.send(encoded)
+            return True
 
-    def _subscribe_chat_marked_as_read(self):
-        self.ws.send(json.dumps({'id': str(uuid.uuid4()), 'payload': {'extensions': {}, 'operationName': 'chatMarkedAsRead', 'query': QUERIES.get('chatMarkedAsRead'), 'variables': {'filter': {'userId': self.conn.id}, 'showForbiddenImage': True}}, 'type': 'subscribe'}))
+    def _send_connection_init(self, generation: int | None = None):
+        self._send_ws({
+            'type': 'connection_init',
+            'payload': {
+                'x-gql-op': 'ws-subscription',
+                'x-gql-path': self.ws_path,
+                'x-timezone-offset': self._timezone_offset_minutes(),
+            },
+        }, generation)
 
-    def _subscribe_user_updated(self):
-        self.ws.send(json.dumps({'id': str(uuid.uuid4()), 'payload': {'extensions': {}, 'operationName': 'userUpdated', 'query': QUERIES.get('userUpdated'), 'variables': {'userId': self.conn.id}}, 'type': 'subscribe'}))
+    def _subscribe_chat_updated(self, generation: int | None = None):
+        self._send_ws({'id': str(uuid.uuid4()), 'payload': {'extensions': {}, 'operationName': 'chatUpdated', 'query': QUERIES.get('chatUpdated'), 'variables': {'filter': {'userId': self.conn.id}, 'showForbiddenImage': True}}, 'type': 'subscribe'}, generation)
 
-    def _subscribe_chat_message_created(self, chat_id):
+    def _subscribe_chat_marked_as_read(self, generation: int | None = None):
+        self._send_ws({'id': str(uuid.uuid4()), 'payload': {'extensions': {}, 'operationName': 'chatMarkedAsRead', 'query': QUERIES.get('chatMarkedAsRead'), 'variables': {'filter': {'userId': self.conn.id}, 'showForbiddenImage': True}}, 'type': 'subscribe'}, generation)
+
+    def _subscribe_user_updated(self, generation: int | None = None):
+        self._send_ws({'id': str(uuid.uuid4()), 'payload': {'extensions': {}, 'operationName': 'userUpdated', 'query': QUERIES.get('userUpdated'), 'variables': {'userId': self.conn.id}}, 'type': 'subscribe'}, generation)
+
+    def _subscribe_chat_message_created(self, chat_id, generation: int | None = None):
         _uuid = str(uuid.uuid4())
-        self.chat_subscriptions[_uuid] = chat_id
-        self.ws.send(json.dumps({'id': _uuid, 'payload': {'extensions': {}, 'operationName': 'chatMessageCreated', 'query': QUERIES.get('chatMessageCreated'), 'variables': {'filter': {'chatId': chat_id}, 'showForbiddenImage': True}}, 'type': 'subscribe'}))
+        sent = self._send_ws({'id': _uuid, 'payload': {'extensions': {}, 'operationName': 'chatMessageCreated', 'query': QUERIES.get('chatMessageCreated'), 'variables': {'filter': {'chatId': chat_id}, 'showForbiddenImage': True}}, 'type': 'subscribe'}, generation)
+        if sent and self._generation_is_current(generation):
+            self.chat_subscriptions[_uuid] = chat_id
 
     def _is_chat_subscribed(self, chat_id):
         for _, sub_chat_id in self.chat_subscriptions.items():
@@ -307,8 +412,11 @@ class Feed:
                 self._parsed_ws_message_ids.discard(key)
         return self._apply_deal_event_cooldown(out)
 
-    def _proccess_new_chat_message(self, chat_obj, message):
+    def _process_new_chat_message(self, chat_obj, message, generation: int | None = None):
         events = []
+        message = self._hydrate_message_if_needed(message, chat_obj.id)
+        if not self._generation_is_current(generation):
+            return events
         is_subscribed = self._is_chat_subscribed(chat_obj.id)
         is_new_chat = chat_obj.id not in [c.id for c in self.chats]
         if is_new_chat:
@@ -320,27 +428,75 @@ class Feed:
                     self.chats.append(chat_obj)
                     break
         if not is_subscribed:
-            self._subscribe_chat_message_created(chat_obj.id)
+            self._subscribe_chat_message_created(chat_obj.id, generation)
             if is_new_chat:
                 events.append(RoomSnapshotReady(chat_obj))
-        message = self._hydrate_message_if_needed(message, chat_obj.id)
         events.extend(self._events_for_chat_message(chat_obj, message))
+        if not self._generation_is_current(generation):
+            return []
         return events
 
-    def proccess_ws_message(self, msg):
+    def _proccess_new_chat_message(self, chat_obj, message):
+        return self._process_new_chat_message(chat_obj, message)
+
+    def process_ws_message(self, msg, generation: int | None = None):
         try:
+            if not self._generation_is_current(generation):
+                return
             try:
                 msg_data = json.loads(msg)
             except json.JSONDecodeError:
                 return
-            self.logger.debug(f'WS -> {msg_data}')
-            if msg_data['type'] == 'connection_ack':
-                self._subscribe_chat_updated()
-                self._subscribe_user_updated()
-                for chat_ in self.chats:
-                    self._subscribe_chat_message_created(chat_.id)
+            message_type = msg_data.get('type')
+            now = time.monotonic()
+            with self._health_lock:
+                self._last_message_at = now
+            if message_type == 'ping':
+                response = {'type': 'pong'}
+                if 'payload' in msg_data:
+                    response['payload'] = msg_data['payload']
+                if self._send_ws(response, generation):
+                    with self._health_lock:
+                        self._last_pong_at = now
+                return
+            if message_type == 'pong':
+                nonce = (msg_data.get('payload') or {}).get('nonce')
+                with self._health_lock:
+                    if self._pending_ping_nonce is None or nonce == self._pending_ping_nonce:
+                        self._pending_ping_nonce = None
+                        self._last_pong_at = now
+                return
+            payload_data = msg_data.get('payload', {}).get('data', {})
+            self.logger.debug(
+                'WS -> type=%s data_keys=%s',
+                msg_data.get('type'),
+                sorted(payload_data) if isinstance(payload_data, dict) else [],
+            )
+            if message_type == 'connection_ack':
+                try:
+                    self.chat_subscriptions.clear()
+                    self._subscribe_chat_updated(generation)
+                    self._subscribe_chat_marked_as_read(generation)
+                    self._subscribe_user_updated(generation)
+                    for chat_ in self.chats:
+                        self._subscribe_chat_message_created(chat_.id, generation)
+                except Exception as exc:
+                    with self._health_lock:
+                        self._connected = False
+                        self._last_error = f'subscribe: {type(exc).__name__}: {exc}'
+                    if self._generation_is_current(generation):
+                        try:
+                            self.ws.close()
+                        except Exception:
+                            pass
+                    raise
+                else:
+                    with self._health_lock:
+                        self._connected = True
+                        self._connected_at = now
+                        self._last_error = None
+                        self._consecutive_failures = 0
             else:
-                payload_data = msg_data.get('payload', {}).get('data', {})
                 if 'userUpdated' in payload_data:
                     unread_chats = payload_data['userUpdated'].get('unreadChatsCounter', 0)
                     if unread_chats > 0:
@@ -348,9 +504,10 @@ class Feed:
                 if 'chatUpdated' in payload_data:
                     _chat = chat(payload_data['chatUpdated'])
                     _message = chat_message(payload_data['chatUpdated']['lastMessage'])
-                    events = self._proccess_new_chat_message(_chat, _message)
+                    events = self._process_new_chat_message(_chat, _message, generation)
                     for event in events:
-                        self.q.put(event)
+                        if self._generation_is_current(generation):
+                            self.q.put(event)
                 if 'chatMessageCreated' in payload_data:
                     chat_id = self.chat_subscriptions.get(msg_data['id'])
                     try:
@@ -359,11 +516,44 @@ class Feed:
                         return
                     _message = chat_message(payload_data['chatMessageCreated'])
                     _message = self._hydrate_message_if_needed(_message, _chat.id)
+                    if not self._generation_is_current(generation):
+                        return
                     events = self._events_for_chat_message(_chat, _message)
                     for event in events:
-                        self.q.put(event)
+                        if self._generation_is_current(generation):
+                            self.q.put(event)
         except Exception:
             self.logger.debug(f'Ошибка обработки сообщения в WebSocket`е: {traceback.format_exc()}')
+
+    def _dispatch_ws_message(self, msg: str, generation: int) -> bool:
+        if not self._ws_capacity.acquire(blocking=False):
+            self.logger.warning('WebSocket очередь переполнена — переподключение для восстановления событий')
+            if self._generation_is_current(generation):
+                try:
+                    self.ws.close()
+                except Exception:
+                    pass
+            return False
+        try:
+            future = self._ws_executor.submit(self.process_ws_message, msg, generation)
+        except Exception:
+            self._ws_capacity.release()
+            raise
+        future.add_done_callback(lambda _future: self._ws_capacity.release())
+        return True
+
+    def _dispatch_incoming_ws_message(self, msg: str, generation: int) -> bool:
+        try:
+            message_type = json.loads(msg).get('type')
+        except (json.JSONDecodeError, AttributeError):
+            message_type = None
+        if message_type in {'ping', 'pong', 'connection_ack'}:
+            self.process_ws_message(msg, generation)
+            return True
+        return self._dispatch_ws_message(msg, generation)
+
+    def proccess_ws_message(self, msg):
+        return self.process_ws_message(msg)
 
     def listen_new_messages(self):
         base_headers = {'accept-encoding': 'gzip, deflate, br, zstd', 'accept-language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7', 'cache-control': 'no-cache', 'connection': 'Upgrade', 'origin': 'https://playerok.com', 'pragma': 'no-cache', 'sec-websocket-extensions': 'permessage-deflate; client_max_window_bits', 'user-agent': self.conn.user_agent}
@@ -373,33 +563,117 @@ class Feed:
             self.chats = []
         for chat_ in self.chats:
             yield RoomSnapshotReady(chat_)
-        while True:
+        while not self._stop_event.is_set():
+            generation = None
+            closing_ws = None
+            retry_delay = 0
             try:
                 cookie_hdr = self.conn._cookie_header() or f'token={self.conn.token}'
                 headers = {**base_headers, 'cookie': cookie_hdr}
-                self.ws = websocket.WebSocket(sslopt={'ca_certs': self.conn._ca_bundle})
-                self.ws.connect(url='wss://ws.playerok.com/graphql', header=[f'{k}: {v}' for k, v in headers.items()], subprotocols=['graphql-transport-ws'])
-                self._send_connection_init()
-                while True:
-                    msg = self.ws.recv()
-                    Thread(target=self.proccess_ws_message, args=(msg,), daemon=True).start()
-            except websocket._exceptions.WebSocketException as e:
-                self.logger.warning('WebSocket: %s — переподключение через 3 с', e)
-                time.sleep(3)
-            except (ssl.SSLError, OSError, ConnectionError, BrokenPipeError, TimeoutError) as e:
-                self.logger.warning(
-                    'WebSocket TLS/сеть (%s): %s — переподключение через 5 с',
-                    type(e).__name__,
-                    e,
+                with self._ws_generation_lock:
+                    self._ws_generation += 1
+                    generation = self._ws_generation
+                    self._ws_generation_socket = None
+                ws = websocket.WebSocket(sslopt={'ca_certs': self.conn._ca_bundle})
+                ws.settimeout(30)
+                with self._ws_generation_lock:
+                    self.ws = ws
+                    self._ws_generation_socket = ws
+                ws.connect(
+                    url='wss://ws.playerok.com/graphql',
+                    header=[f'{k}: {v}' for k, v in headers.items()],
+                    subprotocols=['graphql-transport-ws'],
+                    timeout=30,
                 )
-                time.sleep(5)
+                if not self._generation_is_current(generation) or self._stop_event.is_set():
+                    return
+                with self._health_lock:
+                    if self._last_disconnect_at is not None:
+                        self._reconnect_count += 1
+                    self._connected = False
+                    self._pending_ping_nonce = None
+                self.chat_subscriptions.clear()
+                self._send_connection_init(generation)
+                ack_deadline = time.monotonic() + 30
+                pong_deadline = None
+                while not self._stop_event.is_set():
+                    now = time.monotonic()
+                    with self._health_lock:
+                        is_acked = self._connected
+                        pending_nonce = self._pending_ping_nonce
+                    active_deadline = pong_deadline if pending_nonce is not None else (None if is_acked else ack_deadline)
+                    if active_deadline is not None and now >= active_deadline:
+                        reason = 'pong' if pending_nonce is not None else 'ACK'
+                        raise TimeoutError(f'Playerok WebSocket {reason} timeout')
+                    self.ws.settimeout(max(0.1, min(30, (active_deadline - now) if active_deadline else 30)))
+                    try:
+                        msg = self.ws.recv()
+                    except websocket._exceptions.WebSocketTimeoutException:
+                        with self._health_lock:
+                            is_acked = self._connected
+                            pending_nonce = self._pending_ping_nonce
+                        if not is_acked:
+                            raise TimeoutError('Playerok WebSocket ACK timeout')
+                        if pending_nonce is not None:
+                            raise TimeoutError('Playerok WebSocket pong timeout')
+                        nonce = uuid.uuid4().hex
+                        with self._health_lock:
+                            self._pending_ping_nonce = nonce
+                            self._last_ping_at = time.monotonic()
+                        pong_deadline = time.monotonic() + 15
+                        self._send_ws({'type': 'ping', 'payload': {'nonce': nonce}}, generation)
+                        continue
+                    if not msg:
+                        raise ConnectionError('Playerok WebSocket closed')
+                    try:
+                        incoming_type = json.loads(msg).get('type')
+                    except (json.JSONDecodeError, AttributeError):
+                        incoming_type = None
+                    self._dispatch_incoming_ws_message(msg, generation)
+                    with self._health_lock:
+                        pending_after = self._pending_ping_nonce
+                    if pending_after is None:
+                        pong_deadline = None
+                    elif pong_deadline is not None and time.monotonic() >= pong_deadline:
+                        raise TimeoutError('Playerok WebSocket pong timeout')
+                    if not self.health()['connected'] and time.monotonic() >= ack_deadline:
+                        raise TimeoutError('Playerok WebSocket ACK timeout')
+            except websocket._exceptions.WebSocketException as e:
+                if not self._stop_event.is_set():
+                    with self._health_lock:
+                        self._last_error = f'{type(e).__name__}: {e}'
+                        self._consecutive_failures += 1
+                    delay = min(30, 2 ** min(self._consecutive_failures, 5))
+                    self.logger.warning('WebSocket: %s — переподключение через %s с', e, delay)
+                    retry_delay = delay
+            except (ssl.SSLError, OSError, ConnectionError, BrokenPipeError, TimeoutError) as e:
+                if not self._stop_event.is_set():
+                    with self._health_lock:
+                        self._last_error = f'{type(e).__name__}: {e}'
+                        self._consecutive_failures += 1
+                    delay = min(30, 2 ** min(self._consecutive_failures, 5))
+                    self.logger.warning(
+                        'WebSocket TLS/сеть (%s): %s — переподключение через %s с',
+                        type(e).__name__, e, delay,
+                    )
+                    retry_delay = delay
             finally:
+                with self._ws_generation_lock:
+                    self._ws_generation += 1
+                    self._ws_generation_socket = None
+                    closing_ws = self.ws
+                    self.ws = None
+                with self._health_lock:
+                    self._connected = False
+                    self._last_disconnect_at = time.monotonic()
+                    self._pending_ping_nonce = None
                 try:
-                    if self.ws is not None:
-                        self.ws.close()
+                    if closing_ws is not None:
+                        closing_ws.close()
                 except Exception:
                     pass
-                self.ws = None
+            if retry_delay and self._sleep(retry_delay):
+                return
 
     def _review_fingerprint(self, rev: types.Review | None) -> str | None:
         if not rev:
@@ -450,7 +724,7 @@ class Feed:
                 pass
 
     def listen_new_reviews(self):
-        while True:
+        while not self._stop_event.is_set():
             for deal_id in list(self.review_check_deals):
                 try:
                     if not self._should_check_review_deal(deal_id):
@@ -494,24 +768,29 @@ class Feed:
                         yield ReviewCreatedNotice(deal, deal.chat)
                 except Exception:
                     self.logger.debug(f'Ошибка отслеживания отзыва по сделке {deal_id}: {traceback.format_exc()}')
-            time.sleep(1)
+            if self._sleep(1):
+                return
 
     def _wait_for_check_new_chats(self, delay=10):
         sleep_time = delay - (time.time() - self._last_chat_check)
         if sleep_time > 0:
-            time.sleep(sleep_time)
+            self._sleep(sleep_time)
 
     def listen_new_deals(self):
-        while True:
+        while not self._stop_event.is_set():
             try:
-                self._possible_new_chat.wait()
+                if not self._possible_new_chat.wait(timeout=1):
+                    continue
+                if self._stop_event.is_set():
+                    return
                 self._wait_for_check_new_chats()
                 self._last_chat_check = time.time()
                 self._possible_new_chat.clear()
                 known_chat_ids = [c.id for c in self.chats]
                 for _ in range(3):
                     try:
-                        time.sleep(6)
+                        if self._sleep(6):
+                            return
                         chats = self.conn.load_chats(count=5, type=RoomKind.PM).chats
                         break
                     except Exception:
@@ -523,20 +802,20 @@ class Feed:
                             lm_deal = getattr(lm, 'deal', None)
                             lm_deal_id = getattr(lm_deal, 'id', None) if lm_deal else None
                             if lm_deal_id and lm_deal_id not in self.processed_deals:
-                                events = self._proccess_new_chat_message(chat_obj, lm)
+                                events = self._process_new_chat_message(chat_obj, lm)
                                 for event in events:
                                     yield event
                         continue
                     if chat_obj.last_message and chat_obj.last_message.text == '{{ITEM_PAID}}':
-                        events = self._proccess_new_chat_message(chat_obj, chat_obj.last_message)
+                        events = self._process_new_chat_message(chat_obj, chat_obj.last_message)
                         for event in events:
                             yield event
                         continue
                     try:
                         msg_list = self.conn.load_messages(chat_obj.id, count=12)
-                        new_paid_msg = next((msg for msg in msg_list.messages if msg.text == '{{ITEM_PAID}}' and (datetime.now(timezone.utc) - datetime.fromisoformat(msg.created_at).astimezone(timezone.utc)).total_seconds() <= 120), None)
+                        new_paid_msg = next((msg for msg in msg_list.messages if msg.text == '{{ITEM_PAID}}' and (datetime.now(timezone.utc) - _parse_api_datetime(msg.created_at)).total_seconds() <= 120), None)
                         if new_paid_msg:
-                            events = self._proccess_new_chat_message(chat_obj, new_paid_msg)
+                            events = self._process_new_chat_message(chat_obj, new_paid_msg)
                             for event in events:
                                 yield event
                     except Exception:
@@ -547,21 +826,27 @@ class Feed:
                 self.logger.debug(f'Ошибка проверки новых сделок: {traceback.format_exc()}')
 
     def listen_deal_statuses(self):
-        while True:
+        while not self._stop_event.is_set():
             for chat_id, deals in list(self.active_deals.items()):
                 messages = []
                 for _ in range(3):
                     try:
                         msg_list = self.conn.load_messages(chat_id, 24)
-                        messages = sorted(msg_list.messages, key=lambda x: datetime.fromisoformat(x.created_at))
+                        messages = sorted(msg_list.messages, key=lambda x: _parse_api_datetime(x.created_at))
                         break
                     except Exception:
-                        time.sleep(6)
+                        if self._sleep(6):
+                            return
                 for deal_id, last_status, status_date in list(deals):
                     try:
-                        status_msgs = [msg for msg in messages if msg.deal and msg.deal.status and (datetime.fromisoformat(msg.created_at) >= status_date)]
+                        normalized_status_date = status_date
+                        if normalized_status_date.tzinfo is None:
+                            normalized_status_date = normalized_status_date.replace(tzinfo=timezone.utc)
+                        else:
+                            normalized_status_date = normalized_status_date.astimezone(timezone.utc)
+                        status_msgs = [msg for msg in messages if msg.deal and msg.deal.status and (_parse_api_datetime(msg.created_at) >= normalized_status_date)]
                         for msg in status_msgs:
-                            msg_date = datetime.fromisoformat(msg.created_at)
+                            msg_date = _parse_api_datetime(msg.created_at)
                             if msg.deal.status == last_status and msg_date == status_date:
                                 continue
                             try:
@@ -574,8 +859,10 @@ class Feed:
                             self._set_active_deal(chat_obj, msg.deal, msg_date)
                     except Exception:
                         self.logger.debug(f'Ошибка проверки статусов в сделке {deal_id}: {traceback.format_exc()}')
-                    time.sleep(8)
-            time.sleep(1)
+                    if self._sleep(8):
+                        return
+            if self._sleep(1):
+                return
 
     def listen(self, get_new_message_events: bool = True, get_new_review_events: bool = True) -> Generator:
         if not any((get_new_review_events, get_new_message_events)):
@@ -583,13 +870,27 @@ class Feed:
         self.q = Queue()
 
         def run(gen):
-            for event in gen:
-                self.q.put(event)
+            try:
+                for event in gen:
+                    if self._stop_event.is_set():
+                        return
+                    self.q.put(event)
+            except Exception:
+                if not self._stop_event.is_set():
+                    self.logger.exception('Фоновый обработчик Playerok Feed завершился с ошибкой')
 
         if get_new_message_events:
-            Thread(target=run, args=(self.listen_new_messages(),), daemon=True).start()
-            Thread(target=run, args=(self.listen_new_deals(),), daemon=True).start()
+            self._worker_threads.append(Thread(target=run, args=(self.listen_new_messages(),), daemon=True, name='playerok-ws-listener'))
+            self._worker_threads.append(Thread(target=run, args=(self.listen_new_deals(),), daemon=True, name='playerok-deal-listener'))
         if get_new_review_events:
-            Thread(target=run, args=(self.listen_new_reviews(),), daemon=True).start()
-        while True:
-            yield self.q.get()
+            self._worker_threads.append(Thread(target=run, args=(self.listen_new_reviews(),), daemon=True, name='playerok-review-listener'))
+        for worker in self._worker_threads:
+            worker.start()
+        while not self._stop_event.is_set():
+            try:
+                yield self.q.get(timeout=1)
+            except Empty:
+                dead = [worker.name for worker in self._worker_threads if not worker.is_alive()]
+                if dead and not self._stop_event.is_set():
+                    raise RuntimeError(f'Playerok Feed workers stopped: {", ".join(dead)}')
+                continue

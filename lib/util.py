@@ -8,7 +8,6 @@ import logging
 import textwrap
 import requests
 import subprocess
-import shlex
 import curl_cffi
 import random
 import shutil
@@ -21,11 +20,15 @@ from threading import Thread
 from logging import getLogger
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from lib.consts import C_BRIGHT, C_DIM, C_HIGHLIGHT, C_PRIMARY, C_TEXT
+from lib.consts import C_BRIGHT, C_DIM, C_HIGHLIGHT, C_TEXT
 
 
 def project_root_dir() -> str:
     return os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+
+
+def valid_index(items, index) -> bool:
+    return isinstance(index, int) and not isinstance(index, bool) and 0 <= index < len(items)
 
 
 def get_bot_log_path() -> str:
@@ -368,7 +371,6 @@ def _ensure_packaging() -> None:
 
 
 def _requirement_status(req_line: str) -> str:
-    """Возвращает 'ok' / 'missing' / 'mismatch' / 'skip' (комментарий или не для этой платформы)."""
     req_line = req_line.strip()
     if not req_line or req_line.startswith(('#', '-')):
         return 'skip'
@@ -393,12 +395,6 @@ def _requirement_status(req_line: str) -> str:
 
 
 def check_requirements(requirements_path: str) -> None:
-    """
-    Проверяет requirements.txt и только **сообщает** о проблемах — авто-установку
-    не делаем: на Windows она регулярно падает с WinError 5, когда уже загружены
-    curl_cffi/_wrapper.pyd или tls_requests DLL. Ставьте руками из отдельной
-    консоли: `pip install -r requirements.txt`.
-    """
     try:
         if not os.path.exists(requirements_path):
             return
@@ -457,7 +453,13 @@ def monkey_patch_http() -> None:
     curl_cffi.Session.request = _request
 
 
-def spawn_async(func: callable, args: list | None = None, kwargs: dict | None = None) -> None:
+def spawn_async(
+    func: callable,
+    args: list | None = None,
+    kwargs: dict | None = None,
+    *,
+    name: str = 'AsyncWorker',
+) -> Thread:
     _args   = list(args or [])
     _kwargs = dict(kwargs or {})
     log     = logging.getLogger('cxh.util')
@@ -482,7 +484,9 @@ def spawn_async(func: callable, args: list | None = None, kwargs: dict | None = 
             except Exception:
                 pass
 
-    Thread(target=_run, daemon=True, name='TelegramPanel').start()
+    thread = Thread(target=_run, daemon=True, name=name)
+    thread.start()
+    return thread
 
 
 def spawn_forever(func: callable, args: list = [], kwargs: dict = {}) -> None:
@@ -530,7 +534,7 @@ def cookies_ok(cookies: str) -> bool:
     return bool(tok and token_ok(tok))
 
 
-COOKIES_JSON_PATH = 'conf/cookies.json'
+COOKIES_JSON_PATH = os.path.join(project_root_dir(), 'conf', 'cookies.json')
 
 _COOKIES_JSON_TEMPLATE = (
     '{\n'
@@ -544,13 +548,13 @@ _COOKIES_JSON_TEMPLATE = (
 
 
 def ensure_cookies_json(path: str = COOKIES_JSON_PATH) -> bool:
-    """Создаёт шаблон cookies.json, если файла нет. Возвращает True, если создали."""
     import os as _os
     if _os.path.exists(path):
         return False
     _os.makedirs(_os.path.dirname(path) or '.', exist_ok=True)
     with open(path, 'w', encoding='utf-8') as fh:
         fh.write(_COOKIES_JSON_TEMPLATE)
+    _os.chmod(path, 0o600)
     return True
 
 
@@ -570,8 +574,8 @@ def cookies_from_json_list(items: list[dict]) -> dict[str, str]:
         name = str(c.get('name') or '').strip()
         if not name:
             continue
-        domain = str(c.get('domain') or '').lower()
-        if domain and 'playerok.com' not in domain:
+        domain = str(c.get('domain') or '').strip().lower().lstrip('.')
+        if domain and domain != 'playerok.com' and not domain.endswith('.playerok.com'):
             continue
         value = c.get('value')
         if value is None:
@@ -581,10 +585,7 @@ def cookies_from_json_list(items: list[dict]) -> dict[str, str]:
 
 
 def load_cookies_json(path: str = COOKIES_JSON_PATH) -> tuple[dict[str, str], str | None]:
-    """
-    Читает conf/cookies.json. Возвращает (cookie_jar, error_message).
-    error_message == None → всё хорошо.
-    """
+
     import json as _json
     import os as _os
     if not _os.path.exists(path):
@@ -649,7 +650,6 @@ def _get_short_path_windows(long_path: str) -> str | None:
 
 
 def _cacert_source_path() -> str:
-    """Возвращает путь к исходному CA bundle. Приоритет — bundled lib/cacert.pem."""
     here = os.path.dirname(os.path.abspath(__file__))
     bundled = os.path.join(here, 'cacert.pem')
     if os.path.exists(bundled):
@@ -671,14 +671,6 @@ def _is_file_readable(path: str) -> bool:
 
 
 def ascii_safe_ca_bundle() -> str:
-    """
-    Возвращает путь к CA bundle, гарантированно без не-ASCII символов.
-    libcurl под Windows падает `curl: (77) error setting certificate verify locations`,
-    если в пути есть кириллица (типично: C:\\Users\\андрей\\...).
-    Стратегия: если путь уже ASCII — используем его; иначе КОПИРУЕМ в ASCII-локацию
-    (C:\\cxh / C:\\ProgramData\\cxh / C:\\Windows\\Temp) и проверяем, что файл читается.
-    Fallback — GetShortPathNameW.
-    """
     src = _cacert_source_path()
     if not src:
         return ''
@@ -862,7 +854,7 @@ def proxy_url_for_requests(proxy: str) -> str | None:
             pass
         return None
     if low.startswith(('http://', 'https://')):
-        return s.replace('https://', 'http://', 1)
+        return s
     return f"http://{s.replace('https://', '').replace('http://', '')}"
 
 

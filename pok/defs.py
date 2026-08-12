@@ -24,6 +24,22 @@ class ItemLogEvents(Enum):
     DEAL_ROLLED_BACK = 3
     PROBLEM_REPORTED = 4
     PROBLEM_RESOLVED = 5
+    BLOCKED = 6
+    CREATED = 7
+    DATA_CHANGE_APPROVED = 8
+    DATA_CHANGE_DECLINED = 9
+    DEAL_FAILED = 10
+    DISCONTINUED = 11
+    EXPIRATION_NOTIFICATION = 12
+    EXPIRED = 13
+    ITEM_EDITED = 14
+    ITEM_PUBLISHED = 15
+    ITEM_REPUBLISHED = 16
+    PENDING_MODERATION = 17
+    POSTMODERATION_CHECKED = 18
+    PUBLISHING_APPROVED = 19
+    PUBLISHING_DECLINED = 20
+    REMOVED = 21
 
 class TxKind(Enum):
     DEPOSIT = 0
@@ -36,6 +52,11 @@ class TxKind(Enum):
     MANUAL_BALANCE_DECREASE = 7
     REFERRAL_BONUS = 8
     STEAM_DEPOSIT = 9
+    FRAGMENT_DEPOSIT = 10
+    ITEM_CUSTOM_PRIORITY = 11
+    ITEM_OFFICIAL_BUY = 12
+    ITEM_VIP_PRIORITY = 13
+    REFUND = 14
 
 class TransactionDirections(Enum):
     IN = 0
@@ -52,6 +73,13 @@ class PayMethod(Enum):
     MIR = 0
     VISA_MASTERCARD = 1
     ERIP = 2
+    BEELINE = 3
+    EUR = 4
+    MEGAFON = 5
+    MTS = 6
+    RUB = 7
+    TELE2 = 8
+    YOTA = 9
 
 class TxDirection(Enum):
     IN = 0
@@ -66,6 +94,24 @@ class PayGateway(Enum):
     YMONEY = 5
     USDT = 6
     PENDING_INCOME = 7
+    CRYPTO = 8
+    APPLE_PAY = 9
+    BANK_CARD_ALL = 10
+    BANK_CARD_KZ = 11
+    ENOT = 12
+    ERC20 = 13
+    GOOGLE_PAY = 14
+    MOBILE = 15
+    PAYMART = 16
+    PAYPAL = 17
+    PROMO_CODE = 18
+    QIWI = 19
+    RURUPAY = 20
+    TON = 21
+    TRC20 = 22
+    UNITPAY = 23
+    WEBMONEY = 24
+    TESTPAY = 25
 
 class BankCardTypes(Enum):
     MIR = 0
@@ -79,6 +125,7 @@ class DealStage(Enum):
     CONFIRMED = 3
     CONFIRMED_AUTOMATICALLY = 4
     ROLLED_BACK = 5
+    FAILED = 6
 
 class DealFlow(Enum):
     IN = 0
@@ -87,24 +134,47 @@ class DealFlow(Enum):
 class GameTypes(Enum):
     GAME = 0
     APPLICATION = 1
+    MOBILE_GAME = 2
 
 class AccountRole(Enum):
     USER = 0
     MODERATOR = 1
     BOT = 2
+    ACCOUNTANT = 3
+    ADMIN = 4
+    ADV_DIRECTOR = 5
+    ADV_MANAGER = 6
+    CHECKER = 7
+    DEVELOPER = 8
+    GAMES_AND_APPS = 9
+    MONITORING = 10
+    OFFICIAL_SELLER = 11
+    OFFICIAL_SELLER_ADMIN = 12
+    POSTMODERATOR = 13
+    POSTSECURITY = 14
+    SECURITY = 15
+    SUPPORT = 16
+    SYSTEM_SELLER = 17
 
 class RoomKind(Enum):
     PM = 0
     NOTIFICATIONS = 1
     SUPPORT = 2
+    GROUP = 3
 
 class RoomState(Enum):
     NEW = 0
     FINISHED = 1
+    ACTIVE = 2
+    RESOLVED = 3
+    STARTED = 4
 
 class ChatMessageButtonTypes(Enum):
     REDIRECT = 0
     LOTTERY = 1
+    ASK_FOR_EXTERNAL_REVIEW = 2
+    CURRENT_BALANCE = 3
+    LOTTERY_RESULTS = 4
 
 class ListingStage(Enum):
     PENDING_APPROVAL = 0
@@ -115,10 +185,16 @@ class ListingStage(Enum):
     EXPIRED = 5
     SOLD = 6
     DRAFT = 7
+    DISCONTINUED = 8
+    PENDING_STATUS_PAYMENT = 9
+    REMOVED = 10
 
 class ReviewState(Enum):
     APPROVED = 0
     DELETED = 1
+    PENDING_APPROVAL = 2
+    REJECTED = 3
+    REMOVED = 4
 
 class OrderDir(Enum):
     DESC = 0
@@ -127,14 +203,18 @@ class OrderDir(Enum):
 class BoostLevel(Enum):
     DEFAULT = 0
     PREMIUM = 1
+    CUSTOM = 2
+    VIP = 3
 
 class GameCategoryAgreementIconTypes(Enum):
     RESTRICTION = 0
-    CONFIRMATION = 0
+    CONFIRMATION = 1
 
 class OptionStyle(Enum):
     SELECTOR = 0
     SWITCH = 1
+    RADIO = 2
+    RANGE = 3
 
 class FieldScope(Enum):
     ITEM_DATA = 0
@@ -142,9 +222,14 @@ class FieldScope(Enum):
 
 class GameCategoryDataFieldInputTypes(Enum):
     INPUT = 0
+    TEXTAREA = 1
 
 class GameCategoryAutoConfirmPeriods(Enum):
+    SEVEN_DAYS = 0
     SEVEN_DEYS = 0
+    TWO_DAYS = 1
+    FIFTEEN_DAYS = 2
+    THIRTY_DAYS = 3
 
 class InstructionFor(Enum):
     FOR_SELLER = 0
@@ -163,19 +248,6 @@ class CloudflareDetectedException(Exception):
 
 
 class BotCheckDetectedException(Exception):
-    """
-    Запрос на playerok.com заблокирован защитой DDoS-Guard.
-
-    Обычно это значит, что Cookie `__ddg5_` из `conf/config.json → account.cookies`
-    недействительна: она «умирает» при смене IP, User-Agent / TLS fingerprint
-    или обновлении ключей сервера.
-
-    Что делать:
-      1. Авторизуйтесь на playerok.com в браузере с того же IP.
-      2. Скопируйте все Cookie (расширение Cookie-Editor → Export → Header String).
-      3. Вставьте их в `account.cookies` целиком.
-    """
-
     def __init__(self, response=None):
         self.response = response
         self.status_code = getattr(response, 'status_code', None) if response is not None else None

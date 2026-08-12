@@ -2,6 +2,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import textwrap
+import time
+from threading import Event
 from typing import Any, Awaitable, Callable
 
 from aiogram import BaseMiddleware, Bot, Dispatcher
@@ -43,6 +45,10 @@ class _TgRawUpdateMiddleware(BaseMiddleware):
         data: dict[str, Any],
     ) -> Any:
         if isinstance(event, Update):
+            panel = get_panel()
+            if panel is not None:
+                panel._last_update_at = time.monotonic()
+                panel._updates_received += 1
             parts: list[str] = []
             if event.message:
                 m = event.message
@@ -133,10 +139,16 @@ def get_panel_loop() -> asyncio.AbstractEventLoop | None:
 
 class Panel:
 
+    def __new__(cls):
+        if _panel is not None:
+            return _panel
+        return super().__new__(cls)
+
     def __init__(self):
         global _panel
-        if _panel is not None:
+        if getattr(self, '_initialized', False):
             return
+        self._initialized = True
         logging.getLogger('aiogram').setLevel(logging.CRITICAL)
         logging.getLogger('aiogram.event').setLevel(logging.CRITICAL)
         logging.getLogger('aiogram.dispatcher').setLevel(logging.CRITICAL)
@@ -162,6 +174,16 @@ class Panel:
                     self.dp.include_router(route)
             main_router.include_router(cmd_router)
         self.dp.include_router(main_router)
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self._stop_event = Event()
+        self._polling_active = False
+        self._started_at: float | None = None
+        self._last_api_success_at: float | None = None
+        self._last_update_at: float | None = None
+        self._last_error: str | None = None
+        self._poll_failures = 0
+        self._updates_received = 0
+        self._session_closed = False
         try:
             chain = ' → '.join(repr(r.name) for r in self.dp.sub_routers)
             logger.debug('Telegram: порядок обработки dp.sub_routers = %s', chain)
@@ -169,6 +191,31 @@ class Panel:
             pass
         _panel = self
         _tg_echo_stderr(f'Панель собрана; лог файл: {get_bot_log_path()}')
+
+    def health(self) -> dict:
+        return {
+            'polling_active': self._polling_active,
+            'started_at': self._started_at,
+            'last_api_success_at': self._last_api_success_at,
+            'last_update_at': self._last_update_at,
+            'last_error': self._last_error,
+            'poll_failures': self._poll_failures,
+            'updates_received': self._updates_received,
+            'stopping': self._stop_event.is_set(),
+        }
+
+    async def stop(self) -> None:
+        global _panel
+        self._stop_event.set()
+        try:
+            await self.dp.stop_polling()
+        except (RuntimeError, AttributeError):
+            pass
+        if not self._session_closed:
+            self._session_closed = True
+            await self.bot.session.close()
+        if _panel is self:
+            _panel = None
 
     async def _set_main_menu(self):
         main_menu_commands = panel_bot_command_list()
@@ -216,18 +263,36 @@ class Panel:
         except Exception:
             pass
 
+    async def _health_probe(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                stopped = await asyncio.wait_for(
+                    asyncio.to_thread(self._stop_event.wait), timeout=60,
+                )
+                if stopped:
+                    return
+            except asyncio.TimeoutError:
+                pass
+            try:
+                await self.bot.get_me()
+                self._last_api_success_at = time.monotonic()
+                if self._polling_active:
+                    self._last_error = None
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._last_error = f'health probe: {type(exc).__name__}: {exc}'
+
     async def run_bot(self):
         self.loop = asyncio.get_running_loop()
+        self._started_at = time.monotonic()
         _tg_echo_stderr(f'run_bot старт, loop={id(self.loop)}, log={get_bot_log_path()}')
         await self._set_main_menu()
         await self._set_short_description()
         await self._set_description()
         await dispatch('PANEL_UP', [self])
-        me = await self.bot.get_me()
-        uname = f'@{me.username}' if me.username else f'id:{me.id}'
-        logger.info(f'  {C_SUCCESS}✓{Fore.RESET}  {C_BRIGHT}Telegram-бот {uname} запущен{Fore.RESET}')
-        logger.debug('Telegram-бот %s', uname)
-        await self._send_startup_message(playerok_ok=True)
+        startup_notified = False
+        health_task = asyncio.create_task(self._health_probe(), name='telegram-health-probe')
         if self.proxy:
             from lib.util import proxy_display_parts
             ip, port, user, password = proxy_display_parts(self.proxy)
@@ -243,12 +308,40 @@ class Panel:
                 draw_box('ПРОКСИ TELEGRAM', [('Адрес', f'{ip_masked}:{port_masked}'), ('Логин', user_masked), ('Пароль', pass_masked)])
             else:
                 draw_box('ПРОКСИ TELEGRAM', [('Прокси', 'задан (формат см. conf/config.json)')])
-        while True:
-            try:
-                await self.dp.start_polling(self.bot, skip_updates=True, handle_signals=False)
-            except Exception:
-                logger.exception('[tg] start_polling завершился с ошибкой — пауза 3 с и повтор')
-                await asyncio.sleep(3)
+        try:
+            while not self._stop_event.is_set():
+                attempt_started = time.monotonic()
+                try:
+                    me = await self.bot.get_me()
+                    self._last_api_success_at = time.monotonic()
+                    self._last_error = None
+                    uname = f'@{me.username}' if me.username else f'id:{me.id}'
+                    logger.info(f'  {C_SUCCESS}✓{Fore.RESET}  {C_BRIGHT}Telegram-бот {uname} запущен{Fore.RESET}')
+                    logger.debug('Telegram-бот %s', uname)
+                    if not startup_notified:
+                        await self._send_startup_message(playerok_ok=True)
+                        startup_notified = True
+                    self._polling_active = True
+                    await self.dp.start_polling(self.bot, skip_updates=True, handle_signals=False)
+                    if not self._stop_event.is_set():
+                        raise RuntimeError('Telegram polling завершился без команды остановки')
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    if time.monotonic() - attempt_started >= 60:
+                        self._poll_failures = 0
+                    self._poll_failures += 1
+                    self._last_error = f'{type(exc).__name__}: {exc}'
+                    delay = min(60, 2 ** min(self._poll_failures, 6))
+                    logger.exception('[tg] polling завершился с ошибкой — повтор через %s с', delay)
+                    if self._stop_event.is_set():
+                        return
+                    await asyncio.sleep(delay)
+                finally:
+                    self._polling_active = False
+        finally:
+            health_task.cancel()
+            await asyncio.gather(health_task, return_exceptions=True)
 
     async def call_seller(self, calling_name: str, chat_id: int | str):
         config = cfg.read('config')
@@ -282,6 +375,58 @@ class Panel:
                 )
             except Exception:
                 logger.debug('notify_update: не удалось отправить user=%s', user_id)
+
+    async def notify_broadcast(self, title: str, text: str, buttons: list | None = None, pinned: bool = False, html: bool = False) -> bool:
+        import html as _html
+        head = (title or '').strip()
+        body = (text or '').strip()
+        if not head and not body:
+            return False
+        rows = []
+        for entry in buttons or []:
+            try:
+                label, link = str(entry[0]).strip(), str(entry[1]).strip()
+            except Exception:
+                continue
+            if label and (link.startswith('http://') or link.startswith('https://') or link.startswith('tg://')):
+                rows.append([InlineKeyboardButton(text=label, url=link)])
+        kb = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+        def _compose(as_html: bool) -> str:
+            safe_body = body if as_html else _html.escape(body)
+            if head:
+                parts = [f'📣 <b>{_html.escape(head)}</b>']
+                if body:
+                    parts.append(safe_body)
+                return '\n\n'.join(parts)
+            return f'📣 {safe_body}' if body else ''
+
+        config = cfg.read('config')
+        delivered = False
+        for user_id in config.get('bot', {}).get('admins') or []:
+            sent_msg = None
+            for as_html in ((True, False) if html else (False,)):
+                try:
+                    sent_msg = await self.bot.send_message(
+                        chat_id=user_id, text=_compose(as_html), reply_markup=kb,
+                        parse_mode='HTML',
+                        link_preview_options=LinkPreviewOptions(is_disabled=True),
+                    )
+                    break
+                except Exception:
+                    sent_msg = None
+            if sent_msg is None:
+                logger.debug('notify_broadcast: не удалось отправить user=%s', user_id)
+                continue
+            delivered = True
+            if pinned:
+                try:
+                    await self.bot.pin_chat_message(
+                        chat_id=user_id, message_id=sent_msg.message_id, disable_notification=True,
+                    )
+                except Exception:
+                    pass
+        return delivered
 
     async def log_event(self, text: str, kb: InlineKeyboardMarkup | None = None, link_preview_url: str | None = None):
         config = cfg.read('config')

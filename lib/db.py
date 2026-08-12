@@ -1,7 +1,9 @@
 import json
 import os
 import tempfile
+import copy
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 
@@ -12,13 +14,21 @@ class _DbFile:
     default: Any
 
 
-_USERS  = _DbFile('initialized_users',  'db/initialized_users.json',  [])
-_ITEMS  = _DbFile('saved_items',         'db/saved_items.json',         [])
-_EVENTS = _DbFile('latest_events_times', 'db/latest_events_times.json', {'auto_bump_items': None})
-_STATS  = _DbFile('stats',               'db/stats.json',               {'deals_completed': 0, 'deals_refunded': 0, 'earned_money': 0})
-_UPD    = _DbFile('updater_state',       'db/updater_state.json',       {'last_notified_tag': '', 'latest_tag': '', 'latest_html_url': '', 'latest_download_url': '', 'checked_at': ''})
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-_ALL: list[_DbFile] = [_USERS, _ITEMS, _EVENTS, _STATS, _UPD]
+
+def _project_path(relative_path: str) -> str:
+    return str(_PROJECT_ROOT / relative_path)
+
+
+_USERS  = _DbFile('initialized_users',  _project_path('db/initialized_users.json'),  [])
+_ITEMS  = _DbFile('saved_items',         _project_path('db/saved_items.json'),         [])
+_EVENTS = _DbFile('latest_events_times', _project_path('db/latest_events_times.json'), {'auto_bump_items': None})
+_STATS  = _DbFile('stats',               _project_path('db/stats.json'),               {'deals_completed': 0, 'deals_refunded': 0, 'earned_money': 0})
+_UPD    = _DbFile('updater_state',       _project_path('db/updater_state.json'),       {'last_notified_tag': '', 'latest_tag': '', 'latest_html_url': '', 'latest_download_url': '', 'checked_at': ''})
+_BCAST  = _DbFile('broadcast_state',     _project_path('db/broadcast_state.json'),     {'seen': [], 'checked_at': ''})
+
+_ALL: list[_DbFile] = [_USERS, _ITEMS, _EVENTS, _STATS, _UPD, _BCAST]
 
 
 def _read(path: str, default: Any) -> Any:
@@ -28,10 +38,21 @@ def _read(path: str, default: Any) -> Any:
             content = fh.read()
         if content.strip():
             return json.loads(content)
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
+    except json.JSONDecodeError:
+        backup = path + '.corrupt.bak'
+        suffix = 1
+        while os.path.exists(backup):
+            backup = f'{path}.corrupt.bak.{suffix}'
+            suffix += 1
+        try:
+            os.replace(path, backup)
+        except OSError:
+            pass
+    except (FileNotFoundError, OSError):
         pass
-    _write(path, default)
-    return default
+    value = copy.deepcopy(default)
+    _write(path, value)
+    return value
 
 
 def _write(path: str, data: Any) -> None:
@@ -42,6 +63,10 @@ def _write(path: str, data: Any) -> None:
         with os.fdopen(fd, 'w', encoding='utf-8') as fh:
             json.dump(data, fh, ensure_ascii=False, indent=4)
         os.replace(tmp, path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
     except Exception:
         try:
             os.unlink(tmp)

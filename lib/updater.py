@@ -84,7 +84,7 @@ def fetch_latest_release(proxy: str | None = None, timeout: int = 15) -> Release
         url = a.get('browser_download_url')
         if not url:
             continue
-        if nm.lower().endswith(('.zip', '.tar.gz', '.tgz', '.7z')):
+        if nm.lower().endswith('.zip'):
             asset_url, asset_name = url, nm
             break
 

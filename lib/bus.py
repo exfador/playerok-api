@@ -14,6 +14,8 @@ class Signal:
         self._slots: list[callable] = []
 
     def connect(self, fn: callable, pos: int | None = None) -> None:
+        if fn in self._slots:
+            return
         self._slots.insert(pos, fn) if pos is not None else self._slots.append(fn)
 
     def disconnect(self, fn: callable) -> None:
@@ -123,9 +125,9 @@ def mkt_table() -> dict[MarketEvent, Signal]:
     return _MKT
 
 
-async def fire(event: str, args: list = [], fn: callable = None) -> None:
-    await _sys_sig(event).send(*args, via=fn)
+async def fire(event: str, args: list | None = None, fn: callable = None) -> None:
+    await _sys_sig(event).send(*(args or []), via=fn)
 
 
-async def fire_mkt(event: MarketEvent, args: list = []) -> None:
-    await _mkt_sig(event).send(*args)
+async def fire_mkt(event: MarketEvent, args: list | None = None) -> None:
+    await _mkt_sig(event).send(*(args or []))

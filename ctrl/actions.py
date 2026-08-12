@@ -10,6 +10,7 @@ import os
 import html
 
 from lib.cfg import AppConf as cfg
+from lib.util import valid_index
 from lib.custom_commands import (
     cc_get_items,
     cc_wrap_items,
@@ -30,6 +31,31 @@ from .helpers import emit_overlay, msg_swap_surface
 
 logger = getLogger('pl.ctrl')
 router = Router()
+
+
+def _valid_index(items, index) -> bool:
+    return valid_index(items, index)
+
+
+def _patch_deal_idempotent(account, deal_id: str, target: DealStage):
+    if not deal_id:
+        raise ValueError('ID сделки отсутствует или устарел')
+    try:
+        current = account.load_deal(deal_id)
+    except Exception:
+        current = None
+    if getattr(current, 'status', None) == target:
+        return current
+    try:
+        return account.patch_deal(deal_id, target)
+    except Exception:
+        try:
+            current = account.load_deal(deal_id)
+        except Exception:
+            current = None
+        if getattr(current, 'status', None) == target:
+            return current
+        raise
 
 
 def _runtime_sync_config() -> None:
@@ -639,6 +665,8 @@ async def hx_030(callback: CallbackQuery, state: FSMContext):
             return await hx_001(callback, calls.PduFulfillGrid(page=last_page), state)
         await state.set_state(states.PduFulfillGrp.pdu_ff_keys_edit)
         auto_deliveries = cfg.read('auto_deliveries')
+        if not _valid_index(auto_deliveries, index):
+            return await hx_001(callback, calls.PduFulfillGrid(page=last_page), state)
         auto_delivery_message = '</code>, <code>'.join(auto_deliveries[index]['keyphrases']) or '❌ Не задано'
         await emit_overlay(state=state, message=callback.message, text=templ.fac_075(f'🔑 Введите новые <b>ключевые фразы</b> для автовыдачи по этому товару (через запятую)\n・ Текущее: <code>{auto_delivery_message}</code>'), reply_markup=templ.fac_023(calls.PduFulfillOpen(index=index).pack()))
     except Exception as e:
@@ -654,6 +682,8 @@ async def hx_031(callback: CallbackQuery, state: FSMContext):
             return await hx_001(callback, calls.PduFulfillGrid(page=last_page), state)
         await state.set_state(states.PduFulfillGrp.pdu_ff_msg_edit)
         auto_deliveries = cfg.read('auto_deliveries')
+        if not _valid_index(auto_deliveries, index):
+            return await hx_001(callback, calls.PduFulfillGrid(page=last_page), state)
         auto_delivery_message = '\n'.join(auto_deliveries[index]['message']) or '❌ Не задано'
         await emit_overlay(state=state, message=callback.message, text=templ.fac_075(f'💬 Введите новое <b>сообщение</b> после покупки\n・ Текущее: <blockquote>{auto_delivery_message}</blockquote>'), reply_markup=templ.fac_023(calls.PduFulfillOpen(index=index).pack()))
     except Exception as e:
@@ -833,6 +863,8 @@ async def hx_085(callback: CallbackQuery, state: FSMContext):
     last_page = data.get('last_page', 0)
     index = data.get('auto_delivery_index', 0)
     auto_deliveries = cfg.read('auto_deliveries')
+    if not _valid_index(auto_deliveries, index):
+        return await hx_001(callback, calls.PduFulfillGrid(page=last_page), state)
     auto_deliveries[index]['piece'] = not auto_deliveries[index].get('piece', False)
     cfg.write('auto_deliveries', auto_deliveries)
     return await hx_002(callback, calls.PduFulfillOpen(index=index), state)
@@ -1034,6 +1066,8 @@ async def hx_024(callback: CallbackQuery, callback_data: calls.PduReviveAllowDro
         if index is None:
             return await hx_056(callback, calls.PduReviveAllowPage(page=last_page), state)
         auto_restore_items = cfg.read('auto_restore_items')
+        if not _valid_index(auto_restore_items.get('included') or [], index):
+            return await hx_056(callback, calls.PduReviveAllowPage(page=last_page), state)
         auto_restore_items['included'].pop(index)
         cfg.write('auto_restore_items', auto_restore_items)
         return await hx_056(callback, calls.PduReviveAllowPage(page=last_page), state)
@@ -1050,6 +1084,8 @@ async def hx_023(callback: CallbackQuery, callback_data: calls.PduSealAllowDrop,
         if index is None:
             return await hx_055(callback, calls.PduSealAllowPage(page=last_page), state)
         auto_complete_deals = cfg.read('auto_complete_deals')
+        if not _valid_index(auto_complete_deals.get('included') or [], index):
+            return await hx_055(callback, calls.PduSealAllowPage(page=last_page), state)
         auto_complete_deals['included'].pop(index)
         cfg.write('auto_complete_deals', auto_complete_deals)
         return await hx_055(callback, calls.PduSealAllowPage(page=last_page), state)
@@ -1066,6 +1102,8 @@ async def hx_022(callback: CallbackQuery, callback_data: calls.PduBoostAllowDrop
         if index is None:
             return await hx_054(callback, calls.PduBoostAllowPage(page=last_page), state)
         auto_bump_items = cfg.read('auto_bump_items')
+        if not _valid_index(auto_bump_items.get('included') or [], index):
+            return await hx_054(callback, calls.PduBoostAllowPage(page=last_page), state)
         auto_bump_items['included'].pop(index)
         cfg.write('auto_bump_items', auto_bump_items)
         return await hx_054(callback, calls.PduBoostAllowPage(page=last_page), state)
@@ -1084,6 +1122,8 @@ async def hx_021(callback: CallbackQuery, callback_data: calls.PduBoostDenyDrop,
         auto_bump_items = cfg.read('auto_bump_items')
         if 'excluded' not in auto_bump_items:
             auto_bump_items['excluded'] = []
+        if not _valid_index(auto_bump_items['excluded'], index):
+            return await hx_053(callback, calls.PduBoostDenyPage(page=last_page), state)
         auto_bump_items['excluded'].pop(index)
         cfg.write('auto_bump_items', auto_bump_items)
         return await hx_053(callback, calls.PduBoostDenyPage(page=last_page), state)
@@ -1329,7 +1369,7 @@ async def hx_067(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     deal_id = data.get('deal_id')
     try:
-        eng.bot_account.patch_deal(deal_id, DealStage.ROLLED_BACK)
+        _patch_deal_idempotent(eng.bot_account, deal_id, DealStage.ROLLED_BACK)
         logger.info(f'[tg] возврат  deal={deal_id}')
         text = f'↩️ Возврат по <a href="https://playerok.com/deal/{deal_id}">сделке</a> оформлен.'
     except Exception as e:
@@ -1351,7 +1391,7 @@ async def hx_009(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     deal_id = data.get('deal_id')
     try:
-        eng.bot_account.patch_deal(deal_id, DealStage.SENT)
+        _patch_deal_idempotent(eng.bot_account, deal_id, DealStage.SENT)
         logger.info(f'[tg] сделка закрыта вручную  deal={deal_id}')
         text = f'✅ Сделка <a href="https://playerok.com/deal/{deal_id}">отмечена выполненной</a>.'
     except Exception as e:
@@ -1517,6 +1557,8 @@ async def hx_018(callback: CallbackQuery, state: FSMContext):
         if index is None:
             return await hx_001(callback, calls.PduFulfillGrid(page=last_page), state)
         auto_deliveries = cfg.read('auto_deliveries')
+        if not _valid_index(auto_deliveries, index):
+            return await hx_001(callback, calls.PduFulfillGrid(page=last_page), state)
         del auto_deliveries[index]
         cfg.write('auto_deliveries', auto_deliveries)
         await emit_overlay(state=state, message=callback.message, text=templ.fac_075('✅ <b>Авто-выдача</b> удалена'), reply_markup=templ.fac_023(calls.PduFulfillGrid(page=last_page).pack()))
@@ -1534,7 +1576,12 @@ async def hx_020(callback: CallbackQuery, callback_data: calls.PduFulfillFileDro
         if deliv_index is None:
             return await hx_001(callback, calls.PduFulfillGrid(page=last_page), state)
         auto_deliveries = cfg.read('auto_deliveries')
-        auto_deliveries[deliv_index]['goods'].pop(index)
+        if not _valid_index(auto_deliveries, deliv_index):
+            return await hx_001(callback, calls.PduFulfillGrid(page=last_page), state)
+        goods = auto_deliveries[deliv_index].get('goods') or []
+        if not _valid_index(goods, index):
+            return await hx_026(callback, calls.PduFulfillFilesPage(page=last_page), state)
+        goods.pop(index)
         cfg.write('auto_deliveries', auto_deliveries)
         return await hx_026(callback, calls.PduFulfillFilesPage(page=last_page), state)
     except Exception as e:
@@ -1592,5 +1639,3 @@ async def hx_010(callback: CallbackQuery, state: FSMContext):
         return await hx_079(callback, calls.PduPrefsScope(to='bump'), state)
     await state.set_state(None)
     await emit_overlay(state=state, message=callback.message, text=templ.fac_056('Подтвердите <b>обновление позиций</b> ↓'), reply_markup=templ.fac_024(CX.bm_run, calls.PduPrefsScope(to='bump').pack()))
-
-

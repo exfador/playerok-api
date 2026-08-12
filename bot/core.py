@@ -11,7 +11,7 @@ import shutil
 from collections import deque
 from dataclasses import dataclass as _dc
 from datetime import datetime, timedelta
-from threading import Thread, Lock
+from threading import Event as ThreadingEvent, Thread, Lock, current_thread
 from colorama import Fore
 from logging import getLogger
 
@@ -178,7 +178,43 @@ class MarketBridge:
         self._chat_msg_history:           dict[str, deque]   = {}
         self._chat_msg_history_lock       = Lock()
         self._problem_resolved_notify_at: dict[str, float]   = {}
+        self._mutation_guard = Lock()
+        self._reactivating_items: set[str] = set()
+        self._elevating_items: set[str] = set()
+        self._alive_lock = Lock()
+        self._alive_started = False
+        self._worker_threads: list[Thread] = []
+        self._started_worker_names: set[str] = set()
+        self._stop_event = ThreadingEvent()
+        self._feed: Feed | None = None
+        self._feed_thread: Thread | None = None
+        self._feed_restarts = 0
+        self._feed_last_event_at: float | None = None
         self._problem_resolved_notify_lock = Lock()
+
+    def health(self) -> dict:
+        feed_health = self._feed.health() if self._feed is not None else {'connected': False}
+        workers = {thread.name: thread.is_alive() for thread in self._worker_threads}
+        return {
+            'started_at': self.stats.bot_launch_time,
+            'stopping': self._stop_event.is_set(),
+            'feed': feed_health,
+            'feed_restarts': self._feed_restarts,
+            'feed_supervisor_alive': bool(self._feed_thread and self._feed_thread.is_alive()),
+            'feed_last_event_at': self._feed_last_event_at,
+            'workers': workers,
+        }
+
+    def stop(self, join_timeout: float = 2.0) -> None:
+        self._stop_event.set()
+        feed = self._feed
+        if feed is not None:
+            feed.stop()
+        deadline = time.monotonic() + max(0.0, join_timeout)
+        for worker in [*self._worker_threads, self._feed_thread]:
+            if worker is None or worker is current_thread() or not worker.is_alive():
+                continue
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
 
     def _store_msg(self, chat_id: str, message: ChatMessage | None) -> None:
         if not message or not getattr(message, 'id', None):
@@ -384,6 +420,7 @@ class MarketBridge:
         try:
             user        = self.account.load_user(self.account.id)
             next_cursor = None
+            seen_cursors: set[str] = set()
             while True:
                 itm_list = user.load_listings(count=24, after_cursor=next_cursor, game_id=game_id,
                                               category_id=category_id, statuses=statuses)
@@ -395,7 +432,11 @@ class MarketBridge:
                             return my_items
                 if not itm_list.page_info.has_next_page:
                     break
-                next_cursor = itm_list.page_info.end_cursor
+                new_cursor = itm_list.page_info.end_cursor
+                if not new_cursor or new_cursor == next_cursor or new_cursor in seen_cursors:
+                    raise RuntimeError('Playerok вернул повторяющийся cursor при загрузке лотов')
+                seen_cursors.add(new_cursor)
+                next_cursor = new_cursor
                 time.sleep(0.5)
             self.saved_items = svd_items
         except (RequestApiError, RequestFailedError):
@@ -410,6 +451,18 @@ class MarketBridge:
         return my_items
 
     def _elevate(self, item: ItemProfile | MyItem) -> str:
+        item_id = str(item.id)
+        with self._mutation_guard:
+            if item_id in self._elevating_items:
+                return 'skip_in_progress'
+            self._elevating_items.add(item_id)
+        try:
+            return self._elevate_once(item)
+        finally:
+            with self._mutation_guard:
+                self._elevating_items.discard(item_id)
+
+    def _elevate_once(self, item: ItemProfile | MyItem) -> str:
         name_short = (item.name or '?')[:100]
         try:
             abi = self.auto_bump_items or {}
@@ -443,7 +496,19 @@ class MarketBridge:
             except StopIteration:
                 raise Exception('PREMIUM статус не найден')
             time.sleep(1)
-            self.bot_account.apply_boost(my_item.id, prem_status.id)
+            previous_sequence = my_item.sequence
+            try:
+                self.bot_account.apply_boost(my_item.id, prem_status.id)
+            except Exception:
+                refreshed = self.account.load_listing(my_item.id)
+                if (
+                    isinstance(refreshed, MyItem)
+                    and refreshed.priority == BoostLevel.PREMIUM
+                    and refreshed.sequence != previous_sequence
+                ):
+                    my_item = refreshed
+                else:
+                    raise
             short = my_item.name[:32] + ('...' if len(my_item.name) > 32 else '')
             logger.info('%s«%s»%s поднят  %s%s%s → %s1%s', C_BRIGHT, short, Fore.RESET, C_DIM, my_item.sequence, Fore.RESET, C_SUCCESS, Fore.RESET)
             self._notify_elevated(my_item.name, my_item.id)
@@ -455,7 +520,7 @@ class MarketBridge:
     def _elevate_all(self) -> None:
         self.latest_events_times['auto_bump_items'] = datetime.now().isoformat()
         db.set('latest_events_times', self.latest_events_times)
-        counters_map = {'bumped': 0, 'skip_priority': 0, 'skip_phrases': 0, 'skip_excluded': 0, 'skip_load': 0, 'error': 0}
+        counters_map = {'bumped': 0, 'skip_priority': 0, 'skip_phrases': 0, 'skip_excluded': 0, 'skip_load': 0, 'skip_in_progress': 0, 'error': 0}
         try:
             items = self._listings(statuses=[ListingStage.APPROVED])
             if not items:
@@ -467,9 +532,9 @@ class MarketBridge:
                 result = self._elevate(item)
                 counters_map[result if result in counters_map else 'error'] += 1
             logger.info(
-                '[elevate_all] поднято: %s · не PREMIUM: %s · нет в списке: %s · исключено: %s · не загружено: %s · ошибок: %s',
+                '[elevate_all] поднято: %s · не PREMIUM: %s · нет в списке: %s · исключено: %s · не загружено: %s · уже выполняется: %s · ошибок: %s',
                 counters_map['bumped'], counters_map['skip_priority'], counters_map['skip_phrases'],
-                counters_map['skip_excluded'], counters_map['skip_load'], counters_map['error'],
+                counters_map['skip_excluded'], counters_map['skip_load'], counters_map['skip_in_progress'], counters_map['error'],
             )
         except Exception as e:
             logger.error('Ошибка при автоподнятии: %s', e)
@@ -478,6 +543,19 @@ class MarketBridge:
         self._elevate_all()
 
     def _reactivate(self, item: Item | MyItem | ItemProfile, retry_delays: list[int] | None = None) -> None:
+        item_id = str(item.id)
+        with self._mutation_guard:
+            if item_id in self._reactivating_items:
+                logger.debug('Восстановление «%s» уже выполняется, дубликат пропущен', item_id)
+                return
+            self._reactivating_items.add(item_id)
+        try:
+            self._reactivate_once(item, retry_delays)
+        finally:
+            with self._mutation_guard:
+                self._reactivating_items.discard(item_id)
+
+    def _reactivate_once(self, item: Item | MyItem | ItemProfile, retry_delays: list[int] | None = None) -> None:
         try:
             ari = self.auto_restore_items
             included = any(
@@ -506,6 +584,14 @@ class MarketBridge:
                         return
                     logger.warning('Попытка %d: «%s» — статус %s, повтор...', attempt, short, new_item.status.name)
                 except Exception as free_err:
+                    try:
+                        refreshed = self.account.load_listing(item.id)
+                        if refreshed.status in (ListingStage.PENDING_APPROVAL, ListingStage.APPROVED):
+                            logger.info('%s«%s»%s восстановлен (подтверждено после сетевой ошибки)', C_BRIGHT, short, Fore.RESET)
+                            self._notify_reactivated(item.name, item.id)
+                            return
+                    except Exception:
+                        pass
                     logger.debug('Восстановление «%s»: бесплатная публикация не сработала (%s), проверяю тиры...', item.name[:32], free_err)
                     try:
                         tiers = self.account.load_boost_tiers(item.id, item.raw_price)
@@ -648,60 +734,76 @@ class MarketBridge:
         draw_box('ЖАЛОБА СНЯТА', rows)
 
     async def _on_alive(self) -> None:
+        if not hasattr(self, '_stop_event'):
+            self._stop_event = ThreadingEvent()
+        if self._stop_event.is_set():
+            return
+        with self._alive_lock:
+            if self._alive_started:
+                logger.debug('Фоновые циклы уже запущены; повторный ALIVE пропущен')
+                return
+            self._alive_started = True
         self.stats.bot_launch_time = datetime.now()
 
         def _sync_loop():
-            while True:
-                balance = self.account.profile.balance.value if self.account.profile.balance is not None else '?'
-                set_console_title(f'CXH Playerok v{VERSION} | {self.account.username}: {balance}₽')
-                if self.stats != counters():
-                    update_counters(self.stats)
-                new_cfg = cfg.read('config')
-                if new_cfg != self.config:
-                    old_verbose = self.config.get('debug', {}).get('verbose', False)
-                    new_verbose = new_cfg.get('debug', {}).get('verbose', False)
-                    self.config = new_cfg
-                    if old_verbose != new_verbose:
-                        from lib.util import apply_verbose
-                        apply_verbose(new_verbose)
-                for key in ('messages', 'custom_commands', 'auto_deliveries', 'auto_restore_items', 'auto_complete_deals', 'auto_bump_items'):
-                    fresh = cfg.read(key)
-                    if fresh != getattr(self, key):
-                        setattr(self, key, fresh)
-                for key in ('initialized_users', 'saved_items', 'latest_events_times'):
-                    val = getattr(self, key)
-                    if db.get(key) != val:
-                        db.set(key, val)
-                time.sleep(3)
+            while not self._stop_event.is_set():
+                try:
+                    profile = getattr(self.account, 'profile', None)
+                    balance_obj = getattr(profile, 'balance', None)
+                    balance = getattr(balance_obj, 'value', '?')
+                    set_console_title(f'CXH Playerok v{VERSION} | {self.account.username}: {balance}₽')
+                    if self.stats != counters():
+                        update_counters(self.stats)
+                    new_cfg = cfg.read('config')
+                    if isinstance(new_cfg, dict) and new_cfg != self.config:
+                        old_verbose = self.config.get('debug', {}).get('verbose', False)
+                        new_verbose = new_cfg.get('debug', {}).get('verbose', False)
+                        self.config = new_cfg
+                        if old_verbose != new_verbose:
+                            from lib.util import apply_verbose
+                            apply_verbose(new_verbose)
+                    for key in ('messages', 'custom_commands', 'auto_deliveries', 'auto_restore_items', 'auto_complete_deals', 'auto_bump_items'):
+                        fresh = cfg.read(key)
+                        if fresh != getattr(self, key):
+                            setattr(self, key, fresh)
+                    for key in ('initialized_users', 'saved_items', 'latest_events_times'):
+                        val = getattr(self, key)
+                        if db.get(key) != val:
+                            db.set(key, val)
+                except Exception:
+                    logger.error('Ошибка синхронизации конфигурации/состояния: %s', traceback.format_exc())
+                if self._stop_event.wait(3):
+                    return
 
         def _refresh_profile_loop():
-            while True:
-                time.sleep(1800)
+            while not self._stop_event.wait(1800):
                 try:
                     self._sync_profile()
                 except Exception:
                     logger.error('Ошибка обновления аккаунта: %s', traceback.format_exc())
 
         def _access_check_loop():
-            while True:
+            while not self._stop_event.is_set():
                 try:
                     self._verify_access()
                 except Exception:
                     logger.error('Ошибка проверки блокировки: %s', traceback.format_exc())
-                time.sleep(900)
+                if self._stop_event.wait(900):
+                    return
 
         def _reactivate_expired_loop():
-            while True:
+            while not self._stop_event.is_set():
                 poll_on = (self.config.get('auto', {}).get('restore', {}).get('poll') or {}).get('enabled')
                 if self.config['auto']['restore']['expired'] and not poll_on:
                     try:
                         self._reactivate_expired()
                     except Exception:
                         logger.error('Ошибка автовосстановления: %s', traceback.format_exc())
-                time.sleep(45)
+                if self._stop_event.wait(45):
+                    return
 
         def _reactivate_poll_loop():
-            while True:
+            while not self._stop_event.is_set():
                 poll = (self.config.get('auto', {}).get('restore') or {}).get('poll') or {}
                 iv   = max(30, int(poll.get('interval') or 300))
                 if poll.get('enabled'):
@@ -709,28 +811,33 @@ class MarketBridge:
                         self._reactivate_polled()
                     except Exception:
                         logger.error('Ошибка проверки завершённых лотов: %s', traceback.format_exc())
-                    time.sleep(iv)
+                    if self._stop_event.wait(iv):
+                        return
                 else:
-                    time.sleep(15)
+                    if self._stop_event.wait(15):
+                        return
 
         def _elevate_loop():
-            while True:
+            while not self._stop_event.is_set():
                 if self.config['auto']['bump']['enabled'] and datetime.now() >= self._next_at('auto_bump_items'):
                     try:
                         self._elevate_all()
                     except Exception:
                         logger.error('Ошибка автоподнятия: %s', traceback.format_exc())
-                time.sleep(3)
+                if self._stop_event.wait(3):
+                    return
 
         def _update_check_loop():
             from lib.updater import fetch_latest_release, is_newer
             from lib.consts import VERSION as _VERSION
-            time.sleep(20)
-            while True:
+            if self._stop_event.wait(20):
+                return
+            while not self._stop_event.is_set():
                 upd_cfg = (self.config.get('updater') or {})
                 iv = max(300, int(upd_cfg.get('interval_sec') or 3600))
                 if not upd_cfg.get('enabled', True):
-                    time.sleep(iv)
+                    if self._stop_event.wait(iv):
+                        return
                     continue
                 try:
                     rel = fetch_latest_release(self.config.get('bot', {}).get('proxy') or None)
@@ -763,10 +870,84 @@ class MarketBridge:
                                 logger.info('Доступно обновление: %s (текущая %s)', rel.tag, _VERSION)
                 except Exception:
                     logger.debug('Ошибка проверки обновлений: %s', traceback.format_exc())
-                time.sleep(iv)
+                if self._stop_event.wait(iv):
+                    return
 
-        for target in (_sync_loop, _refresh_profile_loop, _access_check_loop, _reactivate_expired_loop, _reactivate_poll_loop, _elevate_loop, _update_check_loop):
-            Thread(target=target, daemon=True).start()
+        def _broadcast_loop():
+            from lib.broadcast import fetch_bulletins, DEFAULT_SOURCE
+            cap = 800
+            if self._stop_event.wait(25):
+                return
+            while not self._stop_event.is_set():
+                bc = (self.config.get('broadcast') or {})
+                iv = max(120, int(bc.get('interval_sec') or 1800))
+                source = str(bc.get('source') or '').strip() or DEFAULT_SOURCE
+                if not bc.get('enabled', True) or not source:
+                    if self._stop_event.wait(iv):
+                        return
+                    continue
+                try:
+                    alerts = self.config.get('alerts') or {}
+                    alerts_on = alerts.get('enabled', True) and (alerts.get('on') or {}).get('broadcast', True)
+                    if alerts_on:
+                        bulletins = fetch_bulletins(source, self.config.get('bot', {}).get('proxy') or None)
+                        if bulletins:
+                            state = db.get('broadcast_state') or {}
+                            seen = list(state.get('seen') or [])
+                            seen_set = set(seen)
+                            fresh = [b for b in bulletins if b.key not in seen_set]
+                            panel = _get_panel()
+                            loop = _get_panel_loop()
+                            if fresh and panel is not None and loop is not None:
+                                pre_seed: list[str] = []
+                                if not seen_set and len(fresh) > 1:
+                                    pre_seed = [b.key for b in fresh[:-1]]
+                                    fresh = fresh[-1:]
+                                delivered: list[str] = list(pre_seed)
+                                for b in fresh:
+                                    try:
+                                        ok = asyncio.run_coroutine_threadsafe(
+                                            panel.notify_broadcast(b.title, b.text, b.buttons, b.pinned, b.html),
+                                            loop,
+                                        ).result(timeout=30)
+                                    except Exception:
+                                        ok = False
+                                    if ok:
+                                        delivered.append(b.key)
+                                if delivered:
+                                    seen.extend(delivered)
+                                    if len(seen) > cap:
+                                        seen = seen[-cap:]
+                                    state['seen'] = seen
+                                    state['checked_at'] = datetime.now().isoformat(timespec='seconds')
+                                    db.set('broadcast_state', state)
+                                    sent_now = len(delivered) - len(pre_seed)
+                                    if sent_now > 0:
+                                        logger.info('Рассылка: новых сообщений доставлено — %d', sent_now)
+                except Exception:
+                    logger.debug('Ошибка рассылки: %s', traceback.format_exc())
+                if self._stop_event.wait(iv):
+                    return
+
+        targets = (_sync_loop, _refresh_profile_loop, _access_check_loop, _reactivate_expired_loop, _reactivate_poll_loop, _elevate_loop, _update_check_loop, _broadcast_loop)
+        started_names = getattr(self, '_started_worker_names', set())
+        self._started_worker_names = started_names
+        for target in targets:
+            worker_name = f'cxh-{target.__name__.strip("_")}'
+            if worker_name in started_names:
+                continue
+            worker = Thread(target=target, daemon=True, name=worker_name)
+            try:
+                worker.start()
+            except Exception:
+                logger.error('Не удалось запустить фоновый цикл %s: %s', worker_name, traceback.format_exc())
+                continue
+            self._worker_threads.append(worker)
+            started_names.add(worker_name)
+        with self._alive_lock:
+            self._alive_started = len(started_names) == len(targets)
+        if not self._alive_started:
+            logger.error('Запущены не все фоновые циклы (%s/%s); повторный ALIVE дозапустит отсутствующие', len(started_names), len(targets))
 
     def _exec_cmd(self, raw_text: str, chat_id: str, username: str) -> None:
         item = cc_find_by_trigger(cc_get_items(self.custom_commands), raw_text)
@@ -1174,9 +1355,28 @@ class MarketBridge:
         wire_mkt(MarketEvent.DEAL_STATUS_CHANGED, MarketBridge._on_stage,  0)
 
         async def _event_loop():
-            feed = Feed(self.account)
-            for event in feed.listen():
-                await fire_mkt(event.type, [self, event])
+            delay = 1
+            while not self._stop_event.is_set():
+                feed = Feed(self.account, ws_path='/chats')
+                self._feed = feed
+                try:
+                    for event in feed.listen():
+                        if self._stop_event.is_set():
+                            return
+                        self._feed_last_event_at = time.monotonic()
+                        delay = 1
+                        await fire_mkt(event.type, [self, event])
+                    if not self._stop_event.is_set():
+                        raise RuntimeError('Playerok Feed завершился без команды остановки')
+                except Exception:
+                    if not self._stop_event.is_set():
+                        self._feed_restarts += 1
+                        logger.exception('Playerok Feed упал — перезапуск через %s с', delay)
+                finally:
+                    feed.stop()
+                if self._stop_event.wait(delay):
+                    return
+                delay = min(30, delay * 2)
 
-        spawn_async(_event_loop)
+        self._feed_thread = spawn_async(_event_loop, name='PlayerokFeedSupervisor')
         await fire('ALIVE', [self])

@@ -10,11 +10,12 @@ import re
 import html
 import secrets
 import shutil
+import time
 
-from lib.cfg import AppConf as cfg, verify_password
+from lib.cfg import AppConf as cfg, hash_password, password_needs_rehash, verify_password
 from lib.custom_commands import cc_get_items, cc_wrap_items, cc_new_item, cc_trigger_taken, cc_find_by_id
-from lib.ext import all_extensions
-from lib.util import token_ok, cookies_ok, parse_cookies_string, ua_ok, proxy_ok, proxy_reachable, proxy_probe_html_suffix
+from lib.ext import ADDONS_DIR, all_extensions
+from lib.util import token_ok, cookies_ok, parse_cookies_string, ua_ok, proxy_ok, proxy_reachable, proxy_probe_html_suffix, valid_index
 from . import ui as templ
 from . import states
 from . import keys as calls
@@ -31,6 +32,86 @@ async def on_cmd_start(message: types.Message, state: FSMContext):
     if message.from_user.id not in config['bot']['admins']:
         return await adm_gate(message, state)
     await emit_overlay(state=state, message=message, text=templ.fac_040(), reply_markup=templ.fac_039())
+
+
+def _age(value: float | None) -> str:
+    if value is None:
+        return 'нет данных'
+    seconds = max(0, int(time.monotonic() - value))
+    if seconds < 60:
+        return f'{seconds} с назад'
+    if seconds < 3600:
+        return f'{seconds // 60} мин назад'
+    return f'{seconds // 3600} ч назад'
+
+
+def _uptime(value) -> str:
+    if value is None:
+        return 'нет данных'
+    try:
+        import datetime
+        seconds = max(0, int((datetime.datetime.now() - value).total_seconds()))
+    except Exception:
+        return 'нет данных'
+    days, remainder = divmod(seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes = remainder // 60
+    return f'{days} д {hours} ч {minutes} мин' if days else f'{hours} ч {minutes} мин'
+
+
+def _safe_health_error(value) -> str:
+    text = str(value or '')[:500]
+    text = re.sub(r'(?i)(https?://)[^/@\s]+@', r'\1***@', text)
+    text = re.sub(r'(?i)\b(token|cookie|authorization)=?[: ]*[^\s;,]+', r'\1=***', text)
+    return html.escape(text[:180])
+
+
+@router.message(Command('status', 'online'))
+async def on_cmd_status(message: types.Message, state: FSMContext):
+    await state.set_state(None)
+    config = cfg.read('config')
+    if message.from_user.id not in config['bot']['admins']:
+        return await adm_gate(message, state)
+
+    from bot.core import live_bridge
+    from ctrl.panel import get_panel
+
+    bridge = live_bridge()
+    panel = get_panel()
+    market = bridge.health() if bridge is not None else {}
+    telegram = panel.health() if panel is not None else {}
+    feed = market.get('feed') or {}
+    workers = market.get('workers') or {}
+    worker_alive = sum(bool(value) for value in workers.values())
+    worker_total = len(workers)
+    workers_ok = worker_total > 0 and worker_alive == worker_total
+    ws_ok = bool(feed.get('connected'))
+    tg_success_at = telegram.get('last_api_success_at')
+    tg_fresh = tg_success_at is not None and (time.monotonic() - tg_success_at) < 180
+    tg_ok = bool(telegram.get('polling_active')) and tg_fresh
+    supervisor_ok = bool(market.get('feed_supervisor_alive'))
+    overall = ws_ok and tg_ok and supervisor_ok and workers_ok and not market.get('stopping')
+    error = feed.get('last_error') or telegram.get('last_error')
+    error_line = ''
+    if error:
+        error_line = f'\n⚠️ Последняя ошибка: <code>{_safe_health_error(error)}</code>'
+    text = (
+        f'{"🟢" if overall else "🟡"} <b>Состояние CXH 24/7</b>\n\n'
+        f'⏱ Аптайм: {_uptime(market.get("started_at"))}\n\n'
+        f'{"🟢" if ws_ok else "🔴"} Playerok онлайн: <b>{"да" if ws_ok else "нет"}</b>\n'
+        f'├ Последний pong/ответ: {_age(feed.get("last_pong_at") or feed.get("last_message_at"))}\n'
+        f'├ Переподключений: {int(feed.get("reconnect_count") or 0)}\n'
+        f'└ Активных чат-подписок: {int(feed.get("subscriptions") or 0)}\n\n'
+        f'{"🟢" if tg_ok else "🔴"} Telegram polling/API: <b>{"работает" if tg_ok else "требует внимания"}</b>\n'
+        f'├ API Telegram: {_age(telegram.get("last_api_success_at"))}\n'
+        f'├ Получено обновлений: {int(telegram.get("updates_received") or 0)}\n'
+        f'└ Сбоев polling подряд: {int(telegram.get("poll_failures") or 0)}\n\n'
+        f'{"🟢" if workers_ok else "🔴"} Фоновые циклы: {worker_alive}/{worker_total}\n'
+        f'{"🟢" if supervisor_ok else "🔴"} Supervisor Playerok\n'
+        f'♻️ Перезапусков Feed: {int(market.get("feed_restarts") or 0)}'
+        f'{error_line}'
+    )
+    await message.answer(text, parse_mode='HTML')
 
 
 @router.message(Command('logs'))
@@ -78,7 +159,8 @@ async def on_cmd_logs(message: types.Message, state: FSMContext):
         await message.answer(f'❌ Лог за <b>{date_str}</b> не найден.', parse_mode='HTML')
         return
 
-    content = open(log_path, 'rb').read()
+    with open(log_path, 'rb') as log_file:
+        content = log_file.read()
     filename = f'log_{dt.strftime("%d-%m-%Y")}.txt'
     size_kb = len(content) / 1024
     line_count = content.count(b'\n')
@@ -95,9 +177,14 @@ async def rx_026(message: types.Message, state: FSMContext):
     try:
         await state.set_state(None)
         config = cfg.read('config')
-        if not verify_password(message.text.strip(), config['bot']['password_hash']):
+        plain_password = message.text.strip()
+        stored_hash = config['bot']['password_hash']
+        if not verify_password(plain_password, stored_hash):
             raise Exception('❌ Неверный пароль.')
-        config['bot']['admins'].append(message.from_user.id)
+        if password_needs_rehash(stored_hash):
+            config['bot']['password_hash'] = hash_password(plain_password)
+        if message.from_user.id not in config['bot']['admins']:
+            config['bot']['admins'].append(message.from_user.id)
         cfg.write('config', config)
         await emit_overlay(state=state, message=message, text=templ.fac_040(), reply_markup=templ.fac_039())
     except Exception as e:
@@ -877,6 +964,8 @@ async def rx_002(message: types.Message, state: FSMContext):
         if len(message.text) <= 0:
             raise Exception('❌ Слишком короткое значение')
         auto_deliveries = cfg.read('auto_deliveries')
+        if not valid_index(auto_deliveries, index):
+            return await emit_overlay(state=state, message=message, text=templ.fac_075('⚠️ Автовыдача изменилась или была удалена.'), reply_markup=templ.fac_023(calls.PduFulfillGrid(page=data.get('last_page', 0)).pack()))
         keyphrases = [phrase.strip() for phrase in message.text.split(',')]
         auto_deliveries[index]['keyphrases'] = keyphrases
         cfg.write('auto_deliveries', auto_deliveries)
@@ -894,6 +983,8 @@ async def rx_003(message: types.Message, state: FSMContext):
         if len(message.text) <= 0:
             raise Exception('❌ Слишком короткий текст')
         auto_deliveries = cfg.read('auto_deliveries')
+        if not valid_index(auto_deliveries, index):
+            return await emit_overlay(state=state, message=message, text=templ.fac_075('⚠️ Автовыдача изменилась или была удалена.'), reply_markup=templ.fac_023(calls.PduFulfillGrid(page=data.get('last_page', 0)).pack()))
         auto_deliveries[index]['message'] = message.text.splitlines()
         cfg.write('auto_deliveries', auto_deliveries)
         await emit_overlay(state=state, message=message, text=templ.fac_075(f'✅ <b>Сообщение автовыдачи</b> было успешно изменено на: <blockquote>{message.text}</blockquote>'), reply_markup=templ.fac_023(calls.PduFulfillOpen(index=index).pack()))
@@ -923,6 +1014,8 @@ async def rx_001(message: types.Message, state: FSMContext):
         if not goods:
             raise Exception('❌ Не удалось извлечь товары')
         auto_deliveries = cfg.read('auto_deliveries')
+        if not valid_index(auto_deliveries, index):
+            return await emit_overlay(state=state, message=message, text=templ.fac_094('⚠️ Автовыдача изменилась или была удалена.'), reply_markup=templ.fac_023(calls.PduFulfillGrid(page=last_page).pack()))
         auto_deliveries[index]['goods'].extend(goods)
         cfg.write('auto_deliveries', auto_deliveries)
         await emit_overlay(state=state, message=message, text=templ.fac_094(f'✅ <b>{len(goods)} товаров</b> успешно добавлено в автовыдачу'), reply_markup=templ.fac_023(calls.PduFulfillFilesPage(page=last_page).pack()))
@@ -961,7 +1054,7 @@ async def rx_addon_import(message: types.Message, state: FSMContext):
                     if n.startswith(('/', '..', '\\')) or '..' in n.replace('\\', '/').split('/'):
                         raise Exception(f'❌ Опасный путь в архиве: {n!r}')
 
-                os.makedirs('ext', exist_ok=True)
+                os.makedirs(ADDONS_DIR, exist_ok=True)
 
                 top_entries = {n.split('/', 1)[0] for n in names if n.strip()}
                 root_files = [n for n in names if '/' not in n.rstrip('/') and n]
@@ -969,7 +1062,7 @@ async def rx_addon_import(message: types.Message, state: FSMContext):
 
                 if has_root_init:
                     module_name = re.sub(r'[^A-Za-z0-9_]+', '_', os.path.splitext(file_name)[0]).strip('_') or 'extension'
-                    dest = os.path.join('ext', module_name)
+                    dest = os.path.join(ADDONS_DIR, module_name)
                     if os.path.isdir(dest):
                         shutil.rmtree(dest, ignore_errors=True)
                     os.makedirs(dest, exist_ok=True)
@@ -992,7 +1085,7 @@ async def rx_addon_import(message: types.Message, state: FSMContext):
                         added = []
                         for d in valid_dirs:
                             src = os.path.join(extract_tmp, d)
-                            dst = os.path.join('ext', d)
+                            dst = os.path.join(ADDONS_DIR, d)
                             if os.path.isdir(dst):
                                 shutil.rmtree(dst, ignore_errors=True)
                             shutil.move(src, dst)

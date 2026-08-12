@@ -2,6 +2,7 @@ import os
 import sys
 import importlib
 import uuid
+from pathlib import Path
 from uuid import UUID
 from colorama import Fore
 from dataclasses import dataclass
@@ -11,7 +12,7 @@ from lib.bus import graft, prune, graft_mkt, prune_mkt, fire
 from lib.util import check_requirements
 
 logger = getLogger('cxh.ext')
-ADDONS_DIR = 'ext'
+ADDONS_DIR = str(Path(__file__).resolve().parent.parent / 'ext')
 ADDONS_PKG = 'ext'
 
 

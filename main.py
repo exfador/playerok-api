@@ -35,6 +35,9 @@ class CXHBot:
     def __init__(self):
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self._shutdown_flag = False
+        self._shutdown_event: asyncio.Event | None = None
+        self._panel = None
+        self._bridge = None
 
     @staticmethod
     def _log_status(level: str, msg: str, *, icon: str = '', newline: bool = True) -> None:
@@ -383,7 +386,11 @@ class CXHBot:
 
     async def _auto_maintenance(self) -> None:
         while not self._shutdown_flag:
-            await asyncio.sleep(45)
+            try:
+                await asyncio.wait_for(self._shutdown_event.wait(), timeout=45)
+                return
+            except asyncio.TimeoutError:
+                pass
             try:
                 log_path = ut.get_bot_log_path()
                 conf = cfgmod.AppConf.read('config') or {}
@@ -398,20 +405,18 @@ class CXHBot:
     async def _launch_telegram_panel(self) -> None:
         from ctrl.panel import Panel
         panel = Panel()
-        try:
-            async def _panel_poll():
-                await panel.run_bot()
-            asyncio.create_task(_panel_poll(), name='tg_panel')
-        except TypeError:
-            asyncio.create_task(_panel_poll())
+        self._panel = panel
         LOG.debug('Панель Telegram запущена — лог: %s', ut.get_bot_log_path())
+        await panel.run_bot()
 
     async def _launch_market_engine(self) -> None:
         from bot.core import make_bridge
         from pok.defs import RequestSendingError
         try:
             bridge = make_bridge()
+            self._bridge = bridge
             await bridge.start()
+            await self._shutdown_event.wait()
         except RequestSendingError as exc:
             LOG.error('  %s✗%s  Playerok недоступен: проверьте прокси и сеть.', const.C_ERROR, Fore.RESET)
             LOG.error('  %s%s', const.C_TEXT, str(exc)[:500])
@@ -419,6 +424,8 @@ class CXHBot:
             raise SystemExit(1) from None
 
     async def _run(self) -> None:
+        self._shutdown_flag = False
+        self._shutdown_event = asyncio.Event()
         ut.clear_terminal()
         quick_restart = os.environ.pop('CXH_FAST_REBOOT', None) == '1'
         ut.check_requirements('requirements.txt')
@@ -452,12 +459,28 @@ class CXHBot:
 
         await busmod.fire('BOOT')
 
+        shutdown_task = asyncio.create_task(self._shutdown_event.wait(), name='shutdown')
+        service_tasks = (engine_task, panel_task)
         try:
-            await asyncio.gather(engine_task, panel_task, maint_task)
-        except asyncio.CancelledError:
-            pass
+            done, _ = await asyncio.wait(
+                (*service_tasks, shutdown_task),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if shutdown_task not in done:
+                for task in done:
+                    task.result()
+                raise RuntimeError('Служебный процесс завершился неожиданно')
         finally:
             self._shutdown_flag = True
+            self._shutdown_event.set()
+            if self._bridge is not None:
+                await asyncio.to_thread(self._bridge.stop)
+            if self._panel is not None:
+                await self._panel.stop()
+            for task in (engine_task, panel_task, maint_task, shutdown_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(engine_task, panel_task, maint_task, shutdown_task, return_exceptions=True)
 
     def run(self) -> None:
         try:
@@ -469,9 +492,9 @@ class CXHBot:
         ut.bind_loop(self.loop)
 
         def _shutdown_handler():
-            for task in asyncio.all_tasks(self.loop):
-                task.cancel()
-            self.loop.stop()
+            self._shutdown_flag = True
+            if self._shutdown_event is not None:
+                self._shutdown_event.set()
 
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
@@ -481,10 +504,13 @@ class CXHBot:
 
         try:
             self.loop.run_until_complete(self._run())
-            self.loop.run_forever()
         except KeyboardInterrupt:
             LOG.info('%sЗавершение по Ctrl+C%s', const.C_WARNING, Fore.RESET)
         finally:
+            try:
+                self.loop.run_until_complete(self.loop.shutdown_asyncgens())
+            except Exception:
+                pass
             self.loop.close()
 
 

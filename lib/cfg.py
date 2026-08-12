@@ -2,19 +2,37 @@ import os
 import json
 import copy
 import hashlib
+import hmac
+import secrets
 import tempfile
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 
 def hash_password(plain: str) -> str:
-    h = hashlib.new('sha256')
-    h.update(plain.encode('utf-8'))
-    return h.hexdigest()
+    iterations = 310_000
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac('sha256', plain.encode('utf-8'), salt, iterations)
+    return f'pbkdf2_sha256${iterations}${salt.hex()}${digest.hex()}'
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return hash_password(plain) == hashed
+    try:
+        if hashed.startswith('pbkdf2_sha256$'):
+            _, raw_iterations, raw_salt, expected = hashed.split('$', 3)
+            actual = hashlib.pbkdf2_hmac(
+                'sha256', plain.encode('utf-8'), bytes.fromhex(raw_salt), int(raw_iterations),
+            ).hex()
+            return hmac.compare_digest(actual, expected)
+        legacy = hashlib.sha256(plain.encode('utf-8')).hexdigest()
+        return hmac.compare_digest(legacy, hashed)
+    except (TypeError, ValueError):
+        return False
+
+
+def password_needs_rehash(hashed: str) -> bool:
+    return not isinstance(hashed, str) or not hashed.startswith('pbkdf2_sha256$310000$')
 
 
 @dataclass
@@ -55,22 +73,30 @@ _DEFAULTS: dict[str, Any] = {
         'on': {
             'message': True, 'system': True, 'deal': True, 'review': True,
             'problem': True, 'deal_changed': True, 'restore': True, 'bump': True, 'startup': True,
-            'update': True,
+            'update': True, 'broadcast': True,
         },
     },
     'updater': {'enabled': True, 'interval_sec': 3600, 'auto_update': False, 'notify': True},
+    'broadcast': {'enabled': True, 'interval_sec': 1800, 'source': 'https://api.github.com/gists/89e52dbb3ca81aee82b6a3d8b51b55e2'},
     'logs':    {'max_mb': 300},
     'debug':   {'verbose': False},
     'display': {'timezone': ''},
 }
 
-_CFG = _CfgFile('config',             'conf/config.json',             True,  _DEFAULTS)
-_MSG = _CfgFile('messages',           'conf/messages.json',           False, {})
-_CC  = _CfgFile('custom_commands',    'conf/custom_commands.json',    False, {'items': []})
-_AD  = _CfgFile('auto_deliveries',    'conf/auto_deliveries.json',    False, [])
-_ARI = _CfgFile('auto_restore_items', 'conf/auto_restore_items.json', False, {'included': []})
-_ACD = _CfgFile('auto_complete_deals','conf/auto_complete_deals.json',False, {'included': []})
-_ABI = _CfgFile('auto_bump_items',    'conf/auto_bump_items.json',    False, {'included': [], 'excluded': []})
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _project_path(relative_path: str) -> str:
+    return str(_PROJECT_ROOT / relative_path)
+
+
+_CFG = _CfgFile('config',             _project_path('conf/config.json'),             True,  _DEFAULTS)
+_MSG = _CfgFile('messages',           _project_path('conf/messages.json'),           False, {})
+_CC  = _CfgFile('custom_commands',    _project_path('conf/custom_commands.json'),    False, {'items': []})
+_AD  = _CfgFile('auto_deliveries',    _project_path('conf/auto_deliveries.json'),    False, [])
+_ARI = _CfgFile('auto_restore_items', _project_path('conf/auto_restore_items.json'), False, {'included': []})
+_ACD = _CfgFile('auto_complete_deals',_project_path('conf/auto_complete_deals.json'),False, {'included': []})
+_ABI = _CfgFile('auto_bump_items',    _project_path('conf/auto_bump_items.json'),    False, {'included': [], 'excluded': []})
 
 _STORE: dict[str, _CfgFile] = {
     _CFG.name: _CFG, _MSG.name: _MSG, _CC.name: _CC,
@@ -106,14 +132,37 @@ def _restore(current: dict, blueprint: dict) -> dict:
     return out
 
 
+def _backup_corrupt(path: str) -> None:
+    backup = path + '.corrupt.bak'
+    suffix = 1
+    while os.path.exists(backup):
+        backup = f'{path}.corrupt.bak.{suffix}'
+        suffix += 1
+    try:
+        os.replace(path, backup)
+    except OSError:
+        pass
+
+
 def _load(path: str, default: Any, need_restore: bool = True) -> Any:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     raw = None
     try:
         with open(path, encoding='utf-8') as fh:
             raw = json.load(fh)
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+    except FileNotFoundError:
         raw = None
+    except json.JSONDecodeError:
+        _backup_corrupt(path)
+        raw = None
+    except OSError:
+        raw = None
+
+    if raw is not None:
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
 
     if raw is None:
         raw = copy.deepcopy(default)
@@ -121,20 +170,12 @@ def _load(path: str, default: Any, need_restore: bool = True) -> Any:
         return raw
 
     if isinstance(default, dict) and not isinstance(raw, dict):
-        backup = path + '.corrupt.bak'
-        try:
-            os.replace(path, backup)
-        except OSError:
-            pass
+        _backup_corrupt(path)
         fresh = copy.deepcopy(default)
         _save(path, fresh)
         return fresh
     if isinstance(default, list) and not isinstance(raw, list):
-        backup = path + '.corrupt.bak'
-        try:
-            os.replace(path, backup)
-        except OSError:
-            pass
+        _backup_corrupt(path)
         fresh = copy.deepcopy(default)
         _save(path, fresh)
         return fresh
@@ -156,6 +197,10 @@ def _save(path: str, data: Any) -> None:
         with os.fdopen(fd, 'w', encoding='utf-8') as fh:
             json.dump(data, fh, ensure_ascii=False, indent=4)
         os.replace(tmp_path, path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
     except Exception:
         try:
             os.unlink(tmp_path)

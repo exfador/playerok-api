@@ -4,9 +4,9 @@ import logging
 import os
 import shutil
 import stat
-import sys
 import threading
 import time
+import tempfile
 import zipfile
 from typing import Callable
 
@@ -92,35 +92,70 @@ def _should_skip_src(rel: str) -> bool:
 
 
 def apply_update(src_root: str, live_root: str, logger_cb: Callable[[str], None] | None = None) -> dict:
-    """Копирует файлы из src_root в live_root (preserve conf/db/logs/...). Возвращает метрики."""
     log = logger_cb or (lambda m: logger.info(m))
-    copied = 0
     skipped = 0
     errors: list[str] = []
+    sources: list[tuple[str, str]] = []
     for src_path in _iter_tree(src_root):
         rel = _rel(src_root, src_path)
         if _should_skip_src(rel):
             skipped += 1
             continue
-        dst_path = os.path.join(live_root, rel)
-        os.makedirs(os.path.dirname(dst_path) or '.', exist_ok=True)
+        sources.append((src_path, rel))
+
+    live_parent = os.path.dirname(os.path.abspath(live_root)) or '.'
+    os.makedirs(live_parent, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='.cxh-update-', dir=live_parent) as work_dir:
+        staged_root = os.path.join(work_dir, 'staged')
+        backup_root = os.path.join(work_dir, 'backup')
+        for src_path, rel in sources:
+            staged_path = os.path.join(staged_root, rel)
+            os.makedirs(os.path.dirname(staged_path), exist_ok=True)
+            try:
+                shutil.copy2(src_path, staged_path)
+            except OSError as e:
+                errors.append(f'{rel}: {e}')
+                log(f'Ошибка подготовки {rel}: {e}')
+        if errors:
+            log(f'Обновление отменено до изменения рабочей копии: ошибок {len(errors)}')
+            return {'copied': 0, 'skipped': skipped, 'errors': errors}
+
+        applied: list[tuple[str, str | None]] = []
         try:
-            if os.path.exists(dst_path):
-                try:
-                    os.chmod(dst_path, stat.S_IWRITE | stat.S_IREAD)
-                except OSError:
-                    pass
-            shutil.copyfile(src_path, dst_path)
-            copied += 1
+            for _, rel in sources:
+                staged_path = os.path.join(staged_root, rel)
+                dst_path = os.path.join(live_root, rel)
+                os.makedirs(os.path.dirname(dst_path) or '.', exist_ok=True)
+                backup_path = None
+                if os.path.exists(dst_path):
+                    try:
+                        os.chmod(dst_path, stat.S_IWRITE | stat.S_IREAD)
+                    except OSError:
+                        pass
+                    backup_path = os.path.join(backup_root, rel)
+                    os.makedirs(os.path.dirname(backup_path), exist_ok=True)
+                    shutil.copy2(dst_path, backup_path)
+                os.replace(staged_path, dst_path)
+                applied.append((dst_path, backup_path))
         except OSError as e:
-            errors.append(f'{rel}: {e}')
-            log(f'Ошибка копирования {rel}: {e}')
-    log(f'Обновление: скопировано {copied}, пропущено {skipped}, ошибок {len(errors)}')
-    return {'copied': copied, 'skipped': skipped, 'errors': errors}
+            errors.append(str(e))
+            for dst_path, backup_path in reversed(applied):
+                try:
+                    if backup_path is None:
+                        os.unlink(dst_path)
+                    else:
+                        os.replace(backup_path, dst_path)
+                except OSError as rollback_error:
+                    errors.append(f'rollback {dst_path}: {rollback_error}')
+            log(f'Обновление отменено и откачено: ошибок {len(errors)}')
+            return {'copied': 0, 'skipped': skipped, 'errors': errors}
+
+    copied = len(sources)
+    log(f'Обновление: скопировано {copied}, пропущено {skipped}, ошибок 0')
+    return {'copied': copied, 'skipped': skipped, 'errors': []}
 
 
 def schedule_reboot(delay_sec: float = 3.0) -> None:
-    """Перезапускает процесс через delay_sec в фоне."""
     def _do():
         time.sleep(delay_sec)
         try:
