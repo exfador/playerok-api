@@ -2,245 +2,330 @@
 
 # 🏪 CXH Playerok
 
-**Управляйте магазином на Playerok прямо из Telegram — без браузера, без лишних вкладок, 24/7.**
+### Управление магазином Playerok из Telegram — сообщения, сделки и автоматизация 24/7
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![Telegram — канал](https://img.shields.io/badge/Telegram-канал-26A5E4?logo=telegram)](https://t.me/coxerhub_playerok)
-[![Telegram — чат](https://img.shields.io/badge/Telegram-чат-26A5E4?logo=telegram)](https://t.me/coxerhub_ch)
-[![Version](https://img.shields.io/badge/версия-2.0.0-brightgreen)](lib/consts.py)
+[![Release](https://img.shields.io/github/v/release/exfador/playerok-api?style=for-the-badge&color=7c3aed)](https://github.com/exfador/playerok-api/releases/latest)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
+[![Tests](https://img.shields.io/badge/tests-56%20passed-22c55e?style=for-the-badge)](#тестирование)
+[![License](https://img.shields.io/github/license/exfador/playerok-api?style=for-the-badge&color=0ea5e9)](LICENSE)
+
+**Уведомления в реальном времени · Ответы покупателям · Автовыдача · Автоподнятие · Мониторинг соединения**
+
+[Скачать последнюю версию](https://github.com/exfador/playerok-api/releases/latest) · [Релиз 2.0.5](https://github.com/exfador/playerok-api/releases/tag/2.0.5) · [Сообщить об ошибке](https://github.com/exfador/playerok-api/issues)
 
 </div>
 
 ---
 
-## Зачем это нужно
+## О проекте
 
-Продавцы на Playerok теряют сделки из-за медленных ответов. Сидеть за компьютером часами, обновлять страницу вручную, не пропустить ни одно сообщение покупателя — это физически невозможно без инструментов.
+**CXH Playerok** — неофициальный Python-клиент и Telegram-панель для автоматизации магазина на Playerok.
 
-**CXH Playerok** переносит весь процесс работы с магазином в Telegram: уведомления о новых чатах и сделках, ответы покупателям в один клик, полная автоматизация рутины. Работает в фоне пока вы занимаетесь чем угодно другим.
+Бот работает в фоне, получает события через GraphQL WebSocket и переносит основные операции продавца в Telegram: новые сообщения, сделки, отзывы, жалобы, управление объявлениями и автоматическую выдачу товара.
 
+```text
+Покупатель пишет → бот присылает уведомление → продавец отвечает из Telegram
+                           ↓
+             автоматизация обрабатывает сделку
 ```
-Покупатель написал → уведомление в Telegram за секунды → ответили из чата → сделка закрыта.
-Всё это без браузера и без компьютера.
-```
 
----
-
-## Для кого
-
-- Продавцы с большим каталогом, которым нужно поднимать лоты регулярно и не забывать об этом
-- Те, кто продаёт цифровые товары и хочет выдавать ключи/файлы автоматически при оплате
-- Магазины с потоком сделок, где каждая минута задержки с ответом — это риск потери покупателя
-- Разработчики, которые хотят строить собственную автоматизацию поверх Playerok API
-
----
+> [!IMPORTANT]
+> Статус «онлайн» поддерживается, пока процесс бота запущен, интернет доступен, а cookies или токен Playerok остаются действительными.
 
 ## Возможности
 
-### Уведомления и общение
+<table>
+<tr>
+<td width="50%" valign="top">
 
-- Мгновенные уведомления о **новых сообщениях, сделках, отзывах**, жалобах и системных событиях — всё в один Telegram-чат
-- **Ответ покупателю** прямо из уведомления — текстом или фото, без перехода в браузер
-- **Шаблоны ответов** с переменными (`{{buyer}}`, `{{seller}}` и другие) — готовые тексты для типовых ситуаций
-- Просмотр истории переписки и ссылка на чат на сайте — из того же уведомления
-- Тонкая настройка: выбираете, какие типы уведомлений получать, а какие отключить
+### 💬 Чаты и уведомления
 
-### Автоматизация лотов и сделок
+- новые сообщения и чаты;
+- ответы текстом и фотографиями;
+- уведомления о сделках, отзывах и жалобах;
+- история переписки;
+- шаблоны ответов с переменными;
+- пользовательские команды-триггеры.
 
-- **Автоподнятие** — поднимает весь каталог или только лоты по ключевым фразам по расписанию. Вы не теряете позиции в поиске, пока занимаетесь другим
-- **Автовыдача** — при оплате автоматически отправляет покупателю текст или файл (ключи, инструкции, ссылки). Привязка к ключевым фразам в названии лота
-- **Автоподтверждение сделок** — закрывает сделки по правилам без участия человека
-- **Автовосстановление** — возвращает проданные и истёкшие лоты на витрину
-- **Собственные команды** — настраиваемые триггеры: покупатель пишет слово — бот отвечает заготовленным текстом
-- **Ватермарк** — автоматически добавляет подпись ко всем исходящим сообщениям
+</td>
+<td width="50%" valign="top">
 
-### Управление и безопасность
+### ⚙️ Автоматизация
 
-- **Профиль** прямо в боте: баланс, активные лоты, количество сделок
-- **Статистика сессии**: сделки, возвраты, заработок — сброс в любой момент
-- **Пароль доступа** (SHA-256) — никто не управляет вашим магазином кроме вас
-- Раздельные **прокси** для Playerok и Telegram API (в том числе SOCKS5)
-- **Логи** с ограничением размера; просмотр и скачивание прямо из бота командой `/logs`
+- автовыдача цифрового товара;
+- автоподтверждение сделок;
+- восстановление проданных и истёкших лотов;
+- поднятие объявлений по расписанию;
+- фильтры по ключевым словам;
+- настраиваемый watermark.
 
-### Расширения
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
 
-Система плагинов, которая позволяет добавлять собственную логику без правки ядра. Расширение — это Python-модуль в папке `ext/` с хуками системных и рыночных событий и опциональным Telegram-роутером.
+### 🟢 Работа 24/7
 
-Расширения включаются, выключаются и **перезагружаются без перезапуска бота** — прямо из меню «Расширения».
+- WebSocket `ping/pong` и heartbeat;
+- контроль ACK и зависших соединений;
+- автоматический reconnect с backoff;
+- восстановление подписок;
+- supervisor Playerok Feed;
+- восстановление Telegram polling.
 
----
+</td>
+<td width="50%" valign="top">
+
+### 🔐 Безопасность
+
+- salted PBKDF2 для пароля панели;
+- фильтрация доменов cookies;
+- поддержка HTTPS и SOCKS-прокси;
+- скрытие секретов в health-ответах;
+- приватные разрешения конфигурации;
+- резервные копии повреждённых JSON.
+
+</td>
+</tr>
+</table>
 
 ## Быстрый старт
 
-### 1. Ubuntu/Debian — одна команда
+### Требования
 
-Скрипт сам поставит Python 3.11, скачает последний релиз с GitHub и установит зависимости:
+- Python **3.10+**;
+- токен Telegram-бота от [@BotFather](https://t.me/BotFather);
+- cookies или токен активной сессии Playerok;
+- прокси или VPN, если сервисы недоступны напрямую.
+
+### Linux, macOS и Windows
 
 ```bash
-wget https://raw.githubusercontent.com/exfador/playerok-api/main/install_playerok_api.sh -O install_playerok_api.sh
+git clone https://github.com/exfador/playerok-api.git
+cd playerok-api
+
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install --upgrade pip
+python3 -m pip install -r requirements.txt
+
+python3 main.py
+```
+
+Активация виртуального окружения в Windows:
+
+```powershell
+.venv\Scripts\activate
+python -m pip install -r requirements.txt
+python main.py
+```
+
+Также в Windows можно использовать `start.bat` после установки зависимостей.
+
+### Ubuntu/Debian одной командой
+
+```bash
+wget https://raw.githubusercontent.com/exfador/playerok-api/main/install_playerok_api.sh
 chmod +x install_playerok_api.sh
 sudo bash install_playerok_api.sh
 ```
 
-По умолчанию проект ставится в `/root/playerok-api`. Своя директория:
+По умолчанию проект устанавливается в `/root/playerok-api`. Чтобы выбрать другой каталог:
 
 ```bash
 sudo INSTALL_DIR=/opt/playerok-api bash install_playerok_api.sh
 ```
 
-Запуск в фоне:
+> [!WARNING]
+> Установочный скрипт заменяет содержимое каталога `INSTALL_DIR`. Не указывайте домашнюю папку, корень системы или каталог с важными файлами.
+
+## Первый запуск
+
+Интерактивный мастер попросит указать:
+
+1. токен Telegram-бота;
+2. пароль администратора;
+3. cookies или токен Playerok;
+4. User-Agent браузера;
+5. прокси — при необходимости.
+
+После запуска откройте своего Telegram-бота, отправьте `/start` и пройдите авторизацию администратора.
+
+Основная конфигурация создаётся в `conf/config.json` и автоматически дополняется новыми параметрами после обновлений.
+
+> [!CAUTION]
+> Не публикуйте `conf/config.json`, cookies, токены, пароли, содержимое `db/` и рабочие логи.
+
+## Команды Telegram
+
+| Команда | Назначение |
+|---|---|
+| `/start` | Открыть главное меню и пройти авторизацию |
+| `/status` | Проверить Playerok, WebSocket, Telegram API и фоновые процессы |
+| `/online` | Короткий алиас команды `/status` |
+| `/logs` | Скачать журнал работы за выбранную дату |
+| `/restart` | Корректно перезапустить приложение |
+
+### Что показывает `/status`
+
+- аптайм приложения;
+- подключение к Playerok;
+- время последнего WebSocket-ответа;
+- количество reconnect;
+- активные подписки;
+- состояние Telegram polling и API;
+- состояние supervisor и фоновых workers;
+- последнюю ошибку без cookies, токенов и паролей.
+
+## Конфигурация
+
+| Раздел | Назначение |
+|---|---|
+| `account` | Авторизация Playerok, User-Agent, timeout и прокси |
+| `bot` | Токен Telegram, прокси, пароль и список администраторов |
+| `features` | Watermark, команды, приветствия и автовыдача |
+| `auto.restore` | Восстановление проданных и истёкших лотов |
+| `auto.confirm` | Автоматическое подтверждение сделок |
+| `auto.bump` | Поднятие объявлений по расписанию |
+| `alerts` | Фильтры Telegram-уведомлений |
+| `updater` | Проверка и установка обновлений |
+| `broadcast` | Системные объявления проекта |
+| `logs` | Ограничение размера журналов |
+| `debug` | Подробное логирование запросов и событий |
+
+Дополнительные данные находятся в отдельных файлах:
+
+| Файл | Содержимое |
+|---|---|
+| `conf/messages.json` | Шаблоны сообщений |
+| `conf/custom_commands.json` | Пользовательские команды |
+| `conf/auto_deliveries.json` | Правила автовыдачи |
+| `conf/auto_restore_items.json` | Фильтры восстановления |
+| `conf/auto_complete_deals.json` | Правила подтверждения сделок |
+| `conf/auto_bump_items.json` | Фильтры поднятия объявлений |
+
+## Использование Playerok API
+
+Минимальный пример авторизации и получения чатов:
+
+```python
+from pok.conn import Conn
+
+account = Conn(
+    cookies="token=YOUR_PLAYEROK_TOKEN",
+    user_agent="YOUR_BROWSER_USER_AGENT",
+).get()
+
+print(account.username)
+
+chat_list = account.load_chats(count=20)
+for chat in chat_list.chats:
+    print(chat.id)
+```
+
+Доступные группы методов:
+
+- профиль и пользователи;
+- игры и категории;
+- объявления и приоритеты;
+- чаты, сообщения и загрузка изображений;
+- сделки и изменение их статуса;
+- транзакции и платёжные провайдеры.
+
+> [!NOTE]
+> API Playerok не является публично документированным и может изменяться без предупреждения. Перед массовыми или платными операциями проверяйте поведение на тестовом объявлении.
+
+## Запуск 24/7
+
+Для сервера удобно использовать `systemd` или `screen`.
+
+Пример запуска через `screen`:
 
 ```bash
 screen -S playerok
 cd /root/playerok-api
-python3.11 -m pip install "setuptools==68.2.2"
 python3.11 main.py
 ```
 
-Отсоединиться: `Ctrl+A` → `D`. Вернуться: `screen -r playerok`.
+- Отсоединиться: `Ctrl+A`, затем `D`.
+- Вернуться: `screen -r playerok`.
+- Проверить состояние: отправить `/status` в Telegram.
 
-### 2. Вручную (любая ОС)
+Для production-сервера рекомендуется создать отдельного системного пользователя, использовать виртуальное окружение и настроить автоматический перезапуск процесса.
+
+## Архитектура
+
+```text
+playerok-api/
+├── pok/       Playerok HTTP, GraphQL, модели и WebSocket Feed
+├── bot/       движок сделок, чатов и автоматизации
+├── ctrl/      Telegram-панель, команды, FSM и интерфейс
+├── lib/       конфигурация, БД, updater, event bus и утилиты
+├── tests/     regression- и hardening-тесты
+├── conf/      локальная конфигурация
+├── db/        рабочее состояние приложения
+└── main.py    точка входа
+```
+
+## Тестирование
 
 ```bash
-git clone https://github.com/exfador/playerok-api
-cd playerok-api
-pip install -r requirements.txt
-python main.py
+python3 -m unittest -q
+python3 -m ruff check .
+python3 -m compileall -q .
 ```
 
-### 3. Windows
+Текущее состояние версии 2.0.5:
 
-Установите Python 3.11+, зависимости — `pip install -r requirements.txt`, запустите `start.bat` или `python main.py`.
+| Проверка | Результат |
+|---|:---:|
+| Автоматические тесты | **56/56** ✅ |
+| Ruff | **Passed** ✅ |
+| `compileall` | **Passed** ✅ |
+| WebSocket ACK | **Passed** ✅ |
+| Reconnect и восстановление подписок | **Passed** ✅ |
+| Graceful shutdown | **Passed** ✅ |
 
-### Первый запуск
+## Обновление
 
-Консоль задаст несколько вопросов: токен Telegram-бота, пароль панели, JWT Playerok, User-Agent браузера, прокси (если нужны). После этого — `/start` в боте, вводите пароль — и вы в главном меню.
+Последний релиз доступен на странице [Releases](https://github.com/exfador/playerok-api/releases/latest).
 
-> Не знаете, где взять JWT токен Playerok? Загляните в [чат проекта](https://t.me/coxerhub_ch) — там есть инструкция.
+При ручном обновлении обязательно сохраните приватные данные вне публичного архива:
 
----
-
-## Конфигурация
-
-Основной файл: `conf/config.json`. Создаётся автоматически при первом запуске; при обновлении недостающие ключи дополняются из значений по умолчанию.
-
-| Поле | Описание |
-|---|---|
-| `bot.token` | Токен от [@BotFather](https://t.me/BotFather) |
-| `bot.password_hash` | SHA-256 пароля (задаётся при первом запуске) |
-| `bot.proxy` | Прокси для Telegram API |
-| `bot.admins` | Список Telegram user id с доступом |
-| `account.token` | JWT-сессия Playerok (`cookie: token`) |
-| `account.user_agent` | User-Agent браузера |
-| `account.proxy` | Прокси для запросов к Playerok |
-| `account.timeout` | Таймаут HTTP-запросов, сек. |
-| `features` | Ватермарк, команды, автовыдача, приветствие и прочее |
-| `auto` | Автовосстановление, автоподтверждение, автоподнятие |
-| `alerts` | Фильтры уведомлений |
-| `logs.max_mb` | Максимальный размер файла логов |
-| `debug.verbose` | Подробный лог |
-
-Дополнительные файлы в `conf/`:
-
-| Файл | Назначение |
-|---|---|
-| `messages.json` | Шаблоны сообщений |
-| `custom_commands.json` | Пользовательские команды |
-| `auto_deliveries.json` | Правила автовыдачи |
-| `auto_restore_items.json` | Правила автовосстановления |
-| `auto_complete_deals.json` | Правила автоподтверждения |
-| `auto_bump_items.json` | Фразы для режима «не весь каталог» при поднятии |
-
----
-
-## Структура репозитория
-
-```
-playerok-api/
-├── pok/          # Клиент Playerok: HTTP, GraphQL, лента событий (WebSocket + polling)
-├── bot/          # Движок рантайма: сделки, чаты, вся автоматизация
-├── ctrl/         # Telegram-бот: хендлеры, меню, настройки
-├── lib/          # Конфиг, БД (JSON), шина событий, утилиты, загрузчик расширений
-├── ext/          # Подключаемые расширения (Python-пакет)
-├── conf/         # JSON-конфигурация (создаётся при первом запуске)
-├── db/           # Сохранённое состояние (пользователи, статистика и т.д.)
-└── main.py       # Точка входа
+```text
+conf/config.json
+conf/cookies.json
+db/
+logs/
 ```
 
----
-
-## Разработка расширений
-
-Расширение — папка в `ext/` с файлом `__init__.py`. Минимальная структура:
-
-```python
-PREFIX      = 'my_ext'
-VERSION     = '1.0.0'
-NAME        = 'Моё расширение'
-DESCRIPTION = 'Что делает'
-AUTHORS     = '@username'
-LINKS       = 'https://t.me/username'
-
-# Хуки системных событий (BOOT, ALIVE, PANEL_UP, BOT_UP, PLUG_IN, PLUG_OUT)
-EVT_WIRE = {
-    'BOOT': [on_boot],
-}
-
-# Хуки рыночных событий Playerok
-from pok.defs import MarketEvent
-
-MKT_WIRE = {
-    MarketEvent.NEW_DEAL:     [on_new_deal],
-    MarketEvent.NEW_MESSAGE:  [on_new_message],
-    MarketEvent.NEW_REVIEW:   [on_new_review],
-    # и другие...
-}
-
-# Опциональный aiogram-роутер для новых команд/хендлеров в боте
-BOT_PATHS = [my_aiogram_router]
-```
-
-Полный список рыночных событий: `CHAT_INITIALIZED`, `NEW_MESSAGE`, `NEW_DEAL`, `NEW_REVIEW`, `DEAL_CONFIRMED`, `DEAL_CONFIRMED_AUTOMATICALLY`, `DEAL_ROLLED_BACK`, `DEAL_HAS_PROBLEM`, `DEAL_PROBLEM_RESOLVED`, `DEAL_STATUS_CHANGED`, `ITEM_PAID`, `ITEM_SENT`, `REVIEW_REMOVED`, `REVIEW_UPDATED`.
-
-Расширения можно перезагружать «на горячую» без перезапуска бота через меню **Расширения → Перезагрузить**.
-
----
-
-## Стек
-
-| Компонент | |
-|---|---|
-| Python | **3.11+** |
-| Telegram | aiogram ≥ 3.11 |
-| HTTP | `requests`, `httpx`, `curl-cffi`, `wrapper-tls-requests` |
-| WebSocket | `websocket-client` |
-| Прокси | PySocks, `aiohttp-socks` |
-| Прочее | colorama, colorlog, tqdm, beautifulsoup4, lxml |
-
----
+Механизм встроенного обновления использует staging и откат при ошибке, чтобы приложение не запускалось из частично обновлённого каталога.
 
 ## Контакты
 
-| | |
+| Ресурс | Ссылка |
 |---|---|
-| Канал | [@coxerhub_playerok](https://t.me/coxerhub_playerok) |
-| Чат проекта | [@coxerhub_ch](https://t.me/coxerhub_ch) |
+| Telegram-канал | [@coxerhub_playerok](https://t.me/coxerhub_playerok) |
+| Чат сообщества | [@coxerhub_ch](https://t.me/coxerhub_ch) |
 | Авторы | [@exfador](https://t.me/exfador) · [@terop11](https://t.me/terop11) |
-| GitHub | [exfador/playerok-api](https://github.com/exfador/playerok-api) |
-
-Баги, вопросы и предложения — удобнее всего в [чате сообщества](https://t.me/coxerhub_ch).
-
----
+| GitHub Issues | [Сообщить об ошибке](https://github.com/exfador/playerok-api/issues) |
 
 ## Ответственность
 
-Используйте в соответствии с правилами Playerok и Telegram. Вы несёте ответственность за действия с вашим аккаунтом и соблюдение применимого законодательства. **Не публикуйте** токены, пароли и JWT.
+Проект не является официальным продуктом Playerok. Используйте его в соответствии с правилами Playerok и Telegram, а также применимым законодательством.
 
----
+Вы самостоятельно отвечаете за действия с аккаунтом, автоматические операции, сохранность авторизационных данных и возможные ограничения со стороны платформы.
 
 ## Лицензия
 
-MIT — см. файл [LICENSE](LICENSE). Версия приложения: [`lib/consts.py`](lib/consts.py).
+Проект распространяется по лицензии [MIT](LICENSE).
 
-Если проект оказался полезен — поставьте ⭐ на GitHub.
+<div align="center">
+
+---
+
+Если проект оказался полезен — поставьте ⭐ на [GitHub](https://github.com/exfador/playerok-api).
+
+**CXH Playerok — меньше рутины, быстрее ответы, стабильнее магазин.**
+
+</div>
