@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🏪 CXH Playerok
+# 🏪 Playerok API — Python-клиент и Telegram-бот | CXH
 
 ### Управление магазином Playerok из Telegram — сообщения, сделки и автоматизация 24/7
 
