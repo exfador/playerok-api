@@ -1,0 +1,3 @@
+mutation deleteCard($input: DeleteCardInput!) {
+  deleteCard(input: $input)
+}

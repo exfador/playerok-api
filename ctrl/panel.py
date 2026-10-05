@@ -1,6 +1,8 @@
 from __future__ import annotations
 import asyncio
+import html
 import logging
+import re
 import textwrap
 import time
 from threading import Event
@@ -8,6 +10,7 @@ from typing import Any, Awaitable, Callable
 
 from aiogram import BaseMiddleware, Bot, Dispatcher
 from aiogram.dispatcher.event.bases import UNHANDLED
+from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -29,7 +32,7 @@ from . import router as main_router
 from .cmd import router as cmd_router
 from . import ui as templ
 from .cmds import panel_bot_command_list
-import sys
+from .diagnostics import TelegramHandlerDiagnostics
 logger = logging.getLogger('cxh.ctrl')
 
 
@@ -52,16 +55,28 @@ class _TgRawUpdateMiddleware(BaseMiddleware):
             parts: list[str] = []
             if event.message:
                 m = event.message
-                t = (m.text or m.caption or '')[:160]
-                parts.append(f'message chat={m.chat.id} user={m.from_user.id if m.from_user else None} {t!r}')
+                parts.append(f'message chat={m.chat.id} user={m.from_user.id if m.from_user else None} type={m.content_type}')
             if event.callback_query:
                 q = event.callback_query
-                parts.append(f'callback user={q.from_user.id if q.from_user else None} data={q.data!r}')
+                parts.append(f'callback user={q.from_user.id if q.from_user else None}')
             if event.edited_message:
                 parts.append('edited_message')
             line = ' '.join(parts) if parts else f'тип апдейта без message/callback (id={event.update_id})'
             logger.debug('[tg] RAW UPDATE update_id=%s %s', event.update_id, line)
         return await handler(event, data)
+
+
+def _message_allowed(event: Message, uid, data: dict) -> bool:
+    try:
+        admins = cfg.read('config')['bot']['admins']
+    except Exception:
+        admins = []
+    if uid in admins:
+        return True
+    from .states import PduGateGrp
+    if (event.text or '').startswith('/'):
+        return True
+    return data.get('raw_state') == PduGateGrp.pdu_gate_secret.state
 
 
 class _TelegramInboundDebugMiddleware(BaseMiddleware):
@@ -73,21 +88,23 @@ class _TelegramInboundDebugMiddleware(BaseMiddleware):
     ) -> Any:
         if isinstance(event, Message):
             uid = event.from_user.id if event.from_user else None
-            txt = (event.text or event.caption or '')[:220]
             logger.debug(
-                '[tg] входящее сообщение chat_id=%s user_id=%s type=%s text=%r',
+                '[tg] входящее сообщение chat_id=%s user_id=%s type=%s',
                 event.chat.id,
                 uid,
                 getattr(event, 'content_type', '?'),
-                txt or f'({getattr(event, "content_type", "?")}, без текста)',
             )
+            if not _message_allowed(event, uid, data):
+                state = data.get('state')
+                if state is not None:
+                    try:
+                        await state.clear()
+                    except Exception:
+                        pass
+                return UNHANDLED
         elif isinstance(event, CallbackQuery):
             uid = event.from_user.id if event.from_user else None
-            logger.debug(
-                '[tg] callback user_id=%s data=%r',
-                uid,
-                (event.data or '')[:220],
-            )
+            logger.debug('[tg] callback user_id=%s', uid)
             try:
                 admins = cfg.read('config')['bot']['admins']
             except Exception:
@@ -109,17 +126,20 @@ class _TelegramInboundDebugMiddleware(BaseMiddleware):
         if out is UNHANDLED:
             if isinstance(event, Message):
                 logger.warning(
-                    '[tg] ни один handler не обработал сообщение '
-                    '(команда не сматчилась или до неё не дошла очередь). '
-                    'chat_id=%s user_id=%s text=%r',
+                    '[tg] ни один handler не обработал сообщение chat_id=%s user_id=%s type=%s',
                     event.chat.id,
                     event.from_user.id if event.from_user else None,
-                    (event.text or event.caption or '')[:160],
+                    event.content_type,
                 )
             elif isinstance(event, CallbackQuery):
+                if event.data == 'noop':
+                    try:
+                        await event.answer()
+                    except Exception:
+                        pass
+                    return out
                 logger.warning(
-                    '[tg] ни один handler не обработал callback data=%r user_id=%s',
-                    (event.data or '')[:160],
+                    '[tg] ни один handler не обработал callback user_id=%s',
                     event.from_user.id if event.from_user else None,
                 )
         return out
@@ -168,13 +188,19 @@ class Panel:
         mw = _TelegramInboundDebugMiddleware()
         self.dp.message.outer_middleware(mw)
         self.dp.callback_query.outer_middleware(mw)
+        diagnostics = TelegramHandlerDiagnostics(logger)
+        self.dp.message.middleware(diagnostics)
+        self.dp.callback_query.middleware(diagnostics)
         if cmd_router.parent_router is None:
-            for ext in all_extensions():
-                for route in ext.bot_paths:
-                    self.dp.include_router(route)
             main_router.include_router(cmd_router)
-        self.dp.include_router(main_router)
+        if main_router.parent_router is None:
+            self.dp.include_router(main_router)
+        for ext in all_extensions():
+            for route in ext.bot_paths:
+                if route.parent_router is None:
+                    main_router.include_router(route)
         self.loop: asyncio.AbstractEventLoop | None = None
+        self._send_lock: asyncio.Lock | None = None
         self._stop_event = Event()
         self._polling_active = False
         self._started_at: float | None = None
@@ -257,22 +283,23 @@ class Panel:
             signed_users = config['bot']['admins']
             for user_id in signed_users:
                 try:
-                    await self.bot.send_message(chat_id=user_id, text=templ.fac_040(), reply_markup=templ.fac_039(), parse_mode='HTML', link_preview_options=LinkPreviewOptions(is_disabled=True))
+                    await self._deliver(user_id, text=templ.fac_040(), reply_markup=templ.fac_039(), parse_mode='HTML', link_preview_options=LinkPreviewOptions(is_disabled=True))
                 except Exception:
                     pass
         except Exception:
             pass
 
-    async def _health_probe(self) -> None:
+    async def _sleep_unless_stopped(self, seconds: float) -> bool:
+        deadline = time.monotonic() + seconds
         while not self._stop_event.is_set():
-            try:
-                stopped = await asyncio.wait_for(
-                    asyncio.to_thread(self._stop_event.wait), timeout=60,
-                )
-                if stopped:
-                    return
-            except asyncio.TimeoutError:
-                pass
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(1.0, remaining))
+        return True
+
+    async def _health_probe(self) -> None:
+        while not await self._sleep_unless_stopped(60):
             try:
                 await self.bot.get_me()
                 self._last_api_success_at = time.monotonic()
@@ -343,10 +370,28 @@ class Panel:
             health_task.cancel()
             await asyncio.gather(health_task, return_exceptions=True)
 
+    async def _deliver(self, user_id: int, attempts: int = 4, **kwargs) -> Message:
+        if self._send_lock is None:
+            self._send_lock = asyncio.Lock()
+        async with self._send_lock:
+            for attempt in range(1, attempts + 1):
+                try:
+                    return await self.bot.send_message(chat_id=user_id, **kwargs)
+                except TelegramRetryAfter as exc:
+                    if attempt == attempts:
+                        raise
+                    pause = min(float(exc.retry_after or 1), 60.0) + 0.5
+                    logger.warning('[tg] Telegram ограничил частоту отправки — жду %.0f с (попытка %s/%s)', pause, attempt, attempts)
+                    await asyncio.sleep(pause)
+
     async def call_seller(self, calling_name: str, chat_id: int | str):
         config = cfg.read('config')
+        text = templ.fac_014(calling_name, f'https://playerok.com/chats/{chat_id}')
         for user_id in config['bot']['admins']:
-            await self.bot.send_message(chat_id=user_id, text=templ.fac_014(calling_name, f'https://playerok.com/chats/{chat_id}'), reply_markup=templ.fac_016(), parse_mode='HTML')
+            try:
+                await self._deliver(user_id, text=text, reply_markup=templ.fac_016(), parse_mode='HTML')
+            except Exception as exc:
+                logger.warning('[tg] вызов продавца не доставлен user=%s: %s', user_id, exc)
 
     async def notify_update(self, tag: str, html_url: str, download_url: str, body: str = '', current_version: str = '') -> None:
         import html as _html
@@ -369,8 +414,8 @@ class Panel:
         config = cfg.read('config')
         for user_id in config.get('bot', {}).get('admins') or []:
             try:
-                await self.bot.send_message(
-                    chat_id=user_id, text=text, reply_markup=kb, parse_mode='HTML',
+                await self._deliver(
+                    user_id, text=text, reply_markup=kb, parse_mode='HTML',
                     link_preview_options=LinkPreviewOptions(is_disabled=True),
                 )
             except Exception:
@@ -407,8 +452,8 @@ class Panel:
             sent_msg = None
             for as_html in ((True, False) if html else (False,)):
                 try:
-                    sent_msg = await self.bot.send_message(
-                        chat_id=user_id, text=_compose(as_html), reply_markup=kb,
+                    sent_msg = await self._deliver(
+                        user_id, text=_compose(as_html), reply_markup=kb,
                         parse_mode='HTML',
                         link_preview_options=LinkPreviewOptions(is_disabled=True),
                     )
@@ -438,9 +483,15 @@ class Panel:
         ) if link_preview_url else None
         for user_id in config['bot']['admins']:
             try:
-                await self.bot.send_message(
-                    chat_id=user_id, text=text, reply_markup=kb, parse_mode='HTML',
-                    link_preview_options=lp,
-                )
-            except Exception:
-                pass
+                await self._deliver(user_id, text=text, reply_markup=kb, parse_mode='HTML', link_preview_options=lp)
+            except TelegramForbiddenError as exc:
+                logger.warning('[tg] администратор %s заблокировал бота или не начинал с ним диалог: %s', user_id, exc)
+            except TelegramRetryAfter as exc:
+                logger.error('[tg] уведомление потеряно user=%s: Telegram не снял ограничение частоты (%s)', user_id, exc)
+            except Exception as exc:
+                logger.warning('[tg] уведомление не отправлено user=%s: %s — пробую без HTML', user_id, exc)
+                try:
+                    plain = html.unescape(re.sub(r'<[^>]+>', '', text))
+                    await self._deliver(user_id, text=plain[:4096], reply_markup=kb, parse_mode=None)
+                except Exception as fallback_exc:
+                    logger.error('[tg] уведомление потеряно user=%s: %s', user_id, fallback_exc)

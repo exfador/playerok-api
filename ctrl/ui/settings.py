@@ -1,9 +1,15 @@
 import html
 import math
+import re
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from lib.cfg import AppConf as cfg
+from lib.db import spend_today
+from lib.stock import good_tag
 from lib.custom_commands import cc_get_items, cc_find_by_id, cc_item_summary, KNOWN_EVENTS
-from lib.util import proxy_http_latency_country
+from lib.util import plural, proxy_http_latency_country, proxy_masked
+
+PROXY_FORMATS = ('<code>ip:port</code>, <code>user:pass@host:port</code>, <code>http://user:pass@host:port</code> '
+                 'или <code>socks5h://user:pass@host:port</code>')
 from .. import keys as calls
 from ..cb import CX
 
@@ -43,12 +49,12 @@ def fac_009() -> InlineKeyboardButton:
     return InlineKeyboardButton(text='⬅️ Главное меню', callback_data=calls.PduRootNav(to='default').pack())
 
 
-def fac_010(page: int, total: int, pag_cls, back_cb: str) -> list:
+def fac_010(page: int, total: int, pag_cls, back_cb: str, jump_cb: str | None = None) -> list:
     rows = []
     if total > 1:
         rows.append([
             InlineKeyboardButton(text='◀', callback_data=pag_cls(page=page - 1).pack()) if page > 0 else InlineKeyboardButton(text='·', callback_data=CX.noop),
-            InlineKeyboardButton(text=f'{page + 1} / {total}', callback_data=CX.noop),
+            InlineKeyboardButton(text=f'{page + 1} / {total}', callback_data=jump_cb or CX.noop),
             InlineKeyboardButton(text='▶', callback_data=pag_cls(page=page + 1).pack()) if page < total - 1 else InlineKeyboardButton(text='·', callback_data=CX.noop),
         ])
     rows.append([InlineKeyboardButton(text='⬅️ Назад', callback_data=back_cb)])
@@ -66,6 +72,7 @@ _MSG_NAMES: dict[str, str] = {
     'deal_confirmed': 'Сделка завершена',
     'deal_refunded': 'Возврат',
     'new_review': 'Новый отзыв',
+    'out_of_stock': 'Товар закончился',
 }
 
 
@@ -86,7 +93,7 @@ def fac_080() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text='📦 Авто-выдача', callback_data=calls.PduFulfillGrid(page=0).pack()),
-            InlineKeyboardButton(text='✅ Авто-подтверждение', callback_data=calls.PduPrefsScope(to='complete').pack()),
+            InlineKeyboardButton(text='🤝 Авто-подтверждение', callback_data=calls.PduPrefsScope(to='complete').pack()),
         ],
         [
             InlineKeyboardButton(text='🚀 Авто-поднятие', callback_data=calls.PduPrefsScope(to='bump').pack()),
@@ -100,7 +107,10 @@ def fac_080() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text='🌐 Прокси', callback_data=calls.PduPrefsScope(to='proxy').pack()),
             InlineKeyboardButton(text='⚙️ Прочее', callback_data=calls.PduPrefsScope(to='other').pack()),
         ],
-        [InlineKeyboardButton(text='🔑 Авторизация', callback_data=calls.PduPrefsScope(to='auth').pack())],
+        [
+            InlineKeyboardButton(text='🔑 Авторизация', callback_data=calls.PduPrefsScope(to='auth').pack()),
+            InlineKeyboardButton(text='🛡 Доступ', callback_data=CX.acc_open),
+        ],
         [InlineKeyboardButton(text='©️ Ватермарк', callback_data=calls.PduPrefsScope(to='watermark').pack())],
         [InlineKeyboardButton(text='🔃 Обновления', callback_data=calls.PduPrefsScope(to='updates').pack())],
         [fac_009()],
@@ -112,12 +122,18 @@ def fac_upd_text() -> str:
     upd = (config.get('updater') or {})
     auto_update = bool(upd.get('auto_update', False))
     notify = bool(upd.get('notify', True))
+    enabled = bool(upd.get('enabled', False))
     return (
         '🔃 <b>Обновления</b>\n\n'
+        f'<b>🔎 Проверять релизы:</b> {fac_004(enabled)}\n'
+        '<blockquote>Проверяются релизы исходного проекта exfador/playerok-api. Установка заменит файлы этой сборки '
+        '(conf/, db/, logs/, ext/ сохраняются).</blockquote>\n\n'
         f'<b>⬇️ Авто-установка:</b> {fac_004(auto_update)}\n'
         '<blockquote>Бот сам поставит новую версию на старте, если она доступна. Во время работы обновление не запускается.</blockquote>\n\n'
         f'<b>🔔 Оповещать:</b> {fac_004(notify)}\n'
-        '<blockquote>При выходе новой версии вам придёт уведомление сюда в Telegram с кнопкой «Загрузить и применить».</blockquote>'
+        '<blockquote>При выходе новой версии вам придёт уведомление сюда в Telegram с кнопкой «Загрузить и применить».</blockquote>\n\n'
+        f'<b>📣 Рассылка автора:</b> {fac_004(bool((config.get("broadcast") or {}).get("enabled", False)))}\n'
+        '<blockquote>Объявления автора исходного проекта из его GitHub Gist. Приходят сюда в Telegram и могут содержать ссылки.</blockquote>'
     )
 
 
@@ -127,8 +143,10 @@ def fac_upd_kb() -> InlineKeyboardMarkup:
     auto_update = bool(upd.get('auto_update', False))
     notify = bool(upd.get('notify', True))
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f'🔎 Проверять релизы: {fac_004(bool(upd.get("enabled", False)))}', callback_data=CX.upd_en)],
         [InlineKeyboardButton(text=f'⬇️ Авто-установка: {fac_004(auto_update)}', callback_data=CX.upd_auto)],
         [InlineKeyboardButton(text=f'🔔 Оповещать: {fac_004(notify)}', callback_data=CX.upd_notify)],
+        [InlineKeyboardButton(text=f'📣 Рассылка автора: {fac_004(bool((config.get("broadcast") or {}).get("enabled", False)))}', callback_data=CX.bc_en)],
         [InlineKeyboardButton(text='⬅️ Назад', callback_data=calls.PduPrefsScope(to='index').pack())],
     ])
 
@@ -145,6 +163,17 @@ def fac_008(val: str | None) -> str:
     return f'{val[:6]}···'
 
 
+def browser_label(user_agent: str | None) -> str:
+    ua = (user_agent or '').strip()
+    if not ua:
+        return 'не задан'
+    for name, title in (('Edg', 'Edge'), ('YaBrowser', 'Яндекс'), ('OPR', 'Opera'), ('Firefox', 'Firefox'), ('Chrome', 'Chrome')):
+        found = re.search(rf'{name}/(\d+)', ua)
+        if found:
+            return f'{title} {found.group(1)}'
+    return ua[:24] + ('…' if len(ua) > 24 else '')
+
+
 def fac_052() -> str:
     config = cfg.read('config')
     acc = config['account']
@@ -158,6 +187,7 @@ def fac_052() -> str:
         '🔑 <b>Вход на Playerok</b>\n\n'
         f'• {status_cookie} · {status_ddg}\n'
         f'• JWT-токен (внутри Cookie): {token}\n'
+        f'• User-Agent: <code>{html.escape(browser_label(acc.get("user_agent")))}</code>\n'
         f'• Таймаут одного запроса к сайту: <code>{timeout} с</code>\n\n'
         'С обходом DDoS-Guard нужны полные Cookie из браузера '
         '(Cookie-Editor → Export → Header String). Cookie привязаны к IP и User-Agent: '
@@ -173,6 +203,7 @@ def fac_051() -> InlineKeyboardMarkup:
     timeout = acc.get('timeout') or '—'
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f'🔑  {label}', callback_data=CX.pl_tk)],
+        [InlineKeyboardButton(text=f'🎩  User-Agent: {browser_label(acc.get("user_agent"))}', callback_data=CX.pl_ua)],
         [InlineKeyboardButton(text=f'⏱  Таймаут: {timeout} с', callback_data=CX.pl_to)],
         [InlineKeyboardButton(text='⬅️ Назад', callback_data=calls.PduPrefsScope(to='index').pack())],
     ])
@@ -180,13 +211,12 @@ def fac_051() -> InlineKeyboardMarkup:
 
 def fac_102() -> str:
     config = cfg.read('config')
-    pl_proxy = f'<code>{config["account"]["proxy"]}</code>' if config['account']['proxy'] else '<i>без прокси</i>'
-    tg_proxy = f'<code>{config["bot"]["proxy"]}</code>' if config['bot']['proxy'] else '<i>без прокси</i>'
+    pl_proxy = f'<code>{html.escape(proxy_masked(config["account"]["proxy"]))}</code>' if config['account']['proxy'] else '<i>без прокси</i>'
+    tg_proxy = f'<code>{html.escape(proxy_masked(config["bot"]["proxy"]))}</code>' if config['bot']['proxy'] else '<i>без прокси</i>'
     lines = [
         '🌐 <b>Прокси</b>',
         '',
-        'Формат: <code>ip:port</code> или <code>user:pass@ip:port</code>. '
-        'Для Playerok можно указать и SOCKS5: <code>socks5h://user:pass@host:port</code> — без второго раза логина после порта.',
+        f'Формат: {PROXY_FORMATS}.',
         '',
         f'<b>Запросы к Playerok</b>\n{pl_proxy}',
     ]
@@ -210,8 +240,8 @@ def fac_102() -> str:
 
 def fac_101() -> InlineKeyboardMarkup:
     config = cfg.read('config')
-    pl_proxy = config['account']['proxy'] or 'не задан'
-    tg_proxy = config['bot']['proxy'] or 'не задан'
+    pl_proxy = proxy_masked(config['account']['proxy']) or 'не задан'
+    tg_proxy = proxy_masked(config['bot']['proxy']) or 'не задан'
     rows = [
         [InlineKeyboardButton(text=f'🌐  Playerok: {pl_proxy}', callback_data=CX.pl_px)],
         [InlineKeyboardButton(text=f'✈️  Telegram: {tg_proxy}', callback_data=CX.tg_px)],
@@ -244,6 +274,19 @@ def fac_068(placeholder: str) -> str:
     return fac_100(placeholder)
 
 
+def daily_limit_line(config: dict) -> str:
+    limit = (config.get('auto') or {}).get('daily_limit') or 0
+    spent = spend_today()
+    if not limit:
+        return f'• Дневной лимит расходов: <b>нет</b> · сегодня потрачено <code>{spent:g}</code> ₽\n'
+    return f'• Дневной лимит расходов: <code>{limit:g}</code> ₽ · сегодня потрачено <code>{spent:g}</code> ₽\n'
+
+
+def daily_limit_button(config: dict, origin: str = 'bump') -> InlineKeyboardButton:
+    limit = (config.get('auto') or {}).get('daily_limit') or 0
+    return InlineKeyboardButton(text=f'💳 Лимит в день: {f"{limit:g} ₽" if limit else "нет"}', callback_data=CX.day_lim_rs if origin == 'restore' else CX.day_lim)
+
+
 def fac_061() -> str:
     config = cfg.read('config')
     enabled = config['auto']['bump']['enabled']
@@ -256,16 +299,20 @@ def fac_061() -> str:
     interval = config['auto']['bump']['interval'] or '—'
     d = cfg.read('auto_bump_items')
     n_exc = len(d.get('excluded') or [])
-    scope = 'весь каталог' if all_mode else f"по списку ({len(d['included'])} фраз)"
+    scope = 'весь каталог' if all_mode else f"по списку ({len(d['included'])} {plural(len(d['included']), 'фраза', 'фразы', 'фраз')})"
     return (
         '🔼 <b>Авто-поднятие лотов</b>\n\n'
         f'• Работа: {fac_011(enabled)}\n'
         f'• Какие лоты: <b>{scope}</b>\n'
-        f'• Как часто: каждые <code>{interval} с</code>\n\n'
+        f'• Как часто: каждые <code>{interval} с</code>\n'
+        f'• Лимит цены за одно поднятие: <code>{config["auto"]["bump"].get("max_price") or "нет"}</code> ₽\n'
+        f'{daily_limit_line(config)}\n'
         '<b>Как это устроено</b>\n'
-        '• Поднимаются только лоты <b>в продаже</b> (APPROVED), нужен <b>PREMIUM</b>.\n'
+        '• Поднимаются только лоты <b>в продаже</b> (APPROVED), нужен <b>PREMIUM</b>. Каждое поднятие платное.\n'
         '• <b>Весь каталог</b> — все активные PREMIUM, <b>кроме</b> попавших в «Исключения».\n'
         '• <b>По списку</b> — только если название содержит фразу из «В списке» (буквы ё/е не различаются).\n'
+        '• <b>Лимит в день</b> общий для автоподнятия и платного восстановления: когда он исчерпан, '
+        'платные действия переносятся на завтра, а вам приходит уведомление.\n'
         f'• Сейчас исключений: <code>{n_exc}</code>.'
     )
 
@@ -284,6 +331,10 @@ def fac_060() -> InlineKeyboardMarkup:
     scope_btn = 'Охват: весь каталог' if all_mode else 'Охват: по списку'
     rows.append([InlineKeyboardButton(text=f'↔️  {scope_btn}', callback_data=CX.bm_all)])
     rows.append([InlineKeyboardButton(text=f'⏱  Интервал: {interval} с', callback_data=CX.bm_iv)])
+    rows.append([
+        InlineKeyboardButton(text=f'💰 Цена: до {config["auto"]["bump"].get("max_price") or "∞"} ₽', callback_data=CX.bm_lim),
+        daily_limit_button(config),
+    ])
     rows.append([InlineKeyboardButton(text='🔼 Поднять сейчас', callback_data=CX.bm_go)])
     rows.append([
         InlineKeyboardButton(text=f'📋 В списке ({len(d["included"])})', callback_data=CX.nv_bi),
@@ -308,7 +359,7 @@ def fac_059() -> str:
 
 def fac_058(page: int = 0) -> InlineKeyboardMarkup:
     items: list = cfg.read('auto_bump_items').get('included')
-    return fac_005(items, page, calls.PduBoostAllowPage, lambda i: calls.PduBoostAllowDrop(index=i).pack(), CX.in_bm_i_kw, CX.f_bm_i_txt, calls.PduPrefsScope(to='bump').pack())
+    return fac_005(items, page, calls.PduBoostAllowPage, lambda i, t: calls.PduBoostAllowDrop(index=i, tag=t).pack(), CX.in_bm_i_kw, CX.f_bm_i_txt, calls.PduPrefsScope(to='bump').pack())
 
 
 def fac_057(placeholder: str) -> str:
@@ -333,7 +384,7 @@ def fac_054(page: int = 0) -> InlineKeyboardMarkup:
     items: list = cfg.read('auto_bump_items').get('excluded') or []
     return fac_005(
         items, page, calls.PduBoostDenyPage,
-        lambda i: calls.PduBoostDenyDrop(index=i).pack(),
+        lambda i, t: calls.PduBoostDenyDrop(index=i, tag=t).pack(),
         CX.in_bm_x_kw, CX.f_bm_x_txt,
         calls.PduPrefsScope(to='bump').pack(),
     )
@@ -352,19 +403,23 @@ def fac_113() -> str:
     enabled = config['auto']['confirm']['enabled']
     if not enabled:
         return (
-            '✅ <b>Авто-подтверждение сделок</b>\n\n'
+            '🤝 <b>Авто-подтверждение сделок</b>\n\n'
             'Выключено. После включения бот сможет сам закрывать сделки (отправка товара подтверждена) по вашим правилам.'
         )
     all_mode = config['auto']['confirm']['all']
     d = cfg.read('auto_complete_deals')
-    scope = 'любые сделки' if all_mode else f"по списку ({len(d['included'])} фраз)"
+    scope = 'любые сделки' if all_mode else f"по списку ({len(d['included'])} {plural(len(d['included']), 'фраза', 'фразы', 'фраз')})"
+    only_delivered = config['auto']['confirm'].get('only_delivered', True)
     return (
-        '✅ <b>Авто-подтверждение сделок</b>\n\n'
+        '🤝 <b>Авто-подтверждение сделок</b>\n\n'
         f'• Работа: {fac_011(enabled)}\n'
-        f'• Охват: <b>{scope}</b>\n\n'
+        f'• Охват: <b>{scope}</b>\n'
+        f'• Только после автовыдачи: {fac_011(only_delivered)}\n\n'
         'Бот сам нажимает «товар отправлен» / завершает этап без вашего участия.\n'
         '• <b>Любые сделки</b> — по всем подходящим товарам.\n'
-        '• <b>По списку</b> — только если название товара содержит фразу из списка.'
+        '• <b>По списку</b> — только если название товара содержит фразу из списка.\n'
+        '• <b>Только после автовыдачи</b> — подтверждается лишь сделка, по которой бот сам отправил товар. '
+        'Если выключить, бот отметит «отправлено» даже там, где товар ещё не выдан, — это может привести к спору.'
     )
 
 
@@ -379,6 +434,8 @@ def fac_115() -> InlineKeyboardMarkup:
     d = cfg.read('auto_complete_deals')
     scope_btn = 'Охват: любые сделки' if all_mode else 'Охват: по списку'
     rows.append([InlineKeyboardButton(text=f'↔️  {scope_btn}', callback_data=CX.sh_all)])
+    rows.append([InlineKeyboardButton(text=fac_012('📦 Только после автовыдачи', config['auto']['confirm'].get('only_delivered', True)),
+                                      callback_data=CX.sh_od)])
     rows.append([InlineKeyboardButton(text=f"📋  Список ({len(d['included'])})", callback_data=calls.PduSealAllowPage(page=0).pack())])
     rows.append([InlineKeyboardButton(text='⬅️ Назад', callback_data=calls.PduPrefsScope(to='index').pack())])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -399,7 +456,7 @@ def fac_110() -> str:
 
 def fac_112(page: int = 0) -> InlineKeyboardMarkup:
     items: list = cfg.read('auto_complete_deals').get('included')
-    return fac_005(items, page, calls.PduSealAllowPage, lambda i: calls.PduSealAllowDrop(index=i).pack(), CX.in_sh_kw, CX.f_sh_txt, calls.PduPrefsScope(to='complete').pack())
+    return fac_005(items, page, calls.PduSealAllowPage, lambda i, t: calls.PduSealAllowDrop(index=i, tag=t).pack(), CX.in_sh_kw, CX.f_sh_txt, calls.PduPrefsScope(to='complete').pack())
 
 
 def fac_111(placeholder: str) -> str:
@@ -419,17 +476,26 @@ def fac_108() -> str:
     poll_on = poll.get('enabled', False)
     poll_iv = poll.get('interval') or 300
     premium = config['auto']['restore'].get('premium', False)
+    limit = config['auto']['restore'].get('premium_max_price') or 0
+    keep = config['auto']['restore'].get('keep_in_sale', False)
+    limit_text = f'до {limit} ₽' if limit else 'без лимита'
     return (
         '♻️ <b>Авто-восстановление лотов после продажи / срока</b>\n\n'
         f'• После продажи: {fac_011(sold)}\n'
         f'• После истечения срока: {fac_011(expired)}\n'
         f'• Какие лоты трогать: <b>{scope}</b>\n'
-        f'• Платное восстановление (PREMIUM): {fac_011(premium)}\n'
+        f'• Платное восстановление (PREMIUM): {fac_011(premium)} · {limit_text}\n'
+        f'• «Оставлять в продаже» при PREMIUM: {fac_011(keep)}\n'
+        f'{daily_limit_line(config)}'
         f'• Доп. проверка «завершённых» на сайте: {fac_011(poll_on)} (каждые <code>{poll_iv}</code> с)\n\n'
         '<b>Зачем это</b>\n'
         'Обычно бот сразу выставляет лот снова. Если на сайте задержка или сбой, объявление может остаться в архиве.\n\n'
-        '<b>Платное восстановление</b> — если у лота нет бесплатного тира, бот использует PREMIUM (списывается с баланса). '
-        'Если выключено, такие лоты пропускаются.\n\n'
+        '<b>Платное восстановление</b> — лоты, которые были PREMIUM, снова выставляются как PREMIUM в пределах лимита '
+        '(списывается с баланса). Остальные выставляются бесплатно, а если бесплатного тарифа нет — по самому '
+        'дешёвому платному в пределах лимита. Если выключено, бот выставляет только бесплатно.\n\n'
+        'Лоты, для которых Playerok требует больше отзывов, чем есть у аккаунта, пропускаются.\n\n'
+        '<b>Оставлять в продаже</b> — у PREMIUM-лотов Playerok сам оставит лот активным после покупки, '
+        'и платить за повторное выставление не придётся.\n\n'
         '<b>Проверка завершённых</b> — периодически бот снова запрашивает список проданных/истёкших лотов и при необходимости '
         'восстанавливает их (учитываются только включённые выше типы и охват).'
     )
@@ -449,7 +515,11 @@ def fac_107() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=fac_012('Продажа', sold), callback_data=CX.rs_sd)],
         [InlineKeyboardButton(text=fac_012('Истечение', expired), callback_data=CX.rs_ex)],
         [InlineKeyboardButton(text=f'↔️ Охват: {scope}', callback_data=CX.rs_all)],
-        [InlineKeyboardButton(text=fac_012('💎 Платное (PREMIUM)', premium), callback_data=CX.rs_pm)],
+        [InlineKeyboardButton(text=fac_012('💎 Платное (PREMIUM)', premium), callback_data=CX.rs_pm), daily_limit_button(config, 'restore')],
+        [
+            InlineKeyboardButton(text=f'💰 Лимит: {config["auto"]["restore"].get("premium_max_price") or "нет"} ₽', callback_data=CX.rs_lim),
+            InlineKeyboardButton(text=fac_012('📌 Оставлять', config['auto']['restore'].get('keep_in_sale', False)), callback_data=CX.rs_kis),
+        ],
         [InlineKeyboardButton(text=fac_012('Проверка завершённых', poll_on), callback_data=CX.rs_pol)],
     ]
     if poll_on:
@@ -476,7 +546,7 @@ def fac_106() -> str:
 
 def fac_105(page: int = 0) -> InlineKeyboardMarkup:
     items: list = cfg.read('auto_restore_items').get('included')
-    return fac_005(items, page, calls.PduReviveAllowPage, lambda i: calls.PduReviveAllowDrop(index=i).pack(), CX.in_rs_kw, CX.f_rs_txt, calls.PduPrefsScope(to='restore').pack())
+    return fac_005(items, page, calls.PduReviveAllowPage, lambda i, t: calls.PduReviveAllowDrop(index=i, tag=t).pack(), CX.in_rs_kw, CX.f_rs_txt, calls.PduPrefsScope(to='restore').pack())
 
 
 def fac_104(placeholder: str) -> str:
@@ -635,16 +705,17 @@ def fac_042(keys: list[str]) -> str:
 
 
 _KNOWN_EVENTS: dict[str, str] = {
-    'first_message': 'первое сообщение покупателя',
-    'cmd_error':     'ошибка при выполнении команды',
-    'cmd_commands':  'команда !команды',
-    'cmd_seller':    'команда !вызвать',
+    'first_message': 'первая покупка покупателя, который раньше не писал вам',
+    'cmd_error':     'не используется ботом',
+    'cmd_commands':  'не используется ботом',
+    'cmd_seller':    'команда покупателя с событием «Вызов продавца»',
     'new_deal':      'новая сделка',
-    'deal_pending':  'сделка ожидает отправки',
+    'deal_pending':  'не используется ботом',
     'deal_sent':     'продавец подтвердил сделку',
     'deal_confirmed':'покупатель закрыл сделку',
     'deal_refunded': 'возврат сделки',
     'new_review':    'новый отзыв',
+    'out_of_stock':  'закончился товар автовыдачи',
 }
 
 
@@ -681,7 +752,7 @@ def fac_085(page: int = 0) -> InlineKeyboardMarkup:
         name = fac_013(mess_id, info)
         rows.append([InlineKeyboardButton(text=f'{mark}  {name}', callback_data=calls.PduTplOpen(message_id=mess_id).pack())])
     rows.append([InlineKeyboardButton(text='➕  Добавить шаблон', callback_data=CX.tpl_nid)])
-    rows += fac_010(page, total_pages, calls.PduTplGrid, calls.PduPrefsScope(to='index').pack())
+    rows += fac_010(page, total_pages, calls.PduTplGrid, calls.PduPrefsScope(to='index').pack(), CX.tpl_pg)
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -690,7 +761,7 @@ def fac_084(placeholder: str) -> str:
 
 
 _TMPL_VARS: dict[str, list[str]] = {
-    'first_message': ['$buyer', '$time', '$date', '$seller'],
+    'first_message': ['$buyer', '$product', '$time', '$date', '$seller'],
     'cmd_error':     ['$error', '$time'],
     'cmd_commands':  ['$seller', '$time'],
     'cmd_seller':    ['$buyer', '$time'],
@@ -700,6 +771,7 @@ _TMPL_VARS: dict[str, list[str]] = {
     'deal_confirmed':['$buyer', '$product', '$price', '$deal_id', '$time', '$seller'],
     'deal_refunded': ['$buyer', '$product', '$price', '$deal_id', '$time', '$seller'],
     'new_review':    ['$buyer', '$product', '$price', '$deal_id', '$rating', '$time', '$seller'],
+    'out_of_stock':  ['$buyer', '$product', '$deal_id', '$time', '$seller'],
 }
 
 
@@ -721,23 +793,28 @@ def fac_088(message_id: str) -> str:
         body = '<i>Текста ещё нет — нажмите «Редактировать текст».</i>'
     available = fac_127(message_id)
     vars_block = fac_042(available)
+    trigger = _KNOWN_EVENTS.get(message_id, 'вручную — кнопкой «Шаблоны» в уведомлении о сообщении покупателя')
     return (
         f'💬 <b>{html.escape(name)}</b>\n\n'
-        f'<b>Отправка:</b> {status}\n\n'
+        f'<b>Отправка:</b> {status}\n'
+        f'<b>Когда отправляется:</b> {html.escape(trigger)}\n\n'
         f'<b>Текст для покупателя</b>\n{body}\n\n'
         f'<b>Переменные в этом шаблоне</b>\n{vars_block}'
     )
 
 
 def fac_087(message_id: str, page: int = 0) -> InlineKeyboardMarkup:
+    from lib.cfg import SYSTEM_MESSAGES
     messages = cfg.read('messages')
     enabled = messages[message_id]['enabled']
-    return InlineKeyboardMarkup(inline_keyboard=[
+    rows = [
         [InlineKeyboardButton(text=fac_012('Включён', enabled), callback_data=CX.tpl_en)],
         [InlineKeyboardButton(text='📝  Редактировать текст', callback_data=CX.tpl_tx)],
-        [InlineKeyboardButton(text='🗑  Удалить шаблон', callback_data=CX.tpl_dq)],
-        [InlineKeyboardButton(text='⬅️ К шаблонам', callback_data=calls.PduTplGrid(page=page).pack())],
-    ])
+    ]
+    if message_id not in SYSTEM_MESSAGES:
+        rows.append([InlineKeyboardButton(text='🗑  Удалить шаблон', callback_data=CX.tpl_dq)])
+    rows.append([InlineKeyboardButton(text='⬅️ К шаблонам', callback_data=calls.PduTplGrid(page=page).pack())])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def fac_086(placeholder: str) -> str:
@@ -773,7 +850,7 @@ def fac_066(page: int = 0) -> InlineKeyboardMarkup:
         t = it['trigger'][:22] + '…' if len(it['trigger']) > 22 else it['trigger']
         rows.append([InlineKeyboardButton(text=f'{t}  ·  {summ}', callback_data=calls.PduCmdOpen(cmd_id=it['id']).pack())])
     rows.append([InlineKeyboardButton(text='➕  Добавить команду', callback_data=CX.cc_new)])
-    rows += fac_010(page, total_pages, calls.PduCmdGrid, calls.PduPrefsScope(to='index').pack())
+    rows += fac_010(page, total_pages, calls.PduCmdGrid, calls.PduPrefsScope(to='index').pack(), CX.cc_pg)
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -854,14 +931,15 @@ def fac_078(page: int = 0) -> InlineKeyboardMarkup:
     per_page = 7
     total_pages = max(1, math.ceil(len(auto_deliveries) / per_page))
     page = max(0, min(page, total_pages - 1))
-    for deliv in auto_deliveries[page * per_page:(page + 1) * per_page]:
+    start = page * per_page
+    for index, deliv in enumerate(auto_deliveries[start:start + per_page], start):
         piece = deliv.get('piece')
         kp = ', '.join(deliv.get('keyphrases', [])) or 'нет фраз'
         kp_short = kp[:28] + '…' if len(kp) > 28 else kp
         count = f"{len(deliv.get('goods', []))} шт." if piece else 'текст'
-        rows.append([InlineKeyboardButton(text=f'{kp_short}  →  {count}', callback_data=calls.PduFulfillOpen(index=auto_deliveries.index(deliv)).pack())])
+        rows.append([InlineKeyboardButton(text=f'{kp_short}  →  {count}', callback_data=calls.PduFulfillOpen(index=index).pack())])
     rows.append([InlineKeyboardButton(text='➕  Добавить выдачу', callback_data=CX.ad_kw_n)])
-    rows += fac_010(page, total_pages, calls.PduFulfillGrid, calls.PduPrefsScope(to='index').pack())
+    rows += fac_010(page, total_pages, calls.PduFulfillGrid, calls.PduPrefsScope(to='index').pack(), CX.ad_pg)
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -873,9 +951,12 @@ def fac_093(placeholder: str) -> str:
     return f'➕ <b>Новая автовыдача</b>\n\n{placeholder}'
 
 
+DELIVERY_VARIABLES = 'Можно вставить: <code>$buyer</code>, <code>$product</code>, <code>$price</code>, <code>$deal_id</code>, <code>$seller</code>.'
+
+
 def fac_095(last_page: int = 0) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text='📁  Пакет файлов', callback_data=calls.PduFulfillModePick(val=True).pack())],
+        [InlineKeyboardButton(text='🔑  Поштучно (ключи)', callback_data=calls.PduFulfillModePick(val=True).pack())],
         [InlineKeyboardButton(text='💬  Один текст', callback_data=calls.PduFulfillModePick(val=False).pack())],
         [InlineKeyboardButton(text='⬅️ Назад', callback_data=calls.PduFulfillGrid(page=last_page).pack())],
     ])
@@ -888,7 +969,7 @@ def fac_077(index: int) -> str:
     kp_joined = ', '.join(deliv.get('keyphrases', []))
     keyphrases = html.escape(kp_joined) if kp_joined else '<i>фразы не заданы</i>'
     if piece:
-        content = f'<b>Что выдаётся:</b> файлы из списка (<code>{len(deliv.get("goods", []))} шт.</code>)'
+        content = f'<b>Что выдаётся:</b> по одному товару из списка (<code>{len(deliv.get("goods", []))} шт.</code> в наличии)'
     else:
         raw_msg = '\n'.join(deliv.get('message', []))
         if raw_msg:
@@ -897,7 +978,7 @@ def fac_077(index: int) -> str:
             content = '<b>Текст покупателю</b>\n<i>Пока пусто — задайте в кнопке «Текст».</i>'
     return (
         f'📦 <b>Правило автовыдачи</b>\n\n'
-        f'<b>Тип:</b> {"несколько файлов (пакет)" if piece else "одно текстовое сообщение"}\n'
+        f'<b>Тип:</b> {"поштучно — каждому покупателю свой товар" if piece else "одно текстовое сообщение"}\n'
         f'<b>Фразы в названии товара:</b> <code>{keyphrases}</code>\n\n'
         f'{content}'
     )
@@ -912,12 +993,12 @@ def fac_076(index: int, page: int = 0) -> InlineKeyboardMarkup:
     message = '\n'.join(deliv.get('message', [])) or ''
     msg_btn = message[:22] + '…' if len(message) > 22 else message
     content_btn = (
-        InlineKeyboardButton(text=f'📁  Файлы ({n_goods})', callback_data=calls.PduFulfillFilesPage(page=0).pack())
+        InlineKeyboardButton(text=f'🔑  Товары ({n_goods})', callback_data=calls.PduFulfillFilesPage(page=0).pack())
         if piece else
         InlineKeyboardButton(text=f'💬  Текст: {msg_btn}', callback_data=CX.ad_msg)
     )
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f'Тип: {"пакет" if piece else "текст"}', callback_data=CX.ad_pc)],
+        [InlineKeyboardButton(text=f'Тип: {"поштучно" if piece else "текст"}', callback_data=CX.ad_pc)],
         [InlineKeyboardButton(text=f'🔑  Фразы: {kp[:32]}', callback_data=CX.ad_kw_e)],
         [content_btn],
         [InlineKeyboardButton(text='🗑  Удалить выдачу', callback_data=CX.ad_dok)],
@@ -932,8 +1013,9 @@ def fac_075(placeholder: str) -> str:
 def fac_074(index: int = 0) -> str:
     goods = cfg.read('auto_deliveries')[index].get('goods', [])
     return (
-        f'📁 <b>Файлы для выдачи</b>\n\n'
-        f'Каждая строка — отдельный товар (ключ, ссылка и т.д.). Всего: <code>{len(goods)}</code>.'
+        f'🔑 <b>Товары для выдачи</b>\n\n'
+        f'Каждая строка — отдельный товар (ключ, ссылка и т.д.). Покупатель получает один, и он удаляется из списка. '
+        f'В наличии: <code>{len(goods)}</code>.'
     )
 
 
@@ -943,10 +1025,11 @@ def fac_073(index: int = 0, page: int = 0) -> InlineKeyboardMarkup:
     per_page = 7
     total_pages = max(1, math.ceil(len(goods) / per_page))
     page = max(0, min(page, total_pages - 1))
-    for good in goods[page * per_page:(page + 1) * per_page]:
+    start = page * per_page
+    for offset, good in enumerate(goods[start:start + per_page]):
         rows.append([
-            InlineKeyboardButton(text=str(good), callback_data=CX.noop),
-            InlineKeyboardButton(text='✕', callback_data=calls.PduFulfillFileDrop(index=goods.index(good)).pack()),
+            InlineKeyboardButton(text=str(good)[:60], callback_data=CX.noop),
+            InlineKeyboardButton(text='✕', callback_data=calls.PduFulfillFileDrop(index=start + offset, tag=good_tag(good)).pack()),
         ])
     if total_pages > 1:
         rows.append([
@@ -954,17 +1037,17 @@ def fac_073(index: int = 0, page: int = 0) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text=f'{page + 1} / {total_pages}', callback_data=CX.ad_g_pg),
             InlineKeyboardButton(text='▶', callback_data=calls.PduFulfillFilesPage(page=page + 1).pack()) if page < total_pages - 1 else InlineKeyboardButton(text='·', callback_data=CX.noop),
         ])
-    rows.append([InlineKeyboardButton(text='➕  Добавить файл', callback_data=CX.ad_g_add)])
+    rows.append([InlineKeyboardButton(text='➕  Добавить товары', callback_data=CX.ad_g_add)])
     rows.append([InlineKeyboardButton(text='⬅️ Назад', callback_data=calls.PduFulfillOpen(index=index).pack())])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def fac_072(placeholder: str) -> str:
-    return f'📁 <b>Файлы пакета</b>\n\n{placeholder}'
+    return f'🔑 <b>Товары для выдачи</b>\n\n{placeholder}'
 
 
 def fac_094(placeholder: str) -> str:
-    return f'➕ <b>Добавить файл</b>\n\n{placeholder}'
+    return f'➕ <b>Добавить товары</b>\n\n{placeholder}'
 
 
 def fac_005(items: list, page: int, pagination_cls, delete_cb_fn, add_cb: str, bulk_add_cb: str, back_cb: str) -> InlineKeyboardMarkup:
@@ -972,11 +1055,12 @@ def fac_005(items: list, page: int, pagination_cls, delete_cb_fn, add_cb: str, b
     per_page = 7
     total_pages = max(1, math.ceil(len(items) / per_page))
     page = max(0, min(page, total_pages - 1))
-    for kp in items[page * per_page:(page + 1) * per_page]:
+    start = page * per_page
+    for offset, kp in enumerate(items[start:start + per_page]):
         label = ', '.join(kp) if kp else '(пусто)'
         rows.append([
-            InlineKeyboardButton(text=label, callback_data=CX.noop),
-            InlineKeyboardButton(text='✕', callback_data=delete_cb_fn(items.index(kp))),
+            InlineKeyboardButton(text=label[:60], callback_data=CX.noop),
+            InlineKeyboardButton(text='✕', callback_data=delete_cb_fn(start + offset, good_tag(kp))),
         ])
     if total_pages > 1 and pagination_cls is not None:
         rows.append([

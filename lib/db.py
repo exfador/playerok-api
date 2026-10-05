@@ -27,29 +27,31 @@ _EVENTS = _DbFile('latest_events_times', _project_path('db/latest_events_times.j
 _STATS  = _DbFile('stats',               _project_path('db/stats.json'),               {'deals_completed': 0, 'deals_refunded': 0, 'earned_money': 0})
 _UPD    = _DbFile('updater_state',       _project_path('db/updater_state.json'),       {'last_notified_tag': '', 'latest_tag': '', 'latest_html_url': '', 'latest_download_url': '', 'checked_at': ''})
 _BCAST  = _DbFile('broadcast_state',     _project_path('db/broadcast_state.json'),     {'seen': [], 'checked_at': ''})
+_SPEND  = _DbFile('spend_state',         _project_path('db/spend_state.json'),         {'date': '', 'total': 0, 'notified': ''})
+_EXTS   = _DbFile('ext_state',           _project_path('db/ext_state.json'),           {'disabled': []})
 
-_ALL: list[_DbFile] = [_USERS, _ITEMS, _EVENTS, _STATS, _UPD, _BCAST]
+_ALL: list[_DbFile] = [_USERS, _ITEMS, _EVENTS, _STATS, _UPD, _BCAST, _SPEND, _EXTS]
 
 
 def _read(path: str, default: Any) -> Any:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
     try:
         with open(path, encoding='utf-8') as fh:
             content = fh.read()
-        if content.strip():
-            return json.loads(content)
-    except json.JSONDecodeError:
-        backup = path + '.corrupt.bak'
-        suffix = 1
-        while os.path.exists(backup):
-            backup = f'{path}.corrupt.bak.{suffix}'
-            suffix += 1
+    except OSError:
+        return copy.deepcopy(default)
+    if content.strip():
         try:
-            os.replace(path, backup)
-        except OSError:
-            pass
-    except (FileNotFoundError, OSError):
-        pass
+            return json.loads(content)
+        except json.JSONDecodeError:
+            backup = path + '.corrupt.bak'
+            suffix = 1
+            while os.path.exists(backup):
+                backup = f'{path}.corrupt.bak.{suffix}'
+                suffix += 1
+            try:
+                os.replace(path, backup)
+            except OSError:
+                pass
     value = copy.deepcopy(default)
     _write(path, value)
     return value
@@ -62,7 +64,10 @@ def _write(path: str, data: Any) -> None:
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as fh:
             json.dump(data, fh, ensure_ascii=False, indent=4)
-        os.replace(tmp, path)
+            fh.flush()
+            os.fsync(fh.fileno())
+        from lib.cfg import replace_with_retry
+        replace_with_retry(tmp, path)
         try:
             os.chmod(path, 0o600)
         except OSError:
@@ -89,3 +94,14 @@ class AppDb:
         entry = next((d for d in data if d.name == name), None)
         if entry is not None:
             _write(entry.path, new)
+
+
+def spend_today() -> float:
+    from datetime import datetime
+    state = AppDb.get('spend_state') or {}
+    if state.get('date') != datetime.now().strftime('%Y-%m-%d'):
+        return 0.0
+    try:
+        return float(state.get('total') or 0)
+    except (TypeError, ValueError):
+        return 0.0

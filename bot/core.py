@@ -10,7 +10,7 @@ import textwrap
 import shutil
 from collections import deque
 from dataclasses import dataclass as _dc
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from threading import Event as ThreadingEvent, Thread, Lock, current_thread
 from colorama import Fore
 from logging import getLogger
@@ -24,15 +24,35 @@ from bot._tap import DealDisputeRaised, DealDisputeCleared
 from bot._kit import cfg, db, DATA
 from bot._kit import wire, wire_mkt, fire, fire_mkt
 from bot._kit import cc_get_items, cc_find_by_trigger
-from bot._kit import ACCENT_COLOR, VERSION
-from bot._kit import C_PRIMARY, C_SUCCESS, C_WARNING, C_ERROR
-from bot._kit import C_DIM, C_TEXT, C_BRIGHT, C_HIGHLIGHT
-from bot._kit import set_console_title, halt, spawn_async, draw_box, iso_to_display_str
-from bot._kit import _norm_title, _title_matches_groups
+from bot._kit import VERSION
+from bot._kit import C_PRIMARY, C_SUCCESS
+from bot._kit import C_DIM, C_TEXT, C_BRIGHT
+from bot._kit import set_console_title, spawn_async, draw_box, iso_to_display_str
+from bot._kit import _norm_title, _title_matches_groups, best_rule_index
+from pok.conn import PUBLISHABLE_STAGES, BOOSTABLE_STAGES
+from lib.stock import DELIVERY_LOCK
+from pok.transport import MutationOutcomeUnknown
 from bot._forge import message_body_html, first_link_preview_url
-from bot._forge import _build_html, _build_plain, _humanize_msg, SYS_MSG_LABELS
+from bot._forge import _build_html, _build_plain
 
 logger = getLogger('cxh.bot')
+
+
+def _uname(user) -> str:
+    return getattr(user, 'username', None) or '—'
+
+
+def _uid(user) -> str | None:
+    return getattr(user, 'id', None)
+
+
+def _iname(item) -> str:
+    return getattr(item, 'name', None) or '—'
+
+
+def _iprice(item):
+    price = getattr(item, 'price', None)
+    return price if price is not None else '?'
 
 
 def _get_panel():
@@ -113,6 +133,18 @@ def _load_counters() -> Counters:
     )
 
 
+MIN_BUMP_INTERVAL = 600
+
+
+def _seconds(value, default: int, minimum: int, maximum: int | None = None) -> int:
+    try:
+        number = int(float(value))
+    except (TypeError, ValueError, OverflowError):
+        number = default
+    number = max(minimum, number)
+    return min(number, maximum) if maximum is not None else number
+
+
 def _flush_counters(s: Counters) -> None:
     db.set('stats', {
         'deals_completed': s.deals_completed,
@@ -132,6 +164,13 @@ def update_counters(new: Counters) -> None:
     global _counters
     _counters = new
     _flush_counters(new)
+
+
+_SPEND_LOCK = Lock()
+
+
+def _today() -> str:
+    return datetime.now().strftime('%Y-%m-%d')
 
 
 _engine: 'MarketBridge | None' = None
@@ -191,6 +230,9 @@ class MarketBridge:
         self._feed_restarts = 0
         self._feed_last_event_at: float | None = None
         self._problem_resolved_notify_lock = Lock()
+        self._delivery_lock = DELIVERY_LOCK
+        self._seller_calls: dict[str, float] = {}
+        self._restore_skip_until: dict[str, float] = {}
 
     def health(self) -> dict:
         feed_health = self._feed.health() if self._feed is not None else {'connected': False}
@@ -204,6 +246,14 @@ class MarketBridge:
             'feed_last_event_at': self._feed_last_event_at,
             'workers': workers,
         }
+
+    def persist_state(self) -> None:
+        for key in ('initialized_users', 'saved_items', 'latest_events_times'):
+            value = getattr(self, key, None)
+            if value is not None:
+                db.set(key, value)
+        if getattr(self, 'stats', None) is not None:
+            _flush_counters(self.stats)
 
     def stop(self, join_timeout: float = 2.0) -> None:
         self._stop_event.set()
@@ -245,18 +295,74 @@ class MarketBridge:
             obj = self.account.load_chat(self.account.system_chat_id)
         else:
             obj = self.account.find_chat_by_name(username)
-        self._thread_chat_handles[username] = obj
+        if obj is not None:
+            self._thread_chat_handles[username] = obj
         return obj
 
     def _sync_profile(self) -> None:
         self.account = self.bot_account = self.account.get()
 
+    @staticmethod
+    def _config_cookie_jar(account_cfg: dict) -> dict:
+        from pok.cookies import parse_cookies_lenient
+        jar = dict(parse_cookies_lenient(account_cfg.get('cookies') or None))
+        if account_cfg.get('token'):
+            jar['token'] = account_cfg['token']
+        if account_cfg.get('ddg5'):
+            jar['__ddg5_'] = account_cfg['ddg5']
+        return jar
+
+    def _persist_rotated_cookies(self) -> bool:
+        if not hasattr(self.account, '_cookie_header'):
+            return False
+        live = dict(getattr(self.account, 'cookies', {}) or {})
+        if not live.get('token'):
+            return False
+        config = cfg.read('config')
+        account_cfg = config.get('account') or {}
+        stored = self._config_cookie_jar(account_cfg)
+        snapshot = getattr(self, '_cookie_snapshot', None)
+        if snapshot is None:
+            snapshot = self._cookie_snapshot = dict(stored)
+        if stored != snapshot:
+            self._cookie_snapshot = dict(stored)
+            if stored.get('token') and stored != live:
+                self.account.replace_cookies(stored)
+                self._auth_alerted = False
+                logger.info('Cookie Playerok из настроек применены без перезапуска')
+            return False
+        if live == stored:
+            return False
+        account_cfg['cookies'] = '; '.join(f'{k}={v}' for k, v in live.items() if v)
+        account_cfg['token'] = live.get('token', '')
+        account_cfg['ddg5'] = live.get('__ddg5_', '') or account_cfg.get('ddg5', '')
+        config['account'] = account_cfg
+        cfg.write('config', config)
+        self.config = config
+        self._cookie_snapshot = self._config_cookie_jar(account_cfg)
+        logger.info('Playerok обновил Cookie сессии — сохранено в conf/config.json')
+        return True
+
+    def _report_auth_failure(self, exc: Exception) -> None:
+        logger.error('Сессия Playerok недействительна: %s', exc)
+        if getattr(self, '_auth_alerted', False):
+            return
+        self._auth_alerted = True
+        self._push_notify('system', _log_text(
+            title='🔑 Сессия Playerok недействительна',
+            text='Автоматизация не может работать с аккаунтом. Экспортируйте свежие Cookie из браузера и загрузите их: '
+                 '<b>Настройки → Вход на Playerok</b>. Используйте тот же IP и User-Agent, что в браузере.',
+        ), None)
+
     def _verify_access(self) -> None:
-        user = self.account.load_user(self.account.id)
-        if user.is_blocked:
-            logger.critical('Аккаунт %s заблокирован', self.account.username)
-            logger.critical('Обратитесь в поддержку платформы для выяснения причины блокировки')
-            halt()
+        self._sync_profile()
+        if self.account.is_blocked:
+            logger.critical('Аккаунт %s заблокирован на Playerok', self.account.username)
+            self._push_notify('system', _log_text(
+                title='⛔ Аккаунт Playerok заблокирован',
+                text='Автоматизация остановлена. Обратитесь в поддержку Playerok.',
+            ), None)
+            self._stop_event.set()
 
     @staticmethod
     def _ctx(**kwargs) -> dict:
@@ -308,25 +414,33 @@ class MarketBridge:
             return '\n'.join(lines)
 
     def _next_at(self, event: str) -> datetime:
-        if self.latest_events_times.get(event):
-            return (
-                datetime.fromisoformat(self.latest_events_times[event])
-                + timedelta(seconds=self.config['auto']['bump']['interval'])
-            )
-        return datetime.now()
+        stamp = (self.latest_events_times or {}).get(event)
+        if not stamp:
+            return datetime.now()
+        try:
+            last = datetime.fromisoformat(str(stamp))
+        except ValueError:
+            return datetime.now()
+        interval = _seconds(((self.config.get('auto') or {}).get('bump') or {}).get('interval'), 3600, MIN_BUMP_INTERVAL)
+        return last + timedelta(seconds=interval)
 
-    def _push_notify(self, alert_key: str, text: str, kb) -> None:
-        if not self.config.get('alerts', {}).get('enabled'):
-            return
-        if not (self.config.get('alerts', {}).get('on') or {}).get(alert_key, True):
+    def _alert_on(self, alert_key: str) -> bool:
+        alerts = self.config.get('alerts') or {}
+        return bool(alerts.get('enabled')) and bool((alerts.get('on') or {}).get(alert_key, True))
+
+    @staticmethod
+    def _emit(text: str, kb=None, link_preview_url: str | None = None) -> None:
+        panel, loop = _get_panel(), _get_panel_loop()
+        if panel is None or loop is None:
             return
         try:
-            asyncio.run_coroutine_threadsafe(
-                _get_panel().log_event(text=text, kb=kb),
-                _get_panel_loop(),
-            )
-        except Exception:
-            pass
+            asyncio.run_coroutine_threadsafe(panel.log_event(text=text, kb=kb, link_preview_url=link_preview_url), loop)
+        except Exception as exc:
+            logger.debug('Уведомление не поставлено в очередь: %s', exc)
+
+    def _push_notify(self, alert_key: str, text: str, kb, link_preview_url: str | None = None) -> None:
+        if self._alert_on(alert_key):
+            self._emit(text, kb, link_preview_url)
 
     def _notify_reactivated(self, item_name: str | None, item_id: str | None) -> None:
         nm  = html.escape((item_name or '?')[:220])
@@ -347,52 +461,53 @@ class MarketBridge:
         )
 
     def _push(self, chat_id: str, text: str | None = None, photo_file_path: str | None = None,
-               read_chat: bool | None = None, exclude_watermark: bool = False, max_attempts: int = 3) -> ChatMessage | None:
-        if not text and not photo_file_path:
+               read_chat: bool | None = None, exclude_watermark: bool = False) -> ChatMessage | None:
+        if not chat_id or (not text and not photo_file_path):
             return None
-        logger.debug('[_push] chat=%s  text=%r  photo=%s', chat_id, (text or '')[:60], bool(photo_file_path))
-        wm_cfg      = self.config['features']['watermark']
-        wm_enabled  = wm_cfg['enabled']
-        wm_text     = wm_cfg['text']
-        wm_pos      = wm_cfg['position']
-        read_enabled = self.config['features']['read_chat']
-        for _ in range(max_attempts):
-            try:
-                body = text
-                if body and wm_enabled and wm_text and not exclude_watermark:
-                    body = f'{wm_text}\n\n{body}' if wm_pos == 'start' else f'{body}\n\n{wm_text}'
-                use_read = read_enabled if read_chat is None else read_chat
-                mess = self.account.send_message(chat_id=chat_id, text=body, photo_file_path=photo_file_path, read_chat=use_read)
-                if mess:
-                    self._store_msg(chat_id, mess)
-                return mess
-            except Exception as e:
-                snippet = (text or photo_file_path or '').replace('\n', ' ')[:60]
-                logger.error('Ошибка отправки «%s» → чат %s: %s', snippet, chat_id, e)
-                return None
-        return None
+        logger.debug('[_push] chat=%s  text_len=%s  photo=%s', chat_id, len(text or ''), bool(photo_file_path))
+        features = self.config.get('features') or {}
+        wm_cfg = features.get('watermark') or {}
+        body = text
+        if body and wm_cfg.get('enabled') and wm_cfg.get('text') and not exclude_watermark:
+            wm_text = wm_cfg['text']
+            body = f'{wm_text}\n\n{body}' if wm_cfg.get('position') == 'start' else f'{body}\n\n{wm_text}'
+        use_read = bool(features.get('read_chat', True)) if read_chat is None else read_chat
+        try:
+            mess = self.account.send_message(chat_id=chat_id, text=body, photo_file_path=photo_file_path, read_chat=use_read)
+        except Exception as e:
+            logger.error('Ошибка отправки в чат %s: %s', chat_id, e)
+            return None
+        if mess:
+            self._store_msg(chat_id, mess)
+        return mess
+
+    @staticmethod
+    def _enum_name(value):
+        return getattr(value, 'name', value)
 
     def _pack(self, item: ItemProfile) -> dict:
+        attachment = getattr(item, 'attachment', None)
+        user = getattr(item, 'user', None)
         return {
             'id': item.id, 'slug': item.slug,
-            'priority':   item.priority.name if item.priority else None,
-            'status':     item.status.name   if item.status   else None,
+            'priority': self._enum_name(item.priority),
+            'status': self._enum_name(item.status),
             'name': item.name, 'price': item.price, 'raw_price': item.raw_price,
-            'seller_type': item.seller_type.name if item.seller_type else None,
+            'seller_type': self._enum_name(item.seller_type),
             'attachment': {
-                'id': item.attachment.id, 'url': item.attachment.url,
-                'filename': item.attachment.filename, 'mime': item.attachment.mime,
-            },
+                'id': attachment.id, 'url': attachment.url,
+                'filename': attachment.filename, 'mime': attachment.mime,
+            } if attachment else None,
             'user': {
-                'id': item.user.id, 'username': item.user.username,
-                'role': item.user.role.name if item.user.role else None,
-                'avatar_url': item.user.avatar_url,
-                'is_online': item.user.is_online, 'is_blocked': item.user.is_blocked,
-                'rating': item.user.rating, 'reviews_count': item.user.reviews_count,
-                'support_chat_id': item.user.support_chat_id,
-                'system_chat_id': item.user.system_chat_id,
-                'created_at': item.user.created_at,
-            },
+                'id': user.id, 'username': user.username,
+                'role': self._enum_name(user.role),
+                'avatar_url': user.avatar_url,
+                'is_online': user.is_online, 'is_blocked': user.is_blocked,
+                'rating': user.rating, 'reviews_count': user.reviews_count,
+                'support_chat_id': user.support_chat_id,
+                'system_chat_id': user.system_chat_id,
+                'created_at': user.created_at,
+            } if user else None,
             'approval_date': item.approval_date,
             'priority_position': item.priority_position,
             'views_counter': item.views_counter,
@@ -402,53 +517,154 @@ class MarketBridge:
 
     def _unpack(self, item_data: dict) -> ItemProfile:
         data = copy.deepcopy(item_data)
-        ud = data.pop('user')
-        ud['role'] = AccountRole.__members__.get(ud['role']) if ud['role'] else None
-        user = UserProfile(**ud)
-        data['user'] = user
-        ad = data.pop('attachment')
-        data['attachment'] = FileObject(**ad)
-        data['priority']    = BoostLevel.__members__.get(data['priority'])    if data['priority']    else None
-        data['status']      = ListingStage.__members__.get(data['status'])    if data['status']      else None
-        data['seller_type'] = AccountRole.__members__.get(data['seller_type'])if data['seller_type'] else None
-        return ItemProfile(**data)
+        ud = data.pop('user', None)
+        user = None
+        if ud:
+            ud['role'] = AccountRole.__members__.get(ud.get('role')) if ud.get('role') else None
+            user = UserProfile(**ud)
+        ad = data.pop('attachment', None)
+        attachment = FileObject(**ad) if ad else None
+        data['priority'] = BoostLevel.__members__.get(data.get('priority')) if data.get('priority') else None
+        data['status'] = ListingStage.__members__.get(data.get('status')) if data.get('status') else None
+        data['seller_type'] = AccountRole.__members__.get(data.get('seller_type')) if data.get('seller_type') else None
+        return ItemProfile(user=user, attachment=attachment, **data)
 
-    def _listings(self, count: int = -1, game_id: str | None = None,
-                  category_id: str | None = None, statuses: list[ListingStage] | None = None) -> list[ItemProfile]:
-        my_items:  list[ItemProfile] = []
-        svd_items: list[dict]        = []
+    def _listings(self, count: int = -1, statuses: list[ListingStage] | None = None) -> list[ItemProfile]:
+        my_items: list[ItemProfile] = []
+        packed: list[dict] = []
         try:
-            user        = self.account.load_user(self.account.id)
-            next_cursor = None
-            seen_cursors: set[str] = set()
-            while True:
-                itm_list = user.load_listings(count=24, after_cursor=next_cursor, game_id=game_id,
-                                              category_id=category_id, statuses=statuses)
-                for itm in itm_list.items:
-                    svd_items.append(self._pack(itm))
-                    if statuses is None or itm.status in statuses:
-                        my_items.append(itm)
-                        if 0 < count <= len(my_items):
-                            return my_items
-                if not itm_list.page_info.has_next_page:
+            for itm in self.account.iter_my_items(statuses=statuses):
+                if statuses is not None and itm.status not in statuses:
+                    continue
+                my_items.append(itm)
+                try:
+                    packed.append(self._pack(itm))
+                except Exception:
+                    logger.debug('Не удалось сохранить лот %s в кэш', getattr(itm, 'id', '?'))
+                if 0 < count <= len(my_items):
                     break
-                new_cursor = itm_list.page_info.end_cursor
-                if not new_cursor or new_cursor == next_cursor or new_cursor in seen_cursors:
-                    raise RuntimeError('Playerok вернул повторяющийся cursor при загрузке лотов')
-                seen_cursors.add(new_cursor)
-                next_cursor = new_cursor
-                time.sleep(0.5)
-            self.saved_items = svd_items
-        except (RequestApiError, RequestFailedError):
-            for itm_dict in list(self.saved_items):
-                itm = self._unpack(itm_dict)
-                if statuses is None or itm.status in statuses:
-                    my_items.append(itm)
-                    if 0 < count <= len(my_items):
-                        return my_items
+            cache = {d.get('id'): d for d in (self.saved_items or []) if isinstance(d, dict)}
+            cache.update({d['id']: d for d in packed})
+            self.saved_items = list(cache.values())[-500:]
+        except (RequestApiError, RequestFailedError, RequestSendingError, ValueError):
+            cached = []
+            for itm_dict in list(self.saved_items or []):
+                try:
+                    cached.append(self._unpack(itm_dict))
+                except Exception:
+                    continue
+            my_items = [itm for itm in cached if statuses is None or itm.status in statuses]
+            if count > 0:
+                my_items = my_items[:count]
             if not my_items:
                 raise
         return my_items
+
+    @staticmethod
+    def _price_of(item) -> int:
+        try:
+            return int(getattr(item, 'raw_price', None) or getattr(item, 'price', None) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _within_limit(price, limit) -> bool:
+        try:
+            limit = float(limit or 0)
+        except (TypeError, ValueError):
+            limit = 0
+        return limit <= 0 or float(price or 0) <= limit
+
+    def _pick_restore_tier(self, tiers: list, priority: BoostLevel | None = None) -> tuple[ItemPriorityStatus | None, str]:
+        restore_cfg = (self.config.get('auto') or {}).get('restore') or {}
+        usable = [t for t in tiers if t is not None and t.id]
+        free = [t for t in usable if not t.price]
+        paid = sorted((t for t in usable if t.price), key=lambda t: t.price)
+        limit = restore_cfg.get('premium_max_price')
+        if restore_cfg.get('premium') and priority == BoostLevel.PREMIUM:
+            premium = [t for t in paid if t.type == BoostLevel.PREMIUM]
+            if premium and self._within_limit(premium[0].price, limit):
+                return premium[0], 'paid'
+        if free:
+            return free[0], 'free'
+        if not restore_cfg.get('premium'):
+            return None, 'paid_disabled'
+        if not paid:
+            return None, 'no_tiers'
+        if not self._within_limit(paid[0].price, limit):
+            return None, 'over_limit'
+        return paid[0], 'paid'
+
+    def _daily_limit(self) -> float:
+        try:
+            return max(0.0, float((self.config.get('auto') or {}).get('daily_limit') or 0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _reserve_spend(self, amount) -> bool:
+        try:
+            amount = float(amount or 0)
+        except (TypeError, ValueError):
+            amount = 0.0
+        if amount <= 0:
+            return True
+        limit = self._daily_limit()
+        with _SPEND_LOCK:
+            state = db.get('spend_state') or {}
+            if state.get('date') != _today():
+                state = {'date': _today(), 'total': 0, 'notified': ''}
+            total = float(state.get('total') or 0)
+            if limit and total + amount > limit:
+                first_refusal = state.get('notified') != state['date']
+                if first_refusal:
+                    state['notified'] = state['date']
+                    db.set('spend_state', state)
+            else:
+                state['total'] = round(total + amount, 2)
+                db.set('spend_state', state)
+                return True
+        logger.warning('Дневной лимит расходов: потрачено %s ₽ из %s ₽, операция на %s ₽ пропущена', f'{total:g}', f'{limit:g}', f'{amount:g}')
+        if first_refusal:
+            self._push_notify('bump', _log_text(
+                title='💳 Дневной лимит расходов исчерпан',
+                text=f'Сегодня потрачено <b>{total:g} ₽</b> из <b>{limit:g} ₽</b>. '
+                     'Платные автоподнятие и восстановление продолжатся завтра. Лимит меняется в настройках поднятия.',
+            ), None)
+        return False
+
+    def _release_spend(self, amount) -> None:
+        try:
+            amount = float(amount or 0)
+        except (TypeError, ValueError):
+            return
+        if amount <= 0:
+            return
+        with _SPEND_LOCK:
+            state = db.get('spend_state') or {}
+            if state.get('date') != _today():
+                return
+            state['total'] = max(0, round(float(state.get('total') or 0) - amount, 2))
+            db.set('spend_state', state)
+
+    def _confirm_uncertain_listing(self, item_id: str, check) -> MyItem | None:
+        try:
+            refreshed = self.account.load_listing(item_id)
+        except Exception as exc:
+            logger.warning('Не удалось перепроверить лот %s: %s', item_id, exc)
+            return None
+        return refreshed if isinstance(refreshed, MyItem) and check(refreshed) else None
+
+    def _notify_uncertain(self, action: str, item_name: str | None, item_id: str | None) -> None:
+        nm = html.escape((item_name or '?')[:220])
+        iid = html.escape(str(item_id or ''))
+        self._push_notify(
+            'restore',
+            _log_text(
+                title=f'❔ {action}: результат неизвестен',
+                text=f'<b>{nm}</b>\n<code>{iid}</code>\n\nПроверьте лот на Playerok. Повторные платные операции с ним заблокированы до перезапуска или сброса в «Мои лоты».',
+            ),
+            None,
+        )
 
     def _elevate(self, item: ItemProfile | MyItem) -> str:
         item_id = str(item.id)
@@ -466,197 +682,314 @@ class MarketBridge:
         name_short = (item.name or '?')[:100]
         try:
             abi = self.auto_bump_items or {}
-            inc_g = abi.get('included') or []
-            exc_g = abi.get('excluded') or []
-            all_b = self.config['auto']['bump']['all']
-            included = _title_matches_groups(item.name, inc_g)
-            excluded = _title_matches_groups(item.name, exc_g)
-
-            if all_b and excluded:
+            bump_cfg = (self.config.get('auto') or {}).get('bump') or {}
+            all_b = bool(bump_cfg.get('all'))
+            if all_b and _title_matches_groups(item.name, abi.get('excluded') or []):
                 logger.debug('[elevate] пропуск «%s»: в исключениях', name_short)
                 return 'skip_excluded'
-            if not all_b and not included:
+            if not all_b and not _title_matches_groups(item.name, abi.get('included') or []):
                 logger.debug('[elevate] пропуск «%s»: нет совпадения с белым списком', name_short)
                 return 'skip_phrases'
-            my_item: MyItem | None = item if isinstance(item, MyItem) else None
-            if my_item is None:
-                try:
-                    loaded = self.account.load_listing(item.id)
-                except Exception:
-                    logger.debug('[elevate] пропуск «%s»: не удалось загрузить карточку', name_short)
-                    return 'skip_load'
-                if not isinstance(loaded, MyItem):
-                    logger.debug('[elevate] пропуск «%s»: карточка не MyItem', name_short)
-                    return 'skip_load'
-                my_item = loaded
-            time.sleep(1)
-            statuses = self.bot_account.load_boost_tiers(my_item.id, my_item.raw_price)
+            current = self.account.load_listing(item.id)
+            if not isinstance(current, MyItem):
+                return 'skip_load'
+            if current.status != ListingStage.APPROVED or current.priority != BoostLevel.PREMIUM:
+                return 'skip_priority'
+            tiers = self.account.load_boost_tiers(current.id, self._price_of(current))
+            premium = sorted((t for t in tiers if t and t.type == BoostLevel.PREMIUM), key=lambda t: t.price or 0)
+            if not premium:
+                logger.warning('[elevate] «%s»: Playerok не предложил PREMIUM', name_short)
+                return 'error'
+            tier = premium[0]
+            if not self._within_limit(tier.price, bump_cfg.get('max_price')):
+                logger.info('[elevate] «%s»: PREMIUM %s₽ дороже лимита %s₽', name_short, tier.price, bump_cfg.get('max_price'))
+                return 'skip_price'
+            if not self._reserve_spend(tier.price):
+                return 'skip_budget'
+            previous_position = current.priority_position
+            previous_sequence = current.sequence
             try:
-                prem_status = next(s for s in statuses if s.type == BoostLevel.PREMIUM or s.price > 0)
-            except StopIteration:
-                raise Exception('PREMIUM статус не найден')
-            time.sleep(1)
-            previous_sequence = my_item.sequence
-            try:
-                self.bot_account.apply_boost(my_item.id, prem_status.id)
+                self.account.apply_boost(current.id, tier.id, keep_in_sale=current.keep_in_sale)
+            except MutationOutcomeUnknown:
+                confirmed = self._confirm_uncertain_listing(
+                    current.id,
+                    lambda r: r.sequence != previous_sequence or r.priority_position != previous_position,
+                )
+                if confirmed is None:
+                    self._notify_uncertain('Поднятие', current.name, current.id)
+                    return 'uncertain'
             except Exception:
-                refreshed = self.account.load_listing(my_item.id)
-                if (
-                    isinstance(refreshed, MyItem)
-                    and refreshed.priority == BoostLevel.PREMIUM
-                    and refreshed.sequence != previous_sequence
-                ):
-                    my_item = refreshed
-                else:
-                    raise
-            short = my_item.name[:32] + ('...' if len(my_item.name) > 32 else '')
-            logger.info('%s«%s»%s поднят  %s%s%s → %s1%s', C_BRIGHT, short, Fore.RESET, C_DIM, my_item.sequence, Fore.RESET, C_SUCCESS, Fore.RESET)
-            self._notify_elevated(my_item.name, my_item.id)
+                self._release_spend(tier.price)
+                raise
+            logger.info('%s«%s»%s поднят за %s₽', C_BRIGHT, (current.name or '?')[:40], Fore.RESET, tier.price)
+            self._notify_elevated(current.name, current.id)
             return 'bumped'
         except Exception as e:
             logger.error('Ошибка при поднятии «%s»: %s', item.name, e)
             return 'error'
 
-    def _elevate_all(self) -> None:
+    def _elevate_all(self) -> dict:
         self.latest_events_times['auto_bump_items'] = datetime.now().isoformat()
         db.set('latest_events_times', self.latest_events_times)
-        counters_map = {'bumped': 0, 'skip_priority': 0, 'skip_phrases': 0, 'skip_excluded': 0, 'skip_load': 0, 'skip_in_progress': 0, 'error': 0}
+        counters_map = {'checked': 0, 'bumped': 0, 'skip_priority': 0, 'skip_phrases': 0, 'skip_excluded': 0, 'skip_load': 0,
+                        'skip_in_progress': 0, 'skip_price': 0, 'skip_budget': 0, 'uncertain': 0, 'error': 0}
         try:
             items = self._listings(statuses=[ListingStage.APPROVED])
+            counters_map['checked'] = len(items)
             if not items:
                 logger.info('[elevate_all] нет лотов со статусом APPROVED.')
             for item in items:
+                if self._stop_event.is_set():
+                    break
                 if item.priority != BoostLevel.PREMIUM:
                     counters_map['skip_priority'] += 1
                     continue
                 result = self._elevate(item)
                 counters_map[result if result in counters_map else 'error'] += 1
+                if result == 'skip_budget':
+                    break
             logger.info(
-                '[elevate_all] поднято: %s · не PREMIUM: %s · нет в списке: %s · исключено: %s · не загружено: %s · уже выполняется: %s · ошибок: %s',
+                '[elevate_all] поднято: %s · не PREMIUM: %s · нет в списке: %s · исключено: %s · дороже лимита: %s · '
+                'дневной лимит: %s · не загружено: %s · уже выполняется: %s · неизвестно: %s · ошибок: %s',
                 counters_map['bumped'], counters_map['skip_priority'], counters_map['skip_phrases'],
-                counters_map['skip_excluded'], counters_map['skip_load'], counters_map['skip_in_progress'], counters_map['error'],
+                counters_map['skip_excluded'], counters_map['skip_price'], counters_map['skip_budget'],
+                counters_map['skip_load'], counters_map['skip_in_progress'], counters_map['uncertain'],
+                counters_map['error'],
             )
         except Exception as e:
             logger.error('Ошибка при автоподнятии: %s', e)
+        return counters_map
 
-    def bump_items(self) -> None:
-        self._elevate_all()
+    def bump_items(self) -> dict:
+        return self._elevate_all()
 
-    def _reactivate(self, item: Item | MyItem | ItemProfile, retry_delays: list[int] | None = None) -> None:
+    def _reactivate(self, item: Item | MyItem | ItemProfile, retry_delays: list[int] | None = None) -> str:
         item_id = str(item.id)
         with self._mutation_guard:
             if item_id in self._reactivating_items:
                 logger.debug('Восстановление «%s» уже выполняется, дубликат пропущен', item_id)
-                return
+                return 'skip_in_progress'
             self._reactivating_items.add(item_id)
         try:
-            self._reactivate_once(item, retry_delays)
+            return self._reactivate_once(item, retry_delays)
         finally:
             with self._mutation_guard:
                 self._reactivating_items.discard(item_id)
 
-    def _reactivate_once(self, item: Item | MyItem | ItemProfile, retry_delays: list[int] | None = None) -> None:
+    def _reactivate_once(self, item: Item | MyItem | ItemProfile, retry_delays: list[int] | None = None) -> str:
+        name = item.name or '?'
+        short = name[:32] + ('...' if len(name) > 32 else '')
+        restore_cfg = (self.config.get('auto') or {}).get('restore') or {}
+        if not restore_cfg.get('all') and not _title_matches_groups(name, (self.auto_restore_items or {}).get('included') or []):
+            return 'skip_phrases'
+        delays = retry_delays if retry_delays is not None else [0, 15, 45]
+        for attempt, delay in enumerate(delays, 1):
+            if delay and self._stop_event.wait(delay):
+                return 'stopped'
+            try:
+                current = self.account.load_listing(item.id)
+            except Exception as e:
+                logger.warning('Восстановление «%s»: не удалось загрузить лот (%s/%s): %s', short, attempt, len(delays), e)
+                continue
+            if not isinstance(current, MyItem):
+                return 'skip_load'
+            if current.status not in PUBLISHABLE_STAGES:
+                return 'already_active' if current.status in BOOSTABLE_STAGES else 'skip_status'
+            if current.lacks_seller_reviews:
+                logger.info('%s«%s»%s пропущен: нужно %s отзывов, у аккаунта %s', C_DIM, short, Fore.RESET,
+                            current.required_seller_reviews, current.seller_reviews)
+                return 'skip_reviews'
+            try:
+                tiers = self.account.load_boost_tiers(current.id, self._price_of(current))
+            except Exception as e:
+                logger.warning('Восстановление «%s»: тарифы не получены (%s/%s): %s', short, attempt, len(delays), e)
+                continue
+            tier, reason = self._pick_restore_tier(tiers, current.priority)
+            if tier is None:
+                messages = {
+                    'paid_disabled': 'нет бесплатного тарифа, платное восстановление выключено',
+                    'over_limit': 'платный тариф дороже лимита',
+                    'no_tiers': 'Playerok не предложил тарифов',
+                }
+                logger.info('%s«%s»%s пропущен: %s', C_DIM, short, Fore.RESET, messages.get(reason, reason))
+                return f'skip_{reason}'
+            if tier.price and not self._reserve_spend(tier.price):
+                free = next((t for t in tiers if t is not None and t.id and not t.price), None)
+                if free is None:
+                    return 'skip_budget'
+                tier, reason = free, 'free'
+            reserved = tier.price or 0
+            keep = None
+            if restore_cfg.get('keep_in_sale') and tier.type == BoostLevel.PREMIUM and current.keep_in_sale_available is not False:
+                keep = True
+            try:
+                new_item = self.account.activate_listing(current.id, tier.id, keep_in_sale=keep)
+            except MutationOutcomeUnknown:
+                confirmed = self._confirm_uncertain_listing(current.id, lambda r: r.status not in PUBLISHABLE_STAGES)
+                if confirmed is None:
+                    self._notify_uncertain('Восстановление', current.name, current.id)
+                    return 'uncertain'
+                new_item = confirmed
+            except RequestApiError as e:
+                self._release_spend(reserved)
+                logger.warning('Playerok отклонил восстановление «%s»: %s', short, e)
+                return 'skip_rejected'
+            except Exception as e:
+                self._release_spend(reserved)
+                logger.error('Ошибка восстановления «%s»: %s', short, e)
+                return 'error'
+            label = 'бесплатно' if reason == 'free' else f'{tier.name or "PREMIUM"} за {tier.price}₽'
+            logger.info('%s«%s»%s восстановлен (%s), статус %s', C_BRIGHT, short, Fore.RESET, label,
+                        getattr(getattr(new_item, 'status', None), 'name', '?'))
+            self._notify_reactivated(current.name, current.id)
+            return 'restored'
+        logger.error('Восстановление «%s» не выполнено после %s попыток', short, len(delays))
+        return 'error'
+
+    def my_items(self, statuses: list[ListingStage] | None = None) -> list[ItemProfile]:
+        return self._listings(statuses=statuses)
+
+    def listing_card(self, item_id: str) -> MyItem:
+        item = self.account.load_listing(item_id)
+        if not isinstance(item, MyItem):
+            raise ValueError('Лот не найден или принадлежит другому продавцу')
+        return item
+
+    def listing_tiers(self, item: MyItem) -> list[ItemPriorityStatus]:
+        tiers = [t for t in self.account.load_boost_tiers(item.id, self._price_of(item)) if t and t.id]
+        return sorted(tiers, key=lambda t: (t.price or 0, t.name or ''))
+
+    def publish_or_boost(self, item_id: str, tier_id: str, keep_in_sale: bool | None = None,
+                         expected: str | None = None) -> tuple[str, MyItem | None]:
+        key = str(item_id)
+        with self._mutation_guard:
+            if key in self._reactivating_items or key in self._elevating_items:
+                raise ValueError('С этим лотом сейчас работает автоматика — повторите через минуту')
+            self._reactivating_items.add(key)
+            self._elevating_items.add(key)
         try:
-            ari = self.auto_restore_items
-            included = any(
-                any(p.lower() in item.name.lower() or item.name.lower() == p.lower() for p in grp)
-                for grp in ari['included']
-            )
-            if not (self.config['auto']['restore']['all'] or included):
+            return self._publish_or_boost_once(item_id, tier_id, keep_in_sale, expected)
+        finally:
+            with self._mutation_guard:
+                self._reactivating_items.discard(key)
+                self._elevating_items.discard(key)
+
+    def _publish_or_boost_once(self, item_id: str, tier_id: str, keep_in_sale: bool | None,
+                               expected: str | None) -> tuple[str, MyItem | None]:
+        item = self.listing_card(item_id)
+        tier = next((t for t in self.listing_tiers(item) if t.id == tier_id), None)
+        if tier is None:
+            raise ValueError('Тариф больше недоступен — откройте лот заново')
+        if tier.type != BoostLevel.PREMIUM:
+            keep_in_sale = None
+        if item.status in PUBLISHABLE_STAGES and item.lacks_seller_reviews:
+            raise ValueError(f'Playerok разрешает выставлять такой лот только при {item.required_seller_reviews}+ отзывах, '
+                             f'у аккаунта {item.seller_reviews}')
+        if item.status in PUBLISHABLE_STAGES:
+            action = 'published'
+            before = item.status
+            check = lambda r: r.status != before
+            call = lambda: self.account.activate_listing(item.id, tier.id, keep_in_sale=keep_in_sale)
+        elif item.status in BOOSTABLE_STAGES:
+            action = 'boosted'
+            before_seq, before_pos = item.sequence, item.priority_position
+            check = lambda r: r.sequence != before_seq or r.priority_position != before_pos or r.priority != item.priority
+            call = lambda: self.account.apply_boost(item.id, tier.id, keep_in_sale=keep_in_sale)
+        else:
+            raise ValueError(f'Со статусом {getattr(item.status, "name", "?")} лот нельзя выставить или поднять')
+        if expected and expected != action:
+            raise ValueError('Статус лота изменился, пока вы подтверждали — операция отменена. Откройте лот заново')
+        try:
+            call()
+        except MutationOutcomeUnknown:
+            confirmed = self._confirm_uncertain_listing(item.id, check)
+            if confirmed is None:
+                return 'uncertain', None
+            return action, confirmed
+        logger.info('Лот «%s»: %s (%s, %s₽)', (item.name or '?')[:40], action, tier.name, tier.price)
+        return action, self.listing_card(item.id)
+
+    def set_keep_in_sale(self, item_id: str, value: bool) -> MyItem:
+        card = self.listing_card(item_id)
+        if value and (card.priority != BoostLevel.PREMIUM or card.status not in BOOSTABLE_STAGES):
+            raise ValueError('Playerok оставляет в продаже только активные лоты с премиум-размещением — сначала выставьте лот с PREMIUM')
+        self.account.set_keep_in_sale(item_id, value)
+        return self.listing_card(item_id)
+
+    def clone_options(self, item_id: str) -> tuple[MyItem, list[dict]]:
+        source = self.listing_card(item_id)
+        category = getattr(source, 'category', None)
+        if category is None or not category.id:
+            return source, []
+        page = self.account.load_obtain_types(category.id)
+        current = getattr(getattr(source, 'obtaining_type', None), 'id', None)
+        reviews = source.seller_reviews
+        category_min = getattr(getattr(category, 'props', None), 'min_reviews_for_seller', None) or 0
+        options = []
+        for kind in sorted((t for t in (page.obtaining_types if page else []) if t and t.id), key=lambda t: t.sequence or 0):
+            required = max(getattr(getattr(kind, 'props', None), 'min_reviews_for_seller', None) or 0, category_min)
+            options.append({'id': kind.id, 'name': kind.name, 'required': required, 'current': kind.id == current,
+                            'locked': reviews is not None and reviews < required})
+        return source, options
+
+    def clone_listing(self, item_id: str, price: int | None = None, obtaining_type_id: str | None = None) -> MyItem | Item:
+        source = self.listing_card(item_id)
+        current = getattr(getattr(source, 'obtaining_type', None), 'id', None)
+        if (obtaining_type_id in (None, current)) and source.lacks_seller_reviews:
+            raise ValueError(f'Для этого способа получения Playerok требует {source.required_seller_reviews}+ отзывов, '
+                             f'у аккаунта {source.seller_reviews}. Выберите другой способ получения')
+        created = self.account.clone_listing(source, price=price, obtaining_type_id=obtaining_type_id)
+        logger.info('Создана копия лота «%s»: %s', (source.name or '?')[:40], getattr(created, 'id', '?'))
+        return created
+
+    def remove_listing(self, item_id: str) -> None:
+        self.listing_card(item_id)
+        self.account.delete_listing(item_id)
+
+    def reset_listing_lock(self, item_id: str) -> None:
+        self.account.forget_uncertain(f'listing:{item_id}')
+
+    def _restore_settings_fingerprint(self) -> str:
+        auto = self.config.get('auto') or {}
+        return repr((auto.get('restore'), auto.get('daily_limit'), (self.auto_restore_items or {}).get('included')))
+
+    def _restore_batch(self, statuses: list[ListingStage]) -> None:
+        now = time.monotonic()
+        fingerprint = self._restore_settings_fingerprint()
+        if fingerprint != getattr(self, '_restore_skip_fingerprint', None):
+            self._restore_skip_until = {}
+            self._restore_skip_fingerprint = fingerprint
+        self._restore_skip_until = {k: v for k, v in self._restore_skip_until.items() if v > now}
+        seen: set[str] = set()
+        for item in self._listings(statuses=statuses):
+            if self._stop_event.is_set():
                 return
-            if not isinstance(item, MyItem):
-                try:
-                    item = self.account.load_listing(item.id)
-                except Exception:
-                    return
-            premium_allowed = bool((self.config.get('auto', {}).get('restore') or {}).get('premium', False))
-            delays = retry_delays if retry_delays is not None else [5, 15, 30]
-            short = item.name[:32] + ('...' if len(item.name) > 32 else '')
-            for attempt, delay in enumerate(delays, 1):
-                time.sleep(delay)
-                try:
-                    logger.debug('Восстановление «%s»: попытка бесплатной публикации', item.name[:32])
-                    time.sleep(1)
-                    new_item = self.account.activate_listing(item.id, None)
-                    if new_item.status in (ListingStage.PENDING_APPROVAL, ListingStage.APPROVED):
-                        logger.info('%s«%s»%s восстановлен (бесплатно)', C_BRIGHT, short, Fore.RESET)
-                        self._notify_reactivated(item.name, item.id)
-                        return
-                    logger.warning('Попытка %d: «%s» — статус %s, повтор...', attempt, short, new_item.status.name)
-                except Exception as free_err:
-                    try:
-                        refreshed = self.account.load_listing(item.id)
-                        if refreshed.status in (ListingStage.PENDING_APPROVAL, ListingStage.APPROVED):
-                            logger.info('%s«%s»%s восстановлен (подтверждено после сетевой ошибки)', C_BRIGHT, short, Fore.RESET)
-                            self._notify_reactivated(item.name, item.id)
-                            return
-                    except Exception:
-                        pass
-                    logger.debug('Восстановление «%s»: бесплатная публикация не сработала (%s), проверяю тиры...', item.name[:32], free_err)
-                    try:
-                        tiers = self.account.load_boost_tiers(item.id, item.raw_price)
-                        if not tiers:
-                            if attempt < len(delays):
-                                logger.warning('Попытка %d: «%s» — тиры не получены, повтор через %d с...', attempt, short, delays[attempt])
-                            else:
-                                logger.error('Ошибка при восстановлении «%s»: не удалось получить тиры', short)
-                            continue
-                        free_tier = next((s for s in tiers if s.type == BoostLevel.DEFAULT or s.price == 0), None)
-                        if free_tier is not None:
-                            tier = free_tier
-                            logger.debug('Восстановление «%s»: бесплатный тир %s (0₽)', item.name[:32], tier.id)
-                        elif premium_allowed:
-                            tier = tiers[0]
-                            logger.info('Восстановление «%s»: платный тир «%s» (%s₽) — PREMIUM разрешён',
-                                        item.name[:32],
-                                        tier.name if hasattr(tier, 'name') else tier.id,
-                                        getattr(tier, 'price', '?'))
-                        else:
-                            logger.info('%s«%s»%s пропущен: нет бесплатного тира, платное восстановление выключено',
-                                        C_DIM, short, Fore.RESET)
-                            return
-                        time.sleep(1)
-                        new_item = self.account.activate_listing(item.id, tier.id)
-                        if new_item.status in (ListingStage.PENDING_APPROVAL, ListingStage.APPROVED):
-                            label = 'бесплатно' if free_tier is not None else 'PREMIUM'
-                            logger.info('%s«%s»%s восстановлен (%s)', C_BRIGHT, short, Fore.RESET, label)
-                            self._notify_reactivated(item.name, item.id)
-                            return
-                        logger.warning('Попытка %d: «%s» — статус %s, повтор...', attempt, short, new_item.status.name)
-                    except Exception as e:
-                        if attempt < len(delays):
-                            logger.warning('Попытка %d: не удалось восстановить «%s» (%s), повтор через %d с...', attempt, short, e, delays[attempt])
-                        else:
-                            logger.error('Ошибка при восстановлении «%s»: %s', short, e)
-        except Exception as e:
-            logger.error('Ошибка при восстановлении «%s»: %s', item.name, e)
+            if item.id in seen or self._restore_skip_until.get(item.id, 0) > now:
+                continue
+            seen.add(item.id)
+            result = self._reactivate(item, retry_delays=[0])
+            if result.startswith('skip_') and result not in ('skip_in_progress', 'skip_phrases'):
+                self._restore_skip_until[item.id] = time.monotonic() + 1800
+            if self._stop_event.wait(0.5):
+                return
 
     def _reactivate_expired(self) -> None:
         try:
-            seen: list[str] = []
-            for item in self._listings(statuses=[ListingStage.EXPIRED]):
-                if item.id in seen:
-                    continue
-                seen.append(item.id)
-                time.sleep(0.5)
-                self._reactivate(item)
+            self._restore_batch([ListingStage.EXPIRED])
         except Exception as e:
             logger.error('Ошибка при восстановлении истёкших товаров: %s', e)
 
     def _reactivate_polled(self) -> None:
+        restore_cfg = (self.config.get('auto') or {}).get('restore') or {}
         statuses: list[ListingStage] = []
-        if self.config['auto']['restore']['sold']:
+        if restore_cfg.get('sold'):
             statuses.append(ListingStage.SOLD)
-        if self.config['auto']['restore']['expired']:
+        if restore_cfg.get('expired'):
             statuses.append(ListingStage.EXPIRED)
         if not statuses:
             return
         try:
-            items = self._listings(statuses=statuses)
-            logger.debug('[reactivate_polled] лотов: %d (статусы: %s)', len(items), [s.name for s in statuses])
-            for item in items:
-                time.sleep(0.4)
-                self._reactivate(item)
+            self._restore_batch(statuses)
         except Exception as e:
             logger.error('Ошибка при проверке завершённых лотов: %s', e)
 
@@ -666,7 +999,11 @@ class MarketBridge:
             chat_user = next(u.username for u in chat_obj.users if u.id != eng.account.id)
         except Exception:
             chat_user = message.user.username
-        text = _build_plain(message) or '[пустое сообщение]'
+        own = getattr(message.user, 'id', None) == getattr(self.account, 'id', None)
+        if own and not (message.event or (message.text or '').strip().startswith('{{')):
+            text = f'[исходящее сообщение · {len(message.text or "")} симв.{" · вложение" if message.file or message.images else ""}]'
+        else:
+            text = _build_plain(message) or '[пустое сообщение]'
         wrap_w = min(max(shutil.get_terminal_size((80, 20)).columns - 8, 40), 100)
         lines  = [f'{C_PRIMARY}Сообщение — {chat_user}{Fore.RESET}', f'  {C_BRIGHT}{message.user.username}:{Fore.RESET}']
         for raw in text.split('\n'):
@@ -679,8 +1016,8 @@ class MarketBridge:
 
     def _trace_order(self, deal: ItemDeal) -> None:
         draw_box('НОВАЯ СДЕЛКА', [
-            ('ID', deal.id), ('Покупатель', deal.user.username),
-            ('Товар', deal.item.name or '—'), ('Сумма', f'{deal.item.price} ₽'),
+            ('ID', deal.id), ('Покупатель', _uname(deal.user)),
+            ('Товар', _iname(deal.item)), ('Сумма', f'{_iprice(deal.item)} ₽'),
         ])
 
     def _trace_review(self, deal: ItemDeal) -> None:
@@ -688,12 +1025,12 @@ class MarketBridge:
         date  = iso_to_display_str(deal.review.created_at, fmt='%d.%m.%Y %H:%M')
         draw_box('НОВЫЙ ОТЗЫВ', [
             ('Сделка', deal.id), ('Оценка', f'{stars} ({deal.review.rating or 5})'),
-            ('Автор', deal.review.creator.username), ('Текст', deal.review.text or '—'), ('Дата', date),
+            ('Автор', _uname(deal.review.creator)), ('Текст', deal.review.text or '—'), ('Дата', date),
         ])
 
     def _trace_review_del(self, deal: ItemDeal) -> None:
         draw_box('ОТЗЫВ УДАЛЁН', [
-            ('Сделка', deal.id), ('Покупатель', deal.user.username), ('Товар', deal.item.name or '—'),
+            ('Сделка', deal.id), ('Покупатель', _uname(deal.user)), ('Товар', _iname(deal.item)),
         ])
 
     def _trace_review_edit(self, deal: ItemDeal, prev: dict) -> None:
@@ -709,14 +1046,14 @@ class MarketBridge:
     def _trace_stage(self, deal: ItemDeal, status_frmtd: str = 'Неизвестно') -> None:
         draw_box('СТАТУС СДЕЛКИ', [
             ('ID', deal.id), ('Новый статус', status_frmtd),
-            ('Покупатель', deal.user.username), ('Товар', deal.item.name or '—'),
-            ('Сумма', f'{deal.item.price} ₽'),
+            ('Покупатель', _uname(deal.user)), ('Товар', _iname(deal.item)),
+            ('Сумма', f'{_iprice(deal.item)} ₽'),
         ])
 
     def _trace_dispute(self, deal: ItemDeal, category: str | None = None, detail: str | None = None) -> None:
         rows = [
-            ('Сделка', deal.id), ('От', deal.user.username),
-            ('Товар', deal.item.name or '—'), ('Сумма', f'{deal.item.price} ₽'),
+            ('Сделка', deal.id), ('От', _uname(deal.user)),
+            ('Товар', _iname(deal.item)), ('Сумма', f'{_iprice(deal.item)} ₽'),
         ]
         if category:
             rows.append(('Категория', category))
@@ -726,8 +1063,8 @@ class MarketBridge:
 
     def _trace_dispute_close(self, deal: ItemDeal, resolver_username: str | None = None) -> None:
         rows = [
-            ('Сделка', deal.id), ('Покупатель', deal.user.username),
-            ('Товар', deal.item.name or '—'), ('Сумма', f'{deal.item.price} ₽'),
+            ('Сделка', deal.id), ('Покупатель', _uname(deal.user)),
+            ('Товар', _iname(deal.item)), ('Сумма', f'{_iprice(deal.item)} ₽'),
         ]
         if resolver_username:
             rows.append(('Сообщение от', resolver_username))
@@ -759,6 +1096,7 @@ class MarketBridge:
                         old_verbose = self.config.get('debug', {}).get('verbose', False)
                         new_verbose = new_cfg.get('debug', {}).get('verbose', False)
                         self.config = new_cfg
+                        self.account.requests_timeout = _seconds((new_cfg.get('account') or {}).get('timeout'), 30, 5, 300)
                         if old_verbose != new_verbose:
                             from lib.util import apply_verbose
                             apply_verbose(new_verbose)
@@ -770,22 +1108,24 @@ class MarketBridge:
                         val = getattr(self, key)
                         if db.get(key) != val:
                             db.set(key, val)
+                    self._persist_rotated_cookies()
                 except Exception:
                     logger.error('Ошибка синхронизации конфигурации/состояния: %s', traceback.format_exc())
                 if self._stop_event.wait(3):
                     return
 
-        def _refresh_profile_loop():
-            while not self._stop_event.wait(1800):
-                try:
-                    self._sync_profile()
-                except Exception:
-                    logger.error('Ошибка обновления аккаунта: %s', traceback.format_exc())
-
         def _access_check_loop():
             while not self._stop_event.is_set():
                 try:
                     self._verify_access()
+                    self._auth_alerted = False
+                except (UnauthorizedError, HoneypotDetectedException) as exc:
+                    self._report_auth_failure(exc)
+                except RequestApiError as exc:
+                    if exc.error_code in ('UNAUTHENTICATED', 'UNAUTHORIZED', 'FORBIDDEN'):
+                        self._report_auth_failure(exc)
+                    else:
+                        logger.error('Ошибка проверки блокировки: %s', exc)
                 except Exception:
                     logger.error('Ошибка проверки блокировки: %s', traceback.format_exc())
                 if self._stop_event.wait(900):
@@ -793,19 +1133,19 @@ class MarketBridge:
 
         def _reactivate_expired_loop():
             while not self._stop_event.is_set():
-                poll_on = (self.config.get('auto', {}).get('restore', {}).get('poll') or {}).get('enabled')
-                if self.config['auto']['restore']['expired'] and not poll_on:
-                    try:
+                try:
+                    restore_cfg = (self.config.get('auto') or {}).get('restore') or {}
+                    if restore_cfg.get('expired') and not (restore_cfg.get('poll') or {}).get('enabled'):
                         self._reactivate_expired()
-                    except Exception:
-                        logger.error('Ошибка автовосстановления: %s', traceback.format_exc())
-                if self._stop_event.wait(45):
+                except Exception:
+                    logger.error('Ошибка автовосстановления: %s', traceback.format_exc())
+                if self._stop_event.wait(120):
                     return
 
         def _reactivate_poll_loop():
             while not self._stop_event.is_set():
                 poll = (self.config.get('auto', {}).get('restore') or {}).get('poll') or {}
-                iv   = max(30, int(poll.get('interval') or 300))
+                iv   = _seconds(poll.get('interval'), 300, 30)
                 if poll.get('enabled'):
                     try:
                         self._reactivate_polled()
@@ -819,11 +1159,12 @@ class MarketBridge:
 
         def _elevate_loop():
             while not self._stop_event.is_set():
-                if self.config['auto']['bump']['enabled'] and datetime.now() >= self._next_at('auto_bump_items'):
-                    try:
+                try:
+                    bump_cfg = (self.config.get('auto') or {}).get('bump') or {}
+                    if bump_cfg.get('enabled') and datetime.now() >= self._next_at('auto_bump_items'):
                         self._elevate_all()
-                    except Exception:
-                        logger.error('Ошибка автоподнятия: %s', traceback.format_exc())
+                except Exception:
+                    logger.error('Ошибка автоподнятия: %s', traceback.format_exc())
                 if self._stop_event.wait(3):
                     return
 
@@ -834,7 +1175,7 @@ class MarketBridge:
                 return
             while not self._stop_event.is_set():
                 upd_cfg = (self.config.get('updater') or {})
-                iv = max(300, int(upd_cfg.get('interval_sec') or 3600))
+                iv = _seconds(upd_cfg.get('interval_sec'), 3600, 300)
                 if not upd_cfg.get('enabled', True):
                     if self._stop_event.wait(iv):
                         return
@@ -880,9 +1221,9 @@ class MarketBridge:
                 return
             while not self._stop_event.is_set():
                 bc = (self.config.get('broadcast') or {})
-                iv = max(120, int(bc.get('interval_sec') or 1800))
+                iv = _seconds(bc.get('interval_sec'), 1800, 120)
                 source = str(bc.get('source') or '').strip() or DEFAULT_SOURCE
-                if not bc.get('enabled', True) or not source:
+                if not bc.get('enabled', False) or not source:
                     if self._stop_event.wait(iv):
                         return
                     continue
@@ -929,7 +1270,7 @@ class MarketBridge:
                 if self._stop_event.wait(iv):
                     return
 
-        targets = (_sync_loop, _refresh_profile_loop, _access_check_loop, _reactivate_expired_loop, _reactivate_poll_loop, _elevate_loop, _update_check_loop, _broadcast_loop)
+        targets = (_sync_loop, _access_check_loop, _reactivate_expired_loop, _reactivate_poll_loop, _elevate_loop, _update_check_loop, _broadcast_loop)
         started_names = getattr(self, '_started_worker_names', set())
         self._started_worker_names = started_names
         for target in targets:
@@ -955,10 +1296,15 @@ class MarketBridge:
             return
         for ev in item.get('events') or []:
             if ev == 'call_seller':
-                asyncio.run_coroutine_threadsafe(
-                    _get_panel().call_seller(username, chat_id), _get_panel_loop(),
-                )
-                self._push(chat_id, self._render('cmd_seller'))
+                now = time.monotonic()
+                last = self._seller_calls.get(chat_id)
+                if last is not None and now - last < 120:
+                    continue
+                self._seller_calls[chat_id] = now
+                panel, loop = _get_panel(), _get_panel_loop()
+                if panel is not None and loop is not None:
+                    asyncio.run_coroutine_threadsafe(panel.call_seller(username, chat_id), loop)
+                self._push(chat_id, self._render('cmd_seller', buyer=username))
         rl = [x for x in (item.get('reply_lines') or []) if str(x).strip()]
         if rl:
             self._push(chat_id, '\n'.join(rl))
@@ -976,30 +1322,24 @@ class MarketBridge:
         if event.message.user.id == self.account.id:
             return
         is_support = event.chat.id in (self.account.system_chat_id, self.account.support_chat_id)
-        alerts = self.config['alerts']
-        if alerts['enabled']:
-            want_msg = alerts['on']['message'] and not is_support
-            want_sys = alerts['on']['system']  and is_support
-            if want_msg or want_sys:
-                body = _build_html(event.message)
-                text = f'<b>{html.escape(event.message.user.username)}:</b>\n{body}'
-                asyncio.run_coroutine_threadsafe(_get_panel().log_event(
-                    text=_log_text(title='📩 Входящее сообщение', text=text.strip()),
-                    kb=_log_mess_kb(event.message.user.username, event.chat.id),
-                    link_preview_url=first_link_preview_url(event.message),
-                ), _get_panel_loop())
+        sender = _uname(event.message.user)
+        if self._alert_on('system' if is_support else 'message'):
+            body = _build_html(event.message)
+            text = f'<b>{html.escape(sender)}:</b>\n{body}'
+            self._emit(_log_text(title='📩 Входящее сообщение', text=text.strip()),
+                       _log_mess_kb(sender, event.chat.id), first_link_preview_url(event.message))
         if not is_support and event.message.text is not None:
             if event.message.user.id not in self.initialized_users:
                 self.initialized_users.append(event.message.user.id)
-            if self.config['features']['commands']:
-                self._exec_cmd(event.message.text, event.chat.id, event.message.user.username)
+            if (self.config.get('features') or {}).get('commands'):
+                self._exec_cmd(event.message.text, event.chat.id, sender)
 
     async def _on_review_new(self, event: ReviewCreatedNotice) -> None:
         logger.debug('[event] NEW_REVIEW  deal=%s  rating=%s', event.deal.id, getattr(event.deal.review, 'rating', '?'))
-        if event.deal.user.id == self.account.id:
+        if _uid(event.deal.user) == self.account.id:
             return
         self._trace_review(event.deal)
-        if self.config['alerts']['enabled'] and self.config['alerts']['on']['review']:
+        if self._alert_on('review'):
             _rev_chat = event.deal.chat.id if event.deal.chat else None
             rev  = event.deal.review
             rtxt = (rev.text or '').strip()
@@ -1010,43 +1350,37 @@ class MarketBridge:
             stars = '⭐' * max(0, rev.rating or 0) or '—'
             body = (
                 f'<b>Звёзды:</b> {stars}\n'
-                f'<b>Автор:</b> {html.escape(rev.creator.username or "?")}\n\n'
+                f'<b>Автор:</b> {html.escape(_uname(rev.creator) or "?")}\n\n'
                 '<b>Комментарий</b>\n'
                 f'<blockquote>{html.escape(rtxt if rtxt else "—")}</blockquote>\n\n'
                 f'<i>⏱ {html.escape(date_str)}</i>'
             )
-            asyncio.run_coroutine_threadsafe(
-                _get_panel().log_event(
-                    text=_log_text(title=f'⭐ Отзыв к заказу <a href="https://playerok.com/deal/{event.deal.id}">#{str(event.deal.id)[:8]}…</a>', text=body),
-                    kb=_log_chat_only_kb(_rev_chat),
-                ),
-                _get_panel_loop(),
+            self._emit(
+                _log_text(title=f'⭐ Отзыв к заказу <a href="https://playerok.com/deal/{event.deal.id}">#{str(event.deal.id)[:8]}…</a>', text=body),
+                _log_chat_only_kb(_rev_chat),
             )
-        self._push(event.chat.id, self._render('new_review', deal_id=event.deal.id, product=event.deal.item.name, price=event.deal.item.price, rating=event.deal.review.rating))
+        self._push(getattr(event.chat, 'id', None), self._render('new_review', buyer=_uname(event.deal.user), deal_id=event.deal.id, product=_iname(event.deal.item), price=_iprice(event.deal.item), rating=getattr(event.deal.review, 'rating', '')))
 
     async def _on_review_del(self, event: ReviewRemovedNotice) -> None:
         logger.debug('[event] REVIEW_REMOVED  deal=%s', event.deal.id)
-        if event.deal.user.id == self.account.id:
+        if _uid(event.deal.user) == self.account.id:
             return
         self._trace_review_del(event.deal)
-        if self.config['alerts']['enabled'] and self.config['alerts']['on']['review']:
+        if self._alert_on('review'):
             _rev_chat = event.deal.chat.id if event.deal.chat else None
             body = (
-                f'<b>Клиент:</b> {html.escape(event.deal.user.username)}\n'
-                f'<b>Лот:</b> {html.escape(event.deal.item.name or "")}\n'
+                f'<b>Клиент:</b> {html.escape(_uname(event.deal.user))}\n'
+                f'<b>Лот:</b> {html.escape(_iname(event.deal.item) or "")}\n'
                 '<i>Отзыв удалён или снят модерацией.</i>'
             )
-            asyncio.run_coroutine_threadsafe(
-                _get_panel().log_event(
-                    text=_log_text(title=f'🧹 Отзыв снят — заказ <a href="https://playerok.com/deal/{event.deal.id}">#{str(event.deal.id)[:8]}…</a>', text=body),
-                    kb=_log_mess_kb(event.deal.user.username, _rev_chat),
-                ),
-                _get_panel_loop(),
+            self._emit(
+                _log_text(title=f'🧹 Отзыв снят — заказ <a href="https://playerok.com/deal/{event.deal.id}">#{str(event.deal.id)[:8]}…</a>', text=body),
+                _log_mess_kb(_uname(event.deal.user), _rev_chat),
             )
 
     async def _on_review_edit(self, event: ReviewEditedNotice) -> None:
         logger.debug('[event] REVIEW_UPDATED  deal=%s', event.deal.id)
-        if event.deal.user.id == self.account.id:
+        if _uid(event.deal.user) == self.account.id:
             return
         new = event.deal.review
         if not new:
@@ -1056,27 +1390,27 @@ class MarketBridge:
         except Exception:
             prev = {}
         self._trace_review_edit(event.deal, prev)
-        if self.config['alerts']['enabled'] and self.config['alerts']['on']['review']:
-            _rev_chat = event.deal.chat.id if event.deal.chat else None
-            pr = int(prev.get('rating') or 0)
-            pt = (prev.get('text') or '') or '—'
+        if self._alert_on('review'):
+            try:
+                pr = max(0, int(prev.get('rating') or 0))
+            except (TypeError, ValueError):
+                pr = 0
+            nr = max(0, int(new.rating or 0))
+            pt = str(prev.get('text') or '') or '—'
             body = (
-                f'<b>Клиент:</b> {html.escape(event.deal.user.username)}\n'
-                f'<b>Лот:</b> {html.escape(event.deal.item.name or "")}\n\n'
+                f'<b>Клиент:</b> {html.escape(_uname(event.deal.user))}\n'
+                f'<b>Лот:</b> {html.escape(_iname(event.deal.item) or "")}\n\n'
                 f'<b>До правки:</b> {"⭐" * pr} ({pr}) — {html.escape(pt)}\n'
-                f'<b>После:</b> {"⭐" * new.rating} ({new.rating}) — {html.escape(new.text or "—")}'
+                f'<b>После:</b> {"⭐" * nr} ({nr}) — {html.escape(new.text or "—")}'
             )
-            asyncio.run_coroutine_threadsafe(
-                _get_panel().log_event(
-                    text=_log_text(title=f'📝 Правка отзыва — <a href="https://playerok.com/deal/{event.deal.id}">заказ</a>', text=body),
-                    kb=_log_new_review_kb(event.deal.user.username, event.deal.id),
-                ),
-                _get_panel_loop(),
+            self._emit(
+                _log_text(title=f'📝 Правка отзыва — <a href="https://playerok.com/deal/{event.deal.id}">заказ</a>', text=body),
+                _log_new_review_kb(_uname(event.deal.user), event.deal.id),
             )
 
     async def _on_dispute(self, event: DealDisputeRaised) -> None:
-        logger.debug('[event] DEAL_HAS_PROBLEM  deal=%s  user=%s', event.deal.id, event.deal.user.username)
-        if event.deal.user.id == self.account.id:
+        logger.debug('[event] DEAL_HAS_PROBLEM  deal=%s  user=%s', event.deal.id, _uname(event.deal.user))
+        if _uid(event.deal.user) == self.account.id:
             return
         deal = event.deal
         try:
@@ -1085,24 +1419,21 @@ class MarketBridge:
             logger.exception('load_deal for dispute')
         cat, det = _parse_dispute_text(deal)
         self._trace_dispute(deal, category=cat, detail=det)
-        if self.config['alerts']['enabled'] and self.config['alerts']['on']['problem']:
+        if self._alert_on('problem'):
             _prob_chat = deal.chat.id if deal.chat else None
-            body = f'<b>Клиент:</b> {html.escape(deal.user.username)}\n<b>Лот:</b> {html.escape(deal.item.name or "")}'
+            body = f'<b>Клиент:</b> {html.escape(_uname(deal.user))}\n<b>Лот:</b> {html.escape(_iname(deal.item) or "")}'
             if cat:
                 body += f'\n<b>Тема:</b> {html.escape(cat)}'
             if det:
                 body += f'\n<b>{"Детали" if cat else "Описание"}:</b> {html.escape(det)}'
-            asyncio.run_coroutine_threadsafe(
-                _get_panel().log_event(
-                    text=_log_text(title=f'⚠️ Спор по <a href="https://playerok.com/deal/{deal.id}">заказу</a>', text=body),
-                    kb=_log_mess_kb(deal.user.username, _prob_chat),
-                ),
-                _get_panel_loop(),
+            self._emit(
+                _log_text(title=f'⚠️ Спор по <a href="https://playerok.com/deal/{deal.id}">заказу</a>', text=body),
+                _log_mess_kb(_uname(deal.user), _prob_chat),
             )
 
     async def _on_dispute_close(self, event: DealDisputeCleared) -> None:
-        logger.debug('[event] DEAL_PROBLEM_RESOLVED  deal=%s  user=%s', event.deal.id, event.deal.user.username)
-        if event.deal.user.id == self.account.id:
+        logger.debug('[event] DEAL_PROBLEM_RESOLVED  deal=%s  user=%s', event.deal.id, _uname(event.deal.user))
+        if _uid(event.deal.user) == self.account.id:
             return
         did = event.deal.id
         now = time.time()
@@ -1115,98 +1446,189 @@ class MarketBridge:
             if len(self._problem_resolved_notify_at) > 3000:
                 self._problem_resolved_notify_at.clear()
         self._trace_dispute_close(event.deal, event.resolver_username)
-        if self.config['alerts']['enabled'] and self.config['alerts']['on']['problem']:
+        if self._alert_on('problem'):
             _chat = event.deal.chat.id if event.deal.chat else None
-            body = f'<b>Клиент:</b> {html.escape(event.deal.user.username)}\n<b>Лот:</b> {html.escape(event.deal.item.name or "")}'
+            body = f'<b>Клиент:</b> {html.escape(_uname(event.deal.user))}\n<b>Лот:</b> {html.escape(_iname(event.deal.item) or "")}'
             if event.resolver_username:
                 body += f'\n<b>Отметка:</b> {html.escape(event.resolver_username)}'
-            asyncio.run_coroutine_threadsafe(
-                _get_panel().log_event(
-                    text=_log_text(title=f'🟢 Спор закрыт — <a href="https://playerok.com/deal/{event.deal.id}">заказ</a>', text=body),
-                    kb=_log_chat_only_kb(_chat),
-                ),
-                _get_panel_loop(),
+            self._emit(
+                _log_text(title=f'🟢 Спор закрыт — <a href="https://playerok.com/deal/{event.deal.id}">заказ</a>', text=body),
+                _log_chat_only_kb(_chat),
             )
+
+    def _verified_sale(self, deal: ItemDeal) -> tuple[ItemDeal, bool]:
+        fresh = None
+        for attempt in range(3):
+            try:
+                fresh = self.account.load_deal(deal.id)
+                break
+            except Exception as exc:
+                logger.warning('Не удалось проверить сделку %s (%s/3): %s', deal.id, attempt + 1, exc)
+                if self._stop_event.wait(2):
+                    break
+        current = fresh or deal
+        if fresh is not None:
+            if fresh.chat is None:
+                fresh.chat = deal.chat
+            if fresh.item is None:
+                fresh.item = deal.item
+        status_ok = current.status in (DealStage.PAID, DealStage.PENDING, None)
+        item = current.item
+        try:
+            loaded = self.account.load_listing(item.id) if item is not None and item.id else None
+            if loaded is not None:
+                current.item = loaded
+        except Exception as exc:
+            logger.debug('Не удалось загрузить лот сделки %s: %s', deal.id, exc)
+        mine = isinstance(current.item, MyItem) or _uid(getattr(current.item, 'user', None)) == self.account.id
+        return current, bool(status_ok and mine)
+
+    def _take_delivery(self, item_name: str) -> tuple[dict | None, str | None, int]:
+        with self._delivery_lock:
+            rules = cfg.read('auto_deliveries') or []
+            index = best_rule_index(item_name, rules)
+            if index is None:
+                return None, None, 0
+            rule = rules[index]
+            if not rule.get('piece', True):
+                return rule, None, 0
+            goods = [g for g in (rule.get('goods') or []) if str(g).strip()]
+            if not goods:
+                return rule, None, 0
+            good = goods.pop(0)
+            rule['goods'] = goods
+            cfg.write('auto_deliveries', rules)
+            self.auto_deliveries = rules
+            return rule, good, len(goods)
+
+    @staticmethod
+    def _stash_lost_good(rule: dict, good: str) -> str:
+        import os
+        from lib.util import project_root_dir
+        path = os.path.join(project_root_dir(), 'conf', 'lost_goods.txt')
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        phrases = ', '.join(str(p) for p in (rule.get('keyphrases') or []))
+        with open(path, 'a', encoding='utf-8') as handle:
+            handle.write(f'{datetime.now().isoformat(timespec="seconds")}\t{phrases}\t{good}\n')
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        return 'conf/lost_goods.txt'
+
+    def _return_delivery(self, rule: dict, good: str) -> None:
+        with self._delivery_lock:
+            rules = cfg.read('auto_deliveries') or []
+            target = next((r for r in rules if r.get('keyphrases') == rule.get('keyphrases') and r.get('piece', True)), None)
+            if target is None:
+                where = self._stash_lost_good(rule, good)
+                logger.error('Не удалось вернуть товар в автовыдачу: правило удалено. Товар сохранён в %s', where)
+                self._push_notify('deal', _log_text(
+                    title='📦 Товар не вернулся в автовыдачу',
+                    text=f'Правило удалено, пока товар отправлялся. Товар сохранён в <code>{html.escape(where)}</code>.',
+                ), None)
+                return
+            target.setdefault('goods', []).insert(0, good)
+            cfg.write('auto_deliveries', rules)
+            self.auto_deliveries = rules
+
+    def _deliver(self, deal: ItemDeal, chat_id: str) -> str:
+        item_name = _iname(deal.item)
+        rule, good, left = self._take_delivery(item_name)
+        if rule is None:
+            return 'no_rule'
+        buyer = _uname(deal.user)
+        if rule.get('piece', True):
+            if good is None:
+                self._push(chat_id, self._render('out_of_stock', buyer=buyer, product=item_name, deal_id=deal.id))
+                self._push_notify('deal', _log_text(
+                    title='📦 Автовыдача: товар закончился',
+                    text=f'<b>Лот:</b> {html.escape(item_name)}\n<b>Покупатель:</b> {html.escape(buyer)}\n'
+                         f'<a href="https://playerok.com/deal/{deal.id}">Сделка</a> ждёт ручной выдачи.',
+                ), _log_deal_kb(buyer, deal.id))
+                return 'out_of_stock'
+            if self._push(chat_id, good):
+                logger.info('Автовыдача → %s%s%s  «%s»  остаток: %s%d%s', C_BRIGHT, buyer, Fore.RESET,
+                            _norm_title(item_name)[:40], C_BRIGHT, left, Fore.RESET)
+                if left <= 3:
+                    self._push_notify('deal', _log_text(
+                        title='📦 Автовыдача: заканчивается товар',
+                        text=f'<b>Лот:</b> {html.escape(item_name)}\nОсталось: <b>{left}</b>',
+                    ), None)
+                return 'delivered'
+            self._return_delivery(rule, good)
+            return 'failed'
+        text = '\n'.join(rule.get('message') or [])
+        if not text.strip():
+            return 'no_rule'
+        text = self._fill(text, self._ctx(buyer=buyer, product=item_name, deal_id=deal.id, price=_iprice(deal.item),
+                                          seller=getattr(self.account, 'username', '') or ''))
+        if self._push(chat_id, text):
+            logger.info('Автовыдача → %s%s%s  сообщение по правилу', C_BRIGHT, buyer, Fore.RESET)
+            return 'delivered'
+        return 'failed'
+
+    def _should_autoconfirm(self, item_name: str) -> bool:
+        confirm_cfg = (self.config.get('auto') or {}).get('confirm') or {}
+        if not confirm_cfg.get('enabled'):
+            return False
+        if confirm_cfg.get('all'):
+            return True
+        return _title_matches_groups(item_name, (self.auto_complete_deals or {}).get('included') or [])
 
     async def _on_order(self, event: DealCreatedNotice) -> None:
-        logger.debug('[event] NEW_DEAL  user=%s  item=%s  deal=%s', event.deal.user.username, getattr(event.deal.item, 'name', '?'), event.deal.id)
-        if event.deal.user.id == self.account.id:
+        logger.debug('[event] NEW_DEAL  deal=%s', event.deal.id)
+        if _uid(event.deal.user) == self.account.id:
             return
-        try:
-            event.deal.item = self.account.load_listing(event.deal.item.id)
-        except Exception:
-            pass
-        self._trace_order(event.deal)
-        if self.config['alerts']['enabled'] and self.config['alerts']['on']['deal']:
-            asyncio.run_coroutine_threadsafe(
-                _get_panel().log_event(
-                    text=_log_text(
-                        title=f'🛒 Новый заказ <a href="https://playerok.com/deal/{event.deal.id}">↗</a>',
-                        text=f"<b>Клиент:</b> {event.deal.user.username}\n<b>Позиция:</b> {event.deal.item.name or '—'}\n<b>К оплате:</b> {event.deal.item.price or '?'} ₽",
-                    ),
-                    kb=_log_deal_kb(event.deal.user.username, event.deal.id),
-                ),
-                _get_panel_loop(),
-            )
-        self._push(event.chat.id, self._render('new_deal', product=event.deal.item.name or '-', price=event.deal.item.price))
-        is_support = event.chat.id in (self.account.system_chat_id, self.account.support_chat_id)
-        if event.deal.user.id not in self.initialized_users and not is_support:
-            self._push(event.chat.id, self._render('first_message', buyer=event.deal.user.username))
-            self.initialized_users.append(event.deal.user.id)
-        if self.config['features']['deliveries']:
-            item_name = (event.deal.item.name or '').lower()
-            for i, delivery in enumerate(list(self.auto_deliveries)):
-                match = any(p.lower() in item_name or item_name == p.lower() for p in delivery['keyphrases'])
-                if not match:
-                    continue
-                if delivery.get('piece', True):
-                    goods = delivery.get('goods', [])
-                    if not goods:
-                        break
-                    good = goods[0]
-                    mess = self._push(event.chat.id, good)
-                    if mess:
-                        logger.info('Автовыдача → %s%s%s  «%s»  остаток: %s%d%s',
-                                    C_BRIGHT, event.deal.user.username or '?', Fore.RESET,
-                                    good[:40], C_BRIGHT, len(goods) - 1, Fore.RESET)
-                        self.auto_deliveries[i]['goods'].pop(0)
-                        cfg.write('auto_deliveries', self.auto_deliveries)
-                else:
-                    msg_text = delivery.get('message', '')
-                    if msg_text:
-                        mess = self._push(event.chat.id, '\n'.join(msg_text))
-                        if mess:
-                            logger.info('Автовыдача → %s%s%s  сообщение «%s»',
-                                        C_BRIGHT, event.deal.user.username or '?', Fore.RESET,
-                                        str(msg_text)[:40])
-                break
-        if self.config['auto']['confirm']['enabled']:
-            if not event.deal.item.name:
-                try:
-                    event.deal.item = self.account.load_listing(event.deal.item.id)
-                except Exception:
-                    return
-            item_name = event.deal.item.name or ''
-            included = any(
-                any(p.lower() in item_name.lower() or item_name.lower() == p.lower() for p in grp)
-                for grp in self.auto_complete_deals['included']
-            )
-            if self.config['auto']['confirm']['all'] or included:
-                self.account.patch_deal(event.deal.id, DealStage.SENT)
-                logger.info('Сделка %s%s%s подтверждена автоматически', C_BRIGHT, event.deal.id, Fore.RESET)
+        deal, is_my_sale = await asyncio.to_thread(self._verified_sale, event.deal)
+        chat_id = getattr(event.chat, 'id', None) or getattr(deal.chat, 'id', None)
+        buyer = _uname(deal.user)
+        item_name = _iname(deal.item)
+        self._trace_order(deal)
+        self._push_notify('deal', _log_text(
+            title=f'🛒 Новый заказ <a href="https://playerok.com/deal/{deal.id}">↗</a>',
+            text=f'<b>Клиент:</b> {html.escape(buyer)}\n<b>Позиция:</b> {html.escape(item_name)}\n'
+                 f'<b>К оплате:</b> {html.escape(str(_iprice(deal.item)))} ₽',
+        ), _log_deal_kb(buyer, deal.id))
+        if not is_my_sale:
+            logger.info('Сделка %s не прошла проверку (статус %s) — автоматизация пропущена',
+                        deal.id, getattr(deal.status, 'name', '?'))
+            return
+        self._push(chat_id, self._render('new_deal', buyer=buyer, product=item_name, price=_iprice(deal.item), deal_id=deal.id))
+        is_support = chat_id in (self.account.system_chat_id, self.account.support_chat_id)
+        buyer_id = _uid(deal.user)
+        if buyer_id and buyer_id not in self.initialized_users and not is_support:
+            if (self.config.get('features') or {}).get('greet', True):
+                self._push(chat_id, self._render('first_message', buyer=buyer, product=item_name))
+            self.initialized_users.append(buyer_id)
+        delivery = 'disabled'
+        if (self.config.get('features') or {}).get('deliveries'):
+            delivery = await asyncio.to_thread(self._deliver, deal, chat_id)
+        if delivery in ('out_of_stock', 'failed'):
+            logger.warning('Автоподтверждение сделки %s пропущено: автовыдача %s', deal.id, delivery)
+            return
+        confirm_cfg = (self.config.get('auto') or {}).get('confirm') or {}
+        if delivery != 'delivered' and confirm_cfg.get('only_delivered', True) and confirm_cfg.get('enabled'):
+            logger.info('Сделка %s не подтверждена автоматически: бот ничего не выдал по ней', deal.id)
+            return
+        if self._should_autoconfirm(item_name):
+            try:
+                await asyncio.to_thread(self.account.patch_deal, deal.id, DealStage.SENT)
+                logger.info('Сделка %s%s%s подтверждена автоматически', C_BRIGHT, deal.id, Fore.RESET)
+            except Exception as exc:
+                logger.error('Не удалось автоматически подтвердить сделку %s: %s', deal.id, exc)
 
     async def _on_paid(self, event: ListingPaidNotice) -> None:
-        logger.debug('[event] ITEM_PAID  deal=%s  item=%s', event.deal.id, getattr(event.deal.item, 'name', '?'))
-        if self.config['auto']['restore']['sold']:
-            item_id = getattr(event.deal.item, 'id', None)
-            if item_id:
-                def _restore_on_paid(iid: str) -> None:
-                    try:
-                        it = self.account.load_listing(iid)
-                        self._reactivate(it, retry_delays=[30, 60, 120])
-                    except Exception as exc:
-                        logger.error('Ошибка при восстановлении после оплаты: %s', exc)
-                Thread(target=_restore_on_paid, args=(item_id,), daemon=True).start()
+        logger.debug('[event] ITEM_PAID  deal=%s', event.deal.id)
+        if _uid(event.deal.user) == self.account.id:
+            return
+        restore_cfg = (self.config.get('auto') or {}).get('restore') or {}
+        item = event.deal.item
+        if not restore_cfg.get('sold') or not getattr(item, 'id', None):
+            return
+        if getattr(item, 'keep_in_sale', None):
+            return
+        Thread(target=self._reactivate, args=(item, [20, 60, 180]), daemon=True, name='cxh-restore-sold').start()
 
     def _calc_net(self, deal: ItemDeal) -> int:
         try:
@@ -1257,7 +1679,7 @@ class MarketBridge:
 
     async def _on_stage(self, event: DealStageChanged) -> None:
         logger.debug('[event] DEAL_STATUS_CHANGED  deal=%s  status=%s', event.deal.id, getattr(event.deal.status, 'name', '?'))
-        if event.deal.user.id == self.account.id:
+        if _uid(event.deal.user) == self.account.id:
             return
         confirmed_with_problem = False
         if event.deal.status is DealStage.CONFIRMED:
@@ -1273,35 +1695,26 @@ class MarketBridge:
             status_frmtd = self._STAGE_MAP.get(event.deal.status, 'Неизвестный')
         if not confirmed_with_problem:
             self._trace_stage(event.deal, status_frmtd)
-        if self.config['alerts']['enabled'] and self.config['alerts']['on']['deal_changed'] and not confirmed_with_problem:
-            asyncio.run_coroutine_threadsafe(
-                _get_panel().log_event(_log_text(
-                    title=f'🔁 Этап заказа обновлён <a href="https://playerok.com/deal/{event.deal.id}/">↗</a>',
-                    text=f'<b>Сейчас:</b> {html.escape(status_frmtd)}',
-                )),
-                _get_panel_loop(),
-            )
-        if event.deal.status is DealStage.PENDING:
-            self._push(event.chat.id, self._render('deal_pending', deal_id=event.deal.id, product=event.deal.item.name, price=event.deal.item.price))
+        if self._alert_on('deal_changed') and not confirmed_with_problem:
+            self._emit(_log_text(
+                title=f'🔁 Этап заказа обновлён <a href="https://playerok.com/deal/{event.deal.id}/">↗</a>',
+                text=f'<b>Сейчас:</b> {html.escape(status_frmtd)}',
+            ))
+        chat_id = getattr(event.chat, 'id', None)
+        variables = {'buyer': _uname(event.deal.user), 'deal_id': event.deal.id,
+                     'product': _iname(event.deal.item), 'price': _iprice(event.deal.item)}
         if event.deal.status is DealStage.SENT:
-            self._push(event.chat.id, self._render('deal_sent', deal_id=event.deal.id, product=event.deal.item.name, price=event.deal.item.price))
+            self._push(chat_id, self._render('deal_sent', **variables))
         if event.deal.status is DealStage.CONFIRMED and not confirmed_with_problem:
-            self._push(event.chat.id, self._render('deal_confirmed', deal_id=event.deal.id, product=event.deal.item.name, price=event.deal.item.price))
+            self._push(chat_id, self._render('deal_confirmed', **variables))
             self.stats.deals_completed += 1
             self.stats.earned_money    += self._calc_net(event.deal)
             _flush_counters(self.stats)
-            if self.config['auto']['restore']['sold']:
-                item_id = getattr(event.deal.item, 'id', None)
-                if item_id:
-                    def _restore_after_confirm(iid: str) -> None:
-                        try:
-                            it = self.account.load_listing(iid)
-                            self._reactivate(it, retry_delays=[30, 60, 120])
-                        except Exception as exc:
-                            logger.error('Ошибка при восстановлении после подтверждения: %s', exc)
-                    Thread(target=_restore_after_confirm, args=(item_id,), daemon=True).start()
+            restore_cfg = (self.config.get('auto') or {}).get('restore') or {}
+            if restore_cfg.get('sold') and getattr(event.deal.item, 'id', None):
+                Thread(target=self._reactivate, args=(event.deal.item, [30, 90]), daemon=True, name='cxh-restore-confirmed').start()
         if event.deal.status is DealStage.ROLLED_BACK:
-            self._push(event.chat.id, self._render('deal_refunded', deal_id=event.deal.id, product=event.deal.item.name, price=event.deal.item.price))
+            self._push(chat_id, self._render('deal_refunded', **variables))
             self.stats.deals_refunded += 1
             _flush_counters(self.stats)
 
@@ -1311,12 +1724,19 @@ class MarketBridge:
         apply_verbose(self.config.get('debug', {}).get('verbose', False))
         nick = (self.account.username or '').strip() or '—'
         logger.info('  %s✓%s  %sPlayerok: авторизованы как «%s»%s', C_SUCCESS, Fore.RESET, C_BRIGHT, nick, Fore.RESET)
-        stats       = self.account.profile.stats.deals
-        active_sales = stats.outgoing.total  - stats.outgoing.finished
-        active_buys  = stats.incoming.total  - stats.incoming.finished
+        profile = self.account.profile
+        deals_stats = getattr(getattr(profile, 'stats', None), 'deals', None)
+
+        def _active(part) -> int | str:
+            if part is None:
+                return '—'
+            return (part.total or 0) - (part.finished or 0)
+
+        active_sales = _active(getattr(deals_stats, 'outgoing', None))
+        active_buys = _active(getattr(deals_stats, 'incoming', None))
         acc_rows: list = [('Никнейм', self.account.username), ('ID', str(self.account.id)[:36]), None]
-        if self.bot_account.profile.balance:
-            bal = self.account.profile.balance
+        if getattr(profile, 'balance', None):
+            bal = profile.balance
             acc_rows += [
                 ('Баланс', f'{bal.value} ₽'), ('  Доступно', f'{bal.available} ₽'),
                 ('  Ожидание', f'{bal.pending_income} ₽'), ('  Заморожено', f'{bal.frozen} ₽'), None,
@@ -1354,10 +1774,13 @@ class MarketBridge:
         wire_mkt(MarketEvent.ITEM_PAID,        MarketBridge._on_paid,      0)
         wire_mkt(MarketEvent.DEAL_STATUS_CHANGED, MarketBridge._on_stage,  0)
 
+        processed_deals: list = []
+        feed_since = datetime.now(timezone.utc)
+
         async def _event_loop():
             delay = 1
             while not self._stop_event.is_set():
-                feed = Feed(self.account, ws_path='/chats')
+                feed = Feed(self.account, ws_path='/chats', processed_deals=processed_deals, since=feed_since)
                 self._feed = feed
                 try:
                     for event in feed.listen():

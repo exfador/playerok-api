@@ -1,444 +1,191 @@
 from __future__ import annotations
-from typing import *
-from logging import getLogger
-from typing import Literal
+
+import base64
 import json
-import ssl
+import mimetypes
+import os
+import tempfile
 import threading
 import uuid
-import base64
-import certifi
-import requests
-import tls_requests
-import curl_cffi
 from contextlib import ExitStack
-from lib.util import proxy_url_for_requests, ascii_safe_ca_bundle
+from urllib.parse import urlparse
+from http.cookies import CookieError, SimpleCookie
+from logging import getLogger
+from threading import RLock
+from typing import Iterator, Literal
+
+import certifi
+import curl_cffi
+
+from constants.contracts import ORIGIN
+from constants.transport import (
+    DEFAULT_TIMEOUT,
+    DEFAULT_USER_AGENT,
+    MAX_ATTACHMENT_BYTES,
+    MAX_CLONE_ATTACHMENTS,
+    MAX_MESSAGE_COUNT,
+    MAX_PAGES,
+    MESSAGE_PAGE_SIZE,
+    VIEWER_FIELDS,
+)
+from lib.util import ascii_safe_ca_bundle, proxy_url_for_requests
+
 from . import models as types
+from .cookies import parse_cookies, parse_cookies_lenient
 from .defs import *
 from .gql import *
+from .transport import GraphQLTransport, ResponseContractError, impersonation_for
+
+PUBLISHABLE_STAGES = (ListingStage.DRAFT, ListingStage.DECLINED, ListingStage.EXPIRED, ListingStage.SOLD)
+BOOSTABLE_STAGES = (ListingStage.APPROVED, ListingStage.PENDING_MODERATION, ListingStage.PENDING_APPROVAL)
 
 
 def active_conn() -> Conn | None:
-    if hasattr(Conn, 'instance'):
-        return getattr(Conn, 'instance')
-
-
-def _is_transport_recoverable(exc: BaseException) -> bool:
-    if isinstance(exc, (ssl.SSLError, TimeoutError, BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
-        return True
-    if isinstance(exc, OSError):
-        err_no = getattr(exc, 'errno', None)
-        if err_no is not None and err_no in (
-            10054, 10053, 10060,
-            104, 110, 111, 113,
-        ):
-            return True
-    blob = f'{type(exc).__name__} {exc}'.lower()
-    for needle in (
-        'ssl', 'tls', 'handshake', 'certificate', 'eof occurred',
-        'connection reset', 'broken pipe', 'curl: (', 'recv failure', 'send failure',
-        'wrong version number', 'unexpected eof',
-    ):
-        if needle in blob:
-            return True
-    return False
-
-
-def _is_proxy_dial_failure_message(msg: str) -> bool:
-    m = (msg or '').lower()
-    if any(x in m for x in ('curl: (7)', 'curl: (56)')):
-        return True
-    if any(x in m for x in ('failed to connect', 'could not connect', 'connection refused')):
-        return True
-    if any(x in m for x in ('no route to host', 'network is unreachable', 'name or service not known')):
-        return True
-    return False
-
-
-def _proxy_dial_failure_hint(err: str) -> str:
-    e = (err or '').lower()
-    if 'curl: (28)' in e:
-        return (
-            ' | Таймаут запроса (0 байт — часто сеть/фильтр/прокси): проверьте '
-            'доступ к playerok.com с этого хоста, account.proxy, account.timeout в config, фаервол и DNS.'
-        )
-    if 'curl: (7)' in e:
-        return ' | Нет соединения с прокси: закрыт порт, неверный адрес или блокировка.'
-    return ' | Проверьте account.proxy / bot.proxy в conf/config.json.'
-
-
-def _rewind_upload_files(files: dict[str, Any]) -> None:
-    for value in files.values():
-        stream = value
-        if isinstance(value, (tuple, list)) and len(value) > 1:
-            stream = value[1]
-        seek = getattr(stream, 'seek', None)
-        if callable(seek):
-            seek(0)
+    from .client import get_account
+    try:
+        return get_account()
+    except RuntimeError:
+        return None
 
 
 class Conn:
-
-    def __new__(cls, *args, **kwargs) -> Conn:
-        if not hasattr(cls, 'instance'):
-            cls.instance = super(Conn, cls).__new__(cls)
-        return getattr(cls, 'instance')
-
-    def __init__(self, token: str | None = None, user_agent: str = '', proxy: str = None, requests_timeout: int = 15, request_max_retries: int = 5, cookies: str | dict[str, str] | None = None, ddg5: str = '', **kwargs):
-        if not token and not cookies:
-            raise TypeError('Нужен token или cookies (с полем `token=...`). Экспортируйте Cookie из браузера, где вы авторизованы на playerok.com.')
-        self.token = token or ''
-        self.ddg5 = ddg5 or ''
-        self.user_agent = user_agent or 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36'
-        self.requests_timeout = requests_timeout
-        self.proxy = proxy
-        self.__proxy_string = proxy_url_for_requests(self.proxy) if self.proxy else None
+    def __init__(self, token=None, user_agent="", proxy=None,
+                 requests_timeout=DEFAULT_TIMEOUT, request_max_retries=2,
+                 cookies=None, ddg5="", anonymous=False, **kwargs):
+        self.anonymous = bool(anonymous)
+        self.user_agent = user_agent or DEFAULT_USER_AGENT
+        self.requests_timeout = int(requests_timeout or DEFAULT_TIMEOUT)
         self.request_max_retries = request_max_retries
-        self.base_url = 'https://playerok.com'
-        self.cookies: dict[str, str] = self._build_cookie_jar(cookies)
-        self._cookies_lock = threading.Lock()
-        self._request_lock = threading.RLock()
-        if not self.token:
-            self.token = self.cookies.get('token', '')
-        else:
-            self.cookies.setdefault('token', self.token)
-        if self.ddg5:
-            self.cookies.setdefault('__ddg5_', self.ddg5)
-        self.id: str | None = None
-        self.username: str | None = None
-        self.email: str | None = None
-        self.role: str | None = None
-        self.support_chat_id: str | None = None
-        self.system_chat_id: str | None = None
-        self.unread_chats_counter: int | None = None
-        self.is_blocked: bool | None = None
-        self.is_blocked_for: str | None = None
-        self.created_at: str | None = None
-        self.last_item_created_at: str | None = None
-        self.has_frozen_balance: bool | None = None
-        self.has_confirmed_phone_number: bool | None = None
-        self.can_publish_items: bool | None = None
-        self.profile: AccountProfile | None = None
+        self.proxy = proxy
+        self.base_url = ORIGIN
+        self.logger = getLogger("pl.conn")
+        self._cookies_lock = RLock()
+        self._sessions_lock = RLock()
+        self._configure_credentials(token, cookies, ddg5)
         self._ca_bundle = ascii_safe_ca_bundle() or certifi.where()
-        self._refresh_clients()
-        self.logger = getLogger('pl.conn')
+        self.profile = None
+        for attribute in VIEWER_FIELDS:
+            setattr(self, attribute, None)
+        self._configure_transport()
 
-    _IMPERSONATE_PROFILES = [
-        'chrome', 'chrome131', 'chrome124', 'chrome123', 'chrome120',
-        'chrome119', 'chrome116', 'chrome110', 'chrome107', 'chrome104',
-    ]
-    _profile_index: int = 0
+    def _configure_credentials(self, token, cookies, ddg5):
+        self.cookies = parse_cookies_lenient(cookies)
+        if token and self.cookies.get("token", token) != token:
+            raise ValueError("Токен в account.token не совпадает с Cookie token")
+        if token:
+            self.cookies.update(parse_cookies({"token": token}))
+        if ddg5:
+            self.cookies.update(parse_cookies({"__ddg5_": ddg5}))
+        self.token = self.cookies.get("token", "")
+        self.ddg5 = self.cookies.get("__ddg5_", "")
+        if not self.token and not self.anonymous:
+            raise ValueError("Нужен token или Cookie с полем token=... от playerok.com")
 
-    def _refresh_clients(self):
-        with self._request_lock:
-            profile = self._IMPERSONATE_PROFILES[
-                Conn._profile_index % len(self._IMPERSONATE_PROFILES)
-            ]
-            Conn._profile_index += 1
-            self.__tls_requests = tls_requests.Client(proxy=self.__proxy_string)
-            self.__curl_session = curl_cffi.Session(impersonate=profile, timeout=10, proxy=self.__proxy_string, verify=self._ca_bundle)
+    def _configure_transport(self):
+        self.impersonate = impersonation_for(self.user_agent)
+        self._local = threading.local()
+        self._sessions: list = []
+        self._session = None
+        self._transport = GraphQLTransport(None, self)
+
+    def _thread_session(self):
+        if self._session is not None:
+            return self._session
+        session = getattr(self._local, "session", None)
+        if session is None:
+            proxy = proxy_url_for_requests(self.proxy) if self.proxy else None
+            session = curl_cffi.Session(impersonate=self.impersonate, proxy=proxy,
+                                        verify=self._ca_bundle, timeout=self.requests_timeout)
+            self._local.session = session
+            with self._sessions_lock:
+                self._sessions.append(session)
+        return session
+
+    @property
+    def proxy_url(self) -> str | None:
+        return proxy_url_for_requests(self.proxy) if self.proxy else None
 
     @staticmethod
-    def _build_cookie_jar(cookies: str | dict[str, str] | None) -> dict[str, str]:
-        if cookies is None:
-            return {}
-        if isinstance(cookies, dict):
-            return {str(k).strip(): str(v).strip() for k, v in cookies.items() if k}
-        jar: dict[str, str] = {}
-        for chunk in str(cookies).split(';'):
-            chunk = chunk.strip()
-            if not chunk or '=' not in chunk:
-                continue
-            k, v = chunk.split('=', 1)
-            k, v = k.strip(), v.strip()
-            if k:
-                jar[k] = v
-        return jar
+    def _build_cookie_jar(cookies):
+        return parse_cookies(cookies)
 
-    def _cookie_header(self) -> str:
+    def _cookie_header(self):
         with self._cookies_lock:
-            return '; '.join(f'{k}={v}' for k, v in self.cookies.items() if v)
+            return "; ".join(f"{key}={value}" for key, value in self.cookies.items() if value)
 
-    def _ingest_set_cookie(self, resp) -> None:
+    def _ingest_set_cookie(self, response):
+        headers = getattr(response, "headers", None)
+        get_list = getattr(headers, "get_list", None)
+        if not callable(get_list):
+            return
+        for value in get_list("set-cookie") or []:
+            self._ingest_cookie_header(value)
+
+    def _ingest_cookie_header(self, value):
+        parsed = SimpleCookie()
         try:
-            headers = resp.headers
-        except Exception:
+            parsed.load(value)
+        except CookieError:
+            self.logger.warning("Отклонён некорректный Set-Cookie")
             return
-        pairs: list[tuple[str, str]] = []
-        multi = getattr(headers, 'multi_items', None)
-        if callable(multi):
-            try:
-                pairs = [(k, v) for k, v in multi()]
-            except Exception:
-                pairs = []
-        if not pairs:
-            get_list = getattr(headers, 'get_list', None) or getattr(headers, 'getlist', None)
-            if callable(get_list):
-                try:
-                    pairs = [('set-cookie', v) for v in get_list('set-cookie')]
-                except Exception:
-                    pairs = []
-        if not pairs:
-            try:
-                raw = headers.get('set-cookie') or headers.get('Set-Cookie')
-            except Exception:
-                raw = None
-            if raw:
-                pairs = [('set-cookie', raw)]
-        if not pairs:
-            return
-        updates: dict[str, str] = {}
-        for k, v in pairs:
-            if not k or k.lower() != 'set-cookie' or not v:
+        for name, cookie in parsed.items():
+            if cookie["domain"] and cookie["domain"].lstrip(".").lower() != "playerok.com":
                 continue
-            first = v.split(';', 1)[0].strip()
-            if '=' not in first:
+            if cookie["path"] not in ("", "/"):
                 continue
-            name, value = first.split('=', 1)
-            name = name.strip()
-            if name:
-                updates[name] = value.strip()
-        if not updates:
-            return
+            self._update_cookie(name, cookie)
+
+    def replace_cookies(self, cookies) -> None:
+        parsed = parse_cookies_lenient(cookies)
+        if not parsed.get("token"):
+            raise ValueError("В новых Cookie нет token")
         with self._cookies_lock:
-            self.cookies.update(updates)
-            tok = updates.get('token')
-            if tok:
-                self.token = tok
+            self.cookies = parsed
+            self.token = parsed.get("token", "")
+            self.ddg5 = parsed.get("__ddg5_", "")
 
-    @property
-    def _timeout(self) -> int:
-        try:
-            from lib.cfg import AppConf
-            t = AppConf.read('config').get('account', {}).get('timeout')
-            return int(t) if t else self.requests_timeout
-        except Exception:
-            return self.requests_timeout
-
-    @property
-    def _verbose(self) -> bool:
-        try:
-            from lib.cfg import AppConf
-            return bool(AppConf.read('config').get('debug', {}).get('verbose', False))
-        except Exception:
-            return False
-
-    def request(self, method: Literal['get', 'post'], url: str, headers: dict[str, str], payload: dict[str, Any] | None = None, files: dict | None = None) -> requests.Response:
-        if method not in ('get', 'post'):
-            raise ValueError(f'Неподдерживаемый HTTP-метод: {method}')
-        caller_hdr = dict(headers or {})
-        try:
-            x_gql_op = payload.get('operationName', 'viewer')
-        except Exception:
-            x_gql_op = 'viewer'
-        x_gql_path = '/'
-        referer = 'https://playerok.com/'
-        if isinstance(payload, dict) and payload.get('variables'):
-            raw_vars = payload['variables']
-            vars_: dict | None
-            if isinstance(raw_vars, dict):
-                vars_ = raw_vars
+    def _update_cookie(self, name, cookie):
+        with self._cookies_lock:
+            if cookie["max-age"] == "0" or not cookie.value:
+                self.cookies.pop(name, None)
             else:
                 try:
-                    vars_ = json.loads(raw_vars)
-                except Exception:
-                    vars_ = None
-            if vars_ is not None:
-                cid = None
-                if x_gql_op == 'chat':
-                    cid = vars_.get('id')
-                elif x_gql_op == 'chatMessages':
-                    cid = (vars_.get('filter') or {}).get('chatId')
-                elif x_gql_op == 'userChats':
-                    x_gql_path = '/chats'
-                    referer = 'https://playerok.com/chats'
-                if cid:
-                    x_gql_path = '/chats/[id]'
-                    referer = f'https://playerok.com/chats/{cid}'
-        wallet_ops = ('verifiedCards', 'SbpBankMembers', 'requestWithdrawal')
+                    self.cookies.update(parse_cookies({name: cookie.value}))
+                except (TypeError, ValueError):
+                    self.logger.warning("Отклонено значение Cookie %s", name)
+                    return
+            self.token = self.cookies.get("token", "")
 
-        if x_gql_op in wallet_ops:
-            path_attempts = [
-                ('/wallet', 'https://playerok.com/wallet'),
-                ('/profile/wallet', 'https://playerok.com/profile/wallet'),
-                ('/wallet/add', 'https://playerok.com/wallet/add'),
-                ('/profile', 'https://playerok.com/profile'),
-            ]
-        else:
-            path_attempts = [(x_gql_path, referer)]
-        verbose = self._verbose
+    @property
+    def _timeout(self):
+        return self.requests_timeout
 
-        if verbose:
-            payload_keys = sorted((payload or {}).keys()) if isinstance(payload, dict) else []
-            variable_keys: list[str] = []
-            if isinstance(payload, dict):
-                raw_variables = payload.get('variables')
-                if isinstance(raw_variables, str):
-                    try:
-                        raw_variables = json.loads(raw_variables)
-                    except Exception:
-                        raw_variables = None
-                if isinstance(raw_variables, dict):
-                    variable_keys = sorted(raw_variables.keys())
-            self.logger.debug(
-                '→ %s %s op=%s payload_keys=%s variable_keys=%s',
-                method.upper(),
-                url,
-                x_gql_op,
-                payload_keys,
-                variable_keys,
-            )
+    def request(self, method, url, headers, payload=None, files=None):
+        return self._transport.send(method, url, headers, payload, files)
 
-        def make_req(req_headers: dict[str, str]):
-            err = ''
+    def forget_uncertain(self, prefix=None):
+        self._transport.forget_uncertain(prefix)
+
+    def close(self):
+        with self._sessions_lock:
+            sessions, self._sessions = self._sessions, []
+        for session in sessions:
             try:
-                max_try = max(1, int(self.request_max_retries))
-            except (TypeError, ValueError):
-                max_try = 1
-            for attempt in range(max_try):
-                try:
-                    with self._request_lock:
-                        if method == 'get':
-                            r = self.__curl_session.get(url=url, params=payload, headers=req_headers, timeout=self._timeout)
-                        elif method == 'post':
-                            if files:
-                                _rewind_upload_files(files)
-                                r = self.__tls_requests.post(url=url, json=None, data=payload, headers=req_headers, files=files, timeout=self._timeout)
-                            else:
-                                r = self.__curl_session.post(url=url, json=payload, headers=req_headers, timeout=self._timeout)
-                    return r
-                except Exception as e:
-                    err = str(e)
-                    if _is_transport_recoverable(e):
-                        if _is_proxy_dial_failure_message(err):
-                            self.logger.warning(
-                                'Прокси/сеть op=%s (без повторов curl-профиля): %s%s',
-                                x_gql_op,
-                                err[:800],
-                                _proxy_dial_failure_hint(err),
-                            )
-                            raise RequestSendingError(url, err)
-                        self.logger.warning(
-                            'Транспорт/TLS op=%s попытка %s/%s (без перезапуска процесса): %s',
-                            x_gql_op,
-                            attempt + 1,
-                            max_try,
-                            err[:800],
-                        )
-                        self._refresh_clients()
-                        continue
-                    self.logger.warning(
-                        'Невосстановимая ошибка запроса op=%s: %s',
-                        x_gql_op,
-                        err[:800],
-                    )
-                    raise RequestSendingError(url, err) from e
-            if err and 'curl: (28)' in err.lower():
-                err = f'{err}{_proxy_dial_failure_hint(err)}'
-            raise RequestSendingError(url, err)
-
-        cf_sigs = ['<title>Just a moment...</title>', 'window._cf_chl_opt', 'Enable JavaScript and cookies to continue', 'Checking your browser before accessing', 'cf-browser-verification', 'Cloudflare Ray ID']
-        ddg_sigs = ['DDoS-Guard', 'DDOS-GUARD', 'ddos-guard.net', 'check.ddos-guard', '__ddg1_', '__ddg5_']
-        max_cf_retries = 4
-
-        for attempt_i, (pth, ref) in enumerate(path_attempts):
-            _headers = {'accept': '*/*', 'accept-language': 'ru,en;q=0.9,en-GB;q=0.8,en-US;q=0.7', 'apollo-require-preflight': 'true', 'apollographql-client-name': 'web', 'content-type': 'application/json', 'cookie': self._cookie_header() or f'token={self.token}', 'origin': 'https://playerok.com', 'priority': 'u=1, i', 'referer': ref, 'sec-ch-ua': '"Chromium";v="144", "Google Chrome";v="144", "Not_A Brand";v="99"', 'sec-ch-ua-arch': '"x86"', 'sec-ch-ua-bitness': '"64"', 'sec-ch-ua-full-version': '"144.0.7559.110"', 'sec-ch-ua-full-version-list': 'Not(A:Brand";v="8.0.0.0", "Chromium";v="144.0.7559.110", "Google Chrome";v="144.0.7559.110"', 'sec-ch-ua-mobile': '?0', 'sec-ch-ua-model': '""', 'sec-ch-ua-platform': '"Windows"', 'sec-ch-ua-platform-version': '"19.0.0"', 'sec-fetch-dest': 'empty', 'sec-fetch-mode': 'cors', 'sec-fetch-site': 'same-origin', 'user-agent': self.user_agent, 'x-apollo-operation-name': x_gql_op, 'x-gql-op': x_gql_op, 'x-gql-path': pth, 'x-timezone-offset': '-180'}
-            if files:
-                _headers.pop('content-type', None)
-            req_headers = dict(_headers)
-            for key, value in caller_hdr.items():
-                old_key = next((h for h in req_headers if h.lower() == key.lower()), None)
-                if old_key is not None and old_key != key:
-                    del req_headers[old_key]
-                req_headers[key] = value
-            if files:
-                for key in [key for key in req_headers if key.lower() == 'content-type']:
-                    del req_headers[key]
-            resp = None
-            for cf_i in range(max_cf_retries):
-                resp = make_req(req_headers)
-                body = resp.text or ''
-                if any(sig in body for sig in ddg_sigs):
-                    snippet = body[:240].replace('\n', ' ').replace('\r', '')
-                    self.logger.warning(
-                        'DDoS-Guard op=%s path=%s — Cookie __ddg5_ просрочена или не подходит; тело: %s',
-                        x_gql_op, pth, snippet,
-                    )
-                    raise BotCheckDetectedException(resp)
-                if not any(sig in body for sig in cf_sigs):
-                    self._ingest_set_cookie(resp)
-                    break
-                snippet = body[:240].replace('\n', ' ').replace('\r', '')
-                self.logger.warning(
-                    'Ответ похож на Cloudflare challenge op=%s path=%s — новая TLS-сессия, повтор %s/%s (без перезапуска). Начало тела: %s',
-                    x_gql_op,
-                    pth,
-                    cf_i + 1,
-                    max_cf_retries,
-                    snippet,
-                )
-                self._refresh_clients()
-            else:
-                if resp is not None and any((sig in resp.text for sig in cf_sigs)):
-                    raise CloudflareDetectedException(resp)
-
-            json_data = {}
-            try:
-                json_data = resp.json()
+                session.close()
             except Exception:
                 pass
+        self._local = threading.local()
 
-            if verbose:
-                data = json_data.get('data') if isinstance(json_data, dict) else None
-                data_keys = sorted(data.keys()) if isinstance(data, dict) else []
-                error_count = len(json_data.get('errors') or []) if isinstance(json_data, dict) else 0
-                self.logger.debug(
-                    '← %s op=%s path=%s data_keys=%s errors=%s',
-                    resp.status_code,
-                    x_gql_op,
-                    pth,
-                    data_keys,
-                    error_count,
-                )
+    def __enter__(self):
+        return self
 
-            if 'errors' in json_data:
-                errors = json_data.get('errors') or []
-                msg = str((errors or [{}])[0].get('message', '')).lower()
-                permissionish = any(x in msg for x in ('доступ', 'access denied', 'permission', 'forbidden'))
-                last_attempt = attempt_i >= len(path_attempts) - 1
-                if x_gql_op not in wallet_ops or not permissionish or last_attempt:
-                    safe_errors = []
-                    for error in errors[:5]:
-                        if isinstance(error, dict):
-                            extensions = error.get('extensions') or {}
-                            safe_errors.append({
-                                'message': str(error.get('message', ''))[:500],
-                                'code': extensions.get('code'),
-                                'path': error.get('path'),
-                            })
-                        else:
-                            safe_errors.append({'message': str(error)[:500]})
-                    self.logger.warning(
-                        'GraphQL ошибка op=%s x-gql-path=%s referer=%s http=%s errors=%s',
-                        x_gql_op,
-                        pth,
-                        ref,
-                        resp.status_code,
-                        safe_errors,
-                    )
-                    raise RequestApiError(resp)
-                self.logger.debug(
-                    'GraphQL op=%s: отказ по доступу на path=%s — следующий referer/path…',
-                    x_gql_op,
-                    pth,
-                )
-                continue
+    def __exit__(self, exc_type, exc, traceback):
+        self.close()
 
-            if resp.status_code != 200:
-                if verbose:
-                    self.logger.debug(f'⚠ HTTP {resp.status_code}  op={x_gql_op}  body={resp.text[:400]}')
-                raise RequestFailedError(resp)
-            return resp
+    def _graphql(self, operation: str, variables: dict) -> dict:
+        payload = {"operationName": operation, "variables": variables}
+        response = self.request("post", f"{self.base_url}/graphql", {"accept": "*/*"}, payload)
+        return response.json()["data"]
 
     @staticmethod
     def _decode_jwt_sub(token: str) -> str | None:
@@ -447,413 +194,414 @@ class Conn:
             padding = (4 - len(payload_part) % 4) % 4
             decoded = base64.urlsafe_b64decode(payload_part + '=' * padding)
             return json.loads(decoded).get('sub')
-        except Exception:
+        except (ValueError, TypeError, IndexError, KeyError, AttributeError):
             return None
 
     def get(self) -> Conn:
-        headers = {'accept': '*/*'}
-        payload = {'operationName': 'viewer', 'query': QUERIES.get('viewer'), 'variables': {}}
-        url = f'{self.base_url}/graphql'
-        r = self.request('post', url, headers, payload).json()
-        data: dict = r['data']['viewer']
-        if data is None:
-            raise UnauthorizedError()
-        self.id = data.get('id')
-        jwt_sub = self._decode_jwt_sub(self.token)
-        if jwt_sub and self.id and jwt_sub != self.id:
-            self.logger.warning(f'Ханипот: токен sub={jwt_sub}, вернули id={self.id}')
-            raise HoneypotDetectedException(returned_id=self.id, token_sub=jwt_sub)
-        self.username = data.get('username')
-        self.email = data.get('email')
-        self.role = data.get('role')
-        self.has_frozen_balance = data.get('hasFrozenBalance')
-        self.support_chat_id = data.get('supportChatId')
-        self.system_chat_id = data.get('systemChatId')
-        self.unread_chats_counter = data.get('unreadChatsCounter')
-        self.is_blocked = data.get('isBlocked')
-        self.is_blocked_for = data.get('isBlockedFor')
-        self.created_at = data.get('createdAt')
-        self.last_item_created_at = data.get('lastItemCreatedAt')
-        self.has_confirmed_phone_number = data.get('hasConfirmedPhoneNumber')
-        self.can_publish_items = data.get('canPublishItems')
-        self.unread_chats_counter = data.get('unreadChatsCounter')
-        headers = {'accept': '*/*'}
-        payload = {'operationName': 'user', 'variables': json.dumps({'username': self.username, 'hasSupportAccess': False}), 'extensions': json.dumps({'persistedQuery': {'version': 1, 'sha256Hash': PERSISTED_QUERIES.get('user')}})}
-        r = self.request('get', f'{self.base_url}/graphql', headers, payload).json()
-        data: dict = r['data']['user']
-        if data.get('__typename') == 'User':
-            self.profile = account_profile(data)
+        self._apply_viewer(self._graphql("viewer", {}).get("viewer"))
+        data = self._graphql("user", {"id": self.id, "hasSupportAccess": False}).get("user")
+        if not isinstance(data, dict) or data.get("id") != self.id:
+            raise ResponseContractError("Профиль аккаунта не получен или не совпадает")
+        self.profile = account_profile(data)
         return self
 
-    def load_user(self, id: str | None = None, username: str | None = None) -> types.UserProfile:
+    def _apply_viewer(self, data):
+        if data is None:
+            raise UnauthorizedError()
+        if not isinstance(data, dict) or not data.get("id"):
+            raise ResponseContractError("Playerok не вернул id аккаунта")
+        token_subject = self._decode_jwt_sub(self.token)
+        if token_subject and data["id"] != token_subject:
+            raise HoneypotDetectedException(returned_id=data["id"], token_sub=token_subject)
+        for attribute, field in VIEWER_FIELDS.items():
+            setattr(self, attribute, data.get(field))
+
+    def load_balance(self) -> types.AccountBalance | None:
+        data = self._graphql("viewerBalance", {}).get("viewer") or {}
+        return account_balance(data.get("balance"))
+
+    def load_user(self, id: str | None = None, username: str | None = None) -> types.UserProfile | None:
         if not any([id, username]):
             raise TypeError('Не был передан ни один из обязательных аргументов: id, username')
-        headers = {'accept': '*/*'}
-        payload = {'operationName': 'user', 'variables': json.dumps({'id': id, 'username': username, 'hasSupportAccess': False}), 'extensions': json.dumps({'persistedQuery': {'version': 1, 'sha256Hash': PERSISTED_QUERIES.get('user')}})}
-        r = self.request('get', f'{self.base_url}/graphql', headers, payload).json()
-        data: dict = r['data']['user']
+        data = self._graphql("user", {"id": id, "username": username, "hasSupportAccess": False}).get("user")
+        if data is None:
+            return None
         if data.get('__typename') == 'UserFragment':
             profile = data
         elif data.get('__typename') == 'User':
-            profile = data.get('profile')
+            profile = data.get('profile') or data
         else:
             profile = None
-        return user_profile(profile)
+        user = user_profile(profile)
+        if user is not None:
+            user.account = self
+        return user
 
-    def load_deals(self, count: int = 24, statuses: list[DealStage] | None = None, direction: DealFlow | None = None, after_cursor: str = None) -> types.ItemDealList:
-        str_statuses = [status.name for status in statuses] if statuses else None
-        str_direction = direction.name if direction else None
-        headers = {'accept': '*/*'}
-        payload = {'operationName': 'deals', 'variables': json.dumps({'pagination': {'first': count, 'after': after_cursor}, 'filter': {'userId': self.id, 'direction': str_direction, 'status': str_statuses}, 'showForbiddenImage': True}), 'extensions': json.dumps({'persistedQuery': {'version': 1, 'sha256Hash': PERSISTED_QUERIES.get('deals')}})}
-        r = self.request('get', f'{self.base_url}/graphql', headers, payload).json()
-        return item_deal_list(r['data']['deals'])
+    def load_deals(self, count: int = 24, statuses: list[DealStage] | None = None, direction: DealFlow | None = None, after_cursor: str | None = None) -> types.ItemDealList:
+        variables = {
+            "pagination": {"first": count, "after": after_cursor},
+            "filter": {"userId": self.id, "direction": direction.name if direction else None,
+                       "status": [status.name for status in statuses] if statuses else None},
+            "showForbiddenImage": True,
+        }
+        return item_deal_list(self._graphql("deals", variables)["deals"])
 
     def load_deal(self, deal_id: str) -> types.ItemDeal:
-        headers = {'accept': '*/*'}
-        payload = {'operationName': 'deal', 'variables': json.dumps({'id': deal_id, 'hasSupportAccess': False, 'showForbiddenImage': True}), 'extensions': json.dumps({'persistedQuery': {'version': 1, 'sha256Hash': PERSISTED_QUERIES.get('deal')}})}
-        r = self.request('get', f'{self.base_url}/graphql', headers, payload).json()
-        return item_deal(r['data']['deal'])
+        data = self._graphql("deal", {"id": deal_id, "hasSupportAccess": False, "showForbiddenImage": True})
+        return item_deal(data["deal"])
 
     def patch_deal(self, deal_id: str, new_status: DealStage) -> types.ItemDeal:
-        headers = {'accept': '*/*'}
-        payload = {'operationName': 'updateDeal', 'variables': {'input': {'id': deal_id, 'status': new_status.name}}, 'query': QUERIES.get('updateDeal')}
-        r = self.request('post', f'{self.base_url}/graphql', headers, payload).json()
-        return item_deal(r['data']['updateDeal'])
+        data = self._graphql("updateDeal", {"input": {"id": deal_id, "status": new_status.name}, "showForbiddenImage": True})
+        return item_deal(data["updateDeal"])
 
-    def load_games(self, count: int = 24, type: GameTypes | None = None, after_cursor: str = None) -> types.GameList:
-        headers = {'accept': '*/*'}
-        payload = {'operationName': 'games', 'variables': json.dumps({'pagination': {'first': count, 'after': after_cursor}, 'filter': {'type': type.name if type else None}}), 'extensions': json.dumps({'persistedQuery': {'version': 1, 'sha256Hash': PERSISTED_QUERIES.get('games')}})}
-        r = self.request('get', f'{self.base_url}/graphql', headers, payload).json()
-        return game_list(r['data']['games'])
+    def load_games(self, count: int = 24, type: GameTypes | None = None, after_cursor: str | None = None) -> types.GameList:
+        variables = {"pagination": {"first": count, "after": after_cursor}, "filter": {"type": type.name if type else None}}
+        return game_list(self._graphql("games", variables)["games"])
 
     def load_game(self, id: str | None = None, slug: str | None = None) -> types.Game:
         if not any([id, slug]):
             raise TypeError('Не был передан ни один из обязательных аргументов: id, slug')
-        headers = {'accept': '*/*'}
-        payload = {'operationName': 'GamePage', 'variables': json.dumps({'id': id, 'slug': slug}), 'extensions': json.dumps({'persistedQuery': {'version': 1, 'sha256Hash': PERSISTED_QUERIES.get('GamePage')}})}
-        r = self.request('get', f'{self.base_url}/graphql', headers, payload).json()
-        return game(r['data']['game'])
+        return game(self._graphql("GamePage", {"id": id, "slug": slug})["game"])
 
     def load_category(self, id: str | None = None, game_id: str | None = None, slug: str | None = None) -> types.GameCategory:
-        if not id and (not all([game_id, slug])):
-            if not id and (game_id or slug):
+        if not id and not all([game_id, slug]):
+            if game_id or slug:
                 raise TypeError('Связка аргументов game_id, slug была передана не полностью')
             raise TypeError('Не был передан ни один из обязательных аргументов: id, game_id, slug')
-        headers = {'accept': '*/*'}
-        payload = {'operationName': 'GamePageCategory', 'variables': json.dumps({'id': id, 'gameId': game_id, 'slug': slug}), 'extensions': json.dumps({'persistedQuery': {'version': 1, 'sha256Hash': PERSISTED_QUERIES.get('GamePageCategory')}})}
-        r = self.request('get', f'{self.base_url}/graphql', headers, payload).json()
-        return game_category(r['data']['gameCategory'])
+        if not id:
+            game_data = self.load_game(id=game_id)
+            category = next((row for row in (game_data.categories if game_data else []) if row.slug == slug), None)
+            if category is None:
+                raise ValueError('Категория не найдена в указанной игре')
+            id = category.id
+        return game_category(self._graphql("GamePageCategory", {"id": id})["gameCategory"])
 
     def load_agreements(self, game_category_id: str, user_id: str | None = None, count: int = 24, after_cursor: str | None = None) -> types.GameCategoryAgreementList:
-        headers = {'accept': '*/*'}
-        payload = {'operationName': 'gameCategoryAgreements', 'variables': json.dumps({'pagination': {'first': count, 'after': after_cursor}, 'filter': {'gameCategoryId': game_category_id, 'userId': user_id if user_id else self.id}}), 'extensions': json.dumps({'persistedQuery': {'version': 1, 'sha256Hash': PERSISTED_QUERIES.get('gameCategoryAgreements')}})}
-        r = self.request('get', f'{self.base_url}/graphql', headers, payload).json()
-        return game_category_agreement_list(r['data']['gameCategoryAgreements'])
+        variables = {"pagination": {"first": count, "after": after_cursor},
+                     "filter": {"gameCategoryId": game_category_id, "userId": user_id or self.id}}
+        return game_category_agreement_list(self._graphql("gameCategoryAgreements", variables)["gameCategoryAgreements"])
 
     def load_obtain_types(self, game_category_id: str, count: int = 24, after_cursor: str | None = None) -> types.GameCategoryObtainingTypeList:
-        headers = {'accept': '*/*'}
-        payload = {'operationName': 'gameCategoryObtainingTypes', 'variables': json.dumps({'pagination': {'first': count, 'after': after_cursor}, 'filter': {'gameCategoryId': game_category_id}}), 'extensions': json.dumps({'persistedQuery': {'version': 1, 'sha256Hash': PERSISTED_QUERIES.get('gameCategoryObtainingTypes')}})}
-        r = self.request('get', f'{self.base_url}/graphql', headers, payload).json()
-        return game_category_obtaining_type_list(r['data']['gameCategoryObtainingTypes'])
+        variables = {"pagination": {"first": count, "after": after_cursor}, "filter": {"gameCategoryId": game_category_id}}
+        return game_category_obtaining_type_list(self._graphql("gameCategoryObtainingTypes", variables)["gameCategoryObtainingTypes"])
 
     def load_instructions(self, game_category_id: str, obtaining_type_id: str, count: int = 24, type: InstructionFor | None = None, after_cursor: str | None = None) -> types.GameCategoryInstructionList:
-        headers = {'accept': '*/*'}
-        payload = {'operationName': 'gameCategoryInstructions', 'variables': json.dumps({'pagination': {'first': count, 'after': after_cursor}, 'filter': {'gameCategoryId': game_category_id, 'obtainingTypeId': obtaining_type_id, 'type': type.name if type else None}}), 'extensions': json.dumps({'persistedQuery': {'version': 1, 'sha256Hash': PERSISTED_QUERIES.get('gameCategoryInstructions')}})}
-        r = self.request('get', f'{self.base_url}/graphql', headers, payload).json()
-        return game_category_instruction_list(r['data']['gameCategoryInstructions'])
+        variables = {"pagination": {"first": count, "after": after_cursor},
+                     "filter": {"gameCategoryId": game_category_id, "obtainingTypeId": obtaining_type_id,
+                                "type": type.name if type else None}}
+        return game_category_instruction_list(self._graphql("gameCategoryInstructions", variables)["gameCategoryInstructions"])
 
     def load_data_fields(self, game_category_id: str, obtaining_type_id: str, count: int = 24, type: FieldScope | None = None, after_cursor: str | None = None) -> types.GameCategoryDataFieldList:
-        headers = {'accept': '*/*'}
-        payload = {'operationName': 'gameCategoryDataFields', 'variables': json.dumps({'pagination': {'first': count, 'after': after_cursor}, 'filter': {'gameCategoryId': game_category_id, 'obtainingTypeId': obtaining_type_id, 'type': type.name if type else None}}), 'extensions': json.dumps({'persistedQuery': {'version': 1, 'sha256Hash': PERSISTED_QUERIES.get('gameCategoryDataFields')}})}
-        r = self.request('get', f'{self.base_url}/graphql', headers, payload).json()
-        return game_category_data_field_list(r['data']['gameCategoryDataFields'])
+        variables = {"pagination": {"first": count, "after": after_cursor},
+                     "filter": {"gameCategoryId": game_category_id, "obtainingTypeId": obtaining_type_id,
+                                "type": type.name if type else None}}
+        return game_category_data_field_list(self._graphql("gameCategoryDataFields", variables)["gameCategoryDataFields"])
 
     def load_chats(self, count: int = 24, type: RoomKind | None = None, status: RoomState | None = None, after_cursor: str | None = None) -> types.ChatList:
-        headers = {'accept': '*/*'}
-        pag: dict = {'first': count}
+        pagination: dict = {"first": count}
         if after_cursor is not None:
-            pag['after'] = after_cursor
-        flt: dict = {'userId': self.id}
+            pagination["after"] = after_cursor
+        filters: dict = {"userId": self.id}
         if type is not None:
-            flt['type'] = type.name
+            filters["type"] = type.name
         if status is not None:
-            flt['status'] = status.name
-        variables = {'pagination': pag, 'filter': flt}
-        payload = {
-            'operationName': 'userChats',
-            'variables': json.dumps(variables),
-            'extensions': json.dumps({'persistedQuery': {'version': 1, 'sha256Hash': PERSISTED_QUERIES.get('userChats')}}),
-        }
-        r = self.request('get', f'{self.base_url}/graphql', headers, payload).json()
-        return chat_list(r['data']['chats'])
+            filters["status"] = status.name
+        return chat_list(self._graphql("userChats", {"pagination": pagination, "filter": filters})["chats"])
 
     def load_chat(self, chat_id: str) -> types.Chat:
-        headers = {'accept': '*/*'}
-        payload = {
-            'operationName': 'chat',
-            'variables': json.dumps({'id': chat_id, 'hasSupportAccess': False}),
-            'extensions': json.dumps({'persistedQuery': {'version': 1, 'sha256Hash': PERSISTED_QUERIES.get('chat')}}),
-        }
-        r = self.request('get', f'{self.base_url}/graphql', headers, payload).json()
-        return chat(r['data']['chat'])
+        return chat(self._graphql("chat", {"id": chat_id, "hasSupportAccess": False})["chat"])
 
     def find_chat_by_name(self, username: str) -> types.Chat | None:
         next_cursor = None
-        seen_cursors: set[str] = set()
-        while True:
+        visited = set()
+        wanted = (username or "").lower()
+        for _ in range(MAX_PAGES):
             chats = self.load_chats(count=24, after_cursor=next_cursor)
             for chat_item in chats.chats:
-                if any((user for user in chat_item.users if user.username.lower() == username.lower())):
+                if any(user for user in chat_item.users if user and (user.username or "").lower() == wanted):
                     return chat_item
-            if not chats.page_info.has_next_page:
-                break
-            new_cursor = chats.page_info.end_cursor
-            if not new_cursor or new_cursor == next_cursor or new_cursor in seen_cursors:
-                self.logger.warning('Playerok вернул повторяющийся cursor при поиске чата %s', username)
-                break
-            seen_cursors.add(new_cursor)
-            next_cursor = new_cursor
+            if not chats.page_info or not chats.page_info.has_next_page:
+                return None
+            next_cursor = chats.page_info.end_cursor
+            if not next_cursor or next_cursor in visited:
+                raise ResponseContractError('Курсор списка чатов не сдвинулся')
+            visited.add(next_cursor)
         return None
 
-    _CHAT_MESSAGES_PAGE = 10
+    _CHAT_MESSAGES_PAGE = MESSAGE_PAGE_SIZE
 
     def _chat_messages_one_page(self, chat_id: str, pag: dict, show_forbidden: bool, method: Literal['get', 'post']) -> dict:
-        headers = {'accept': '*/*'}
-        vars_d = {
-            'pagination': pag,
-            'filter': {'chatId': chat_id},
-            'hasSupportAccess': False,
-            'showForbiddenImage': show_forbidden,
-        }
-        if method == 'post':
-            payload = {
-                'operationName': 'chatMessages',
-                'variables': vars_d,
-                'extensions': {'persistedQuery': {'version': 1, 'sha256Hash': PERSISTED_QUERIES.get('chatMessages')}},
-            }
-            return self.request('post', f'{self.base_url}/graphql', headers, payload).json()
-        payload = {
-            'operationName': 'chatMessages',
-            'variables': json.dumps(vars_d),
-            'extensions': json.dumps({'persistedQuery': {'version': 1, 'sha256Hash': PERSISTED_QUERIES.get('chatMessages')}}),
-        }
-        return self.request('get', f'{self.base_url}/graphql', headers, payload).json()
+        variables = {'pagination': pag, 'filter': {'chatId': chat_id}, 'hasSupportAccess': False,
+                     'showForbiddenImage': show_forbidden}
+        payload = {'operationName': 'chatMessages', 'variables': json.dumps(variables)}
+        return self.request('get', f'{self.base_url}/graphql', {'accept': '*/*'}, payload).json()
 
     def load_messages(self, chat_id: str, count: int = 25, after_cursor: str | None = None) -> types.ChatMessageList:
-        collected: list = []
+        if type(count) is not int or not 1 <= count <= MAX_MESSAGE_COUNT:
+            raise ValueError("Некорректное количество сообщений")
+        collected, seen_ids, visited = [], set(), {after_cursor}
         cursor = after_cursor
-        last_list: types.ChatMessageList | None = None
+        info = None
+        total = None
         while len(collected) < count:
-            batch = min(self._CHAT_MESSAGES_PAGE, count - len(collected))
-            pag: dict = {'first': batch}
+            pagination = {"first": min(MESSAGE_PAGE_SIZE, count - len(collected))}
             if cursor is not None:
-                pag['after'] = cursor
-            r = None
-            last_err: RequestFailedError | None = None
-            for method, show_forbidden in (('get', True), ('get', False), ('post', True), ('post', False)):
-                try:
-                    r = self._chat_messages_one_page(chat_id, pag, show_forbidden, method)
-                    break
-                except RequestFailedError as e:
-                    last_err = e
-                    sc = getattr(e, 'status_code', 0) or 0
-                    if sc >= 500:
-                        self.logger.debug(
-                            'chatMessages %s showForbiddenImage=%s -> HTTP %s, следующий вариант…',
-                            method,
-                            show_forbidden,
-                            sc,
-                        )
-                        continue
-                    raise
-            if r is None and last_err is not None:
-                raise last_err
-            lst = chat_message_list(r['data']['chatMessages'])
-            last_list = lst
-            collected.extend(lst.messages)
-            pi = lst.page_info
-            if not pi or not pi.has_next_page or not pi.end_cursor:
+                pagination["after"] = cursor
+            response = self._chat_messages_one_page(chat_id, pagination, True, "get")
+            page = chat_message_list(response["data"]["chatMessages"])
+            if page is None:
+                raise ResponseContractError("Playerok не вернул список сообщений")
+            total = page.total_count
+            for message in page.messages:
+                if message and message.id not in seen_ids:
+                    collected.append(message)
+                    seen_ids.add(message.id)
+            info = page.page_info
+            if not info or not info.has_next_page or len(collected) >= count:
                 break
-            cursor = pi.end_cursor
-        total = last_list.total_count if last_list else len(collected)
-        pi = last_list.page_info if last_list else None
-        return types.ChatMessageList(messages=collected[:count], page_info=pi, total_count=total)
+            cursor = info.end_cursor
+            if not cursor or cursor in visited or not page.messages:
+                raise ResponseContractError("Курсор сообщений не сдвинулся")
+            visited.add(cursor)
+        return types.ChatMessageList(collected, info, total)
 
     def read_chat(self, chat_id: str) -> types.Chat:
-        headers = {'accept': '*/*'}
-        payload = {'operationName': 'markChatAsRead', 'query': QUERIES.get('markChatAsRead'), 'variables': {'input': {'chatId': chat_id}}}
-        r = self.request('post', f'{self.base_url}/graphql', headers, payload).json()
-        return chat(r['data']['markChatAsRead'])
+        return chat(self._graphql("markChatAsRead", {"input": {"chatId": chat_id}})["markChatAsRead"])
 
     def upload_chat_image(self, photo_file_path: str, chat_id: str) -> types.TemporaryAttachmentUploadOutput:
-        headers = {'accept': '*/*'}
         operations = {
             'operationName': 'uploadChatImageIntoTemporaryStore',
-            'query': QUERIES.get('uploadChatImageIntoTemporaryStore'),
-            'variables': {
-                'file': None,
-                'input': {'chatId': chat_id, 'clientAttachmentId': str(uuid.uuid4())},
-            },
+            'variables': {'file': None, 'input': {'chatId': chat_id, 'clientAttachmentId': str(uuid.uuid4())}},
         }
         with open(photo_file_path, 'rb') as fh:
-            files = {'1': fh}
             payload = {'operations': json.dumps(operations), 'map': json.dumps({'1': ['variables.file']})}
-            r = self.request('post', f'{self.base_url}/graphql', headers, payload if files else operations, files if files else None).json()
+            r = self.request('post', f'{self.base_url}/graphql', {'accept': '*/*'}, payload, {'1': fh}).json()
         return temporary_attachment_upload_output(r['data']['uploadChatImageIntoTemporaryStore'])
 
     def send_message(self, chat_id: str, text: str | None = None, photo_file_path: str | list[str] | None = None, read_chat: bool = False) -> types.ChatMessage:
         if not text and not photo_file_path:
             raise TypeError('Не был передан ни один из обязательных аргументов: text, photo_file_path')
         if read_chat:
-            self.read_chat(chat_id=chat_id)
-        image_paths: list[str]
+            try:
+                self.read_chat(chat_id=chat_id)
+            except Exception as error:
+                self.logger.debug('markChatAsRead %s не выполнен: %s', chat_id, error)
         if photo_file_path is None:
-            image_paths = []
+            image_paths: list[str] = []
         elif isinstance(photo_file_path, str):
             image_paths = [photo_file_path]
         else:
             image_paths = list(photo_file_path)
         images_ids: list[str] = []
-        for p in image_paths:
-            uploaded = self.upload_chat_image(p, chat_id)
+        for path in image_paths:
+            uploaded = self.upload_chat_image(path, chat_id)
             if uploaded and getattr(uploaded, 'id', None):
                 images_ids.append(uploaded.id)
-        headers = {'accept': '*/*'}
-        payload = {
-            'operationName': 'createChatMessage',
-            'query': QUERIES.get('createChatMessage'),
-            'variables': {
-                'input': {'chatId': chat_id, 'imagesIds': images_ids, 'text': text or ''},
-            },
+        variables = {'input': {'chatId': chat_id, 'imagesIds': images_ids, 'text': text or ''}, 'showForbiddenImage': True}
+        return chat_message(self._graphql('createChatMessage', variables)['createChatMessage'])
+
+    def _upload_listing(self, operation, variables, paths, variable_name):
+        operations = {"operationName": operation, "variables": {**variables, variable_name: [None] * len(paths)}}
+        with ExitStack() as stack:
+            files = {str(index): stack.enter_context(open(path, "rb")) for index, path in enumerate(paths, start=1)}
+            if files:
+                mapping = {str(index): [f"variables.{variable_name}.{index - 1}"] for index in range(1, len(paths) + 1)}
+                payload = {"operations": json.dumps(operations), "map": json.dumps(mapping)}
+                response = self.request("post", f"{self.base_url}/graphql", {}, payload, files).json()
+            else:
+                response = self.request("post", f"{self.base_url}/graphql", {}, operations).json()
+        data = response["data"][operation]
+        return my_item(data) if data.get("__typename") == "MyItem" else item(data)
+
+    def new_listing(self, game_category_id: str, obtaining_type_id: str | None, name: str, price: int,
+                    description: str, options: list[GameCategoryOption] | None = None,
+                    data_fields: list[GameCategoryDataField] | None = None, attachments: list[str] | None = None,
+                    attachment_ids: list[str] | None = None, comment: str | None = None,
+                    attributes: dict | None = None) -> types.Item:
+        fields = {"gameCategoryId": game_category_id, "name": name, "price": int(price), "description": description}
+        if obtaining_type_id:
+            fields["obtainingTypeId"] = obtaining_type_id
+        if attributes is not None:
+            fields["attributes"] = attributes
+        elif options:
+            fields["attributes"] = {option.field: option.value for option in options}
+        if data_fields:
+            fields["dataFields"] = [{"fieldId": field.id, "value": field.value} for field in data_fields if field and field.value is not None]
+        if comment:
+            fields["comment"] = comment
+        if attachment_ids:
+            fields["attachmentIds"] = list(attachment_ids)
+            return self._upload_listing("createItem", {"input": fields, "showForbiddenImage": True}, [], "attachments")
+        return self._upload_listing("createItem", {"input": fields, "showForbiddenImage": True}, attachments or [], "attachments")
+
+    def edit_listing(self, id: str, name: str | None = None, price: int | None = None,
+                     description: str | None = None, options: list[GameCategoryOption] | None = None,
+                     data_fields: list[GameCategoryDataField] | None = None,
+                     remove_attachments: list[str] | None = None,
+                     add_attachments: list[str] | None = None, keep_in_sale: bool | None = None,
+                     comment: str | None = None) -> types.Item:
+        candidates = {
+            "name": name, "price": int(price) if price is not None else None,
+            "description": description, "removedAttachments": remove_attachments,
+            "attributes": {option.field: option.value for option in options} if options is not None else None,
+            "dataFields": [{"fieldId": field.id, "value": field.value} for field in data_fields] if data_fields is not None else None,
+            "keepInSale": keep_in_sale, "comment": comment,
         }
-        r = self.request('post', f'{self.base_url}/graphql', headers, payload).json()
-        return chat_message(r['data']['createChatMessage'])
+        fields = {"id": id, **{key: value for key, value in candidates.items() if value is not None}}
+        return self._upload_listing("updateItem", {"input": fields, "showForbiddenImage": True}, add_attachments or [], "addedAttachments")
 
-    def new_listing(self, game_category_id: str, obtaining_type_id: str, name: str, price: int, description: str, options: list[GameCategoryOption], data_fields: list[GameCategoryDataField], attachments: list[str]) -> types.Item:
-        payload_attributes = {option.field: option.value for option in options}
-        payload_data_fields = [{'fieldId': field.id, 'value': field.value} for field in data_fields]
-        headers = {'accept': '*/*'}
-        operations = {'operationName': 'createItem', 'query': QUERIES.get('createItem'), 'variables': {'input': {'gameCategoryId': game_category_id, 'obtainingTypeId': obtaining_type_id, 'name': name, 'price': int(price), 'description': description, 'attributes': payload_attributes, 'dataFields': payload_data_fields}, 'attachments': [None] * len(attachments)}}
-        map_data = {}
-        with ExitStack() as stack:
-            files = {}
-            for i, att in enumerate(attachments, start=1):
-                map_data[str(i)] = [f'variables.attachments.{i - 1}']
-                files[str(i)] = stack.enter_context(open(att, 'rb'))
-            payload = {'operations': json.dumps(operations), 'map': json.dumps(map_data)}
-            r = self.request('post', f'{self.base_url}/graphql', headers, payload if files else operations, files if files else None).json()
-        return item(r['data']['createItem'])
+    def set_keep_in_sale(self, item_id: str, keep_in_sale: bool) -> types.Item:
+        return self.edit_listing(item_id, keep_in_sale=bool(keep_in_sale))
 
-    def edit_listing(self, id: str, name: str | None = None, price: int | None = None, description: str | None = None, options: list[GameCategoryOption] | None = None, data_fields: list[GameCategoryDataField] | None = None, remove_attachments: list[str] | None = None, add_attachments: list[str] | None = None) -> types.Item:
-        payload_attributes = {option.field: option.value for option in options} if options is not None else None
-        payload_data_fields = [{'fieldId': field.id, 'value': field.value} for field in data_fields] if data_fields is not None else None
-        headers = {'accept': '*/*'}
-        operations = {'operationName': 'updateItem', 'query': QUERIES.get('updateItem'), 'variables': {'input': {'id': id}, 'addedAttachments': [None] * len(add_attachments) if add_attachments else None}}
-        if name is not None:
-            operations['variables']['input']['name'] = name
-        if price is not None:
-            operations['variables']['input']['price'] = int(price)
-        if description is not None:
-            operations['variables']['input']['description'] = description
-        if options is not None:
-            operations['variables']['input']['attributes'] = payload_attributes
-        if data_fields is not None:
-            operations['variables']['input']['dataFields'] = payload_data_fields
-        if remove_attachments is not None:
-            operations['variables']['input']['removedAttachments'] = remove_attachments
-        map_data = {}
-        with ExitStack() as stack:
-            files = {}
-            if add_attachments:
-                for i, att in enumerate(add_attachments, start=1):
-                    map_data[str(i)] = [f'variables.addedAttachments.{i - 1}']
-                    files[str(i)] = stack.enter_context(open(att, 'rb'))
-            payload = {'operations': json.dumps(operations), 'map': json.dumps(map_data)}
-            r = self.request('post', f'{self.base_url}/graphql', headers, payload if files else operations, files if files else None).json()
-        return item(r['data']['updateItem'])
+    def download_attachment(self, url: str, folder: str) -> str:
+        parsed = urlparse(url or "")
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme != "https" or not (host == "playerok.com" or host.endswith(".playerok.com")):
+            raise ValueError("Картинка лота размещена не на playerok.com")
+        headers = {"user-agent": self.user_agent, "accept": "image/avif,image/webp,image/*,*/*;q=0.8",
+                   "referer": f"{ORIGIN}/"}
+        response = self._thread_session().get(url, headers=headers, timeout=self._timeout,
+                                              allow_redirects=False, discard_cookies=True)
+        if response.status_code != 200:
+            raise RequestFailedError(response)
+        content = response.content or b""
+        kind = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
+        if not kind.startswith("image/") or not content or len(content) > MAX_ATTACHMENT_BYTES:
+            raise ValueError("Не удалось скачать картинку лота")
+        path = os.path.join(folder, f"{uuid.uuid4().hex}{mimetypes.guess_extension(kind) or '.jpg'}")
+        with open(path, "wb") as handle:
+            handle.write(content)
+        return path
+
+    def clone_listing(self, source: types.MyItem | types.Item, price: int | None = None, name: str | None = None,
+                      obtaining_type_id: str | None = None) -> types.Item:
+        category = getattr(source, "category", None)
+        obtaining = getattr(source, "obtaining_type", None)
+        if category is None or not category.id:
+            raise ValueError("У исходного лота нет категории")
+        source_type = obtaining.id if obtaining else None
+        target_type = obtaining_type_id or source_type
+        urls = [file.url for file in (getattr(source, "attachments", None) or []) if file and file.url]
+        if not urls:
+            raise ValueError("У исходного лота нет картинок, а без них Playerok не создаст лот")
+        same_type = target_type == source_type
+        data_fields = [field for field in (getattr(source, "data_fields", None) or []) if field and field.value] if same_type else []
+        with tempfile.TemporaryDirectory(prefix="pok-clone-") as folder:
+            paths = [self.download_attachment(url, folder) for url in urls[:MAX_CLONE_ATTACHMENTS]]
+            return self.new_listing(
+                game_category_id=category.id,
+                obtaining_type_id=target_type,
+                name=name or source.name,
+                price=int(price if price is not None else (getattr(source, "raw_price", None) or source.price)),
+                description=getattr(source, "description", "") or "",
+                data_fields=data_fields,
+                attachments=paths,
+                comment=getattr(source, "comment", None),
+                attributes=getattr(source, "attributes", None) or None,
+            )
 
     def delete_listing(self, id: str) -> bool:
-        headers = {'accept': '*/*'}
-        payload = {'operationName': 'removeItem', 'query': QUERIES.get('removeItem'), 'variables': {'id': id}}
-        self.request('post', f'{self.base_url}/graphql', headers, payload)
+        self._graphql("removeItem", {"id": id, "showForbiddenImage": True})
         return True
 
-    def activate_listing(self, item_id: str, priority_status_id: str | None = None, transaction_provider_id: PayGateway = PayGateway.LOCAL) -> types.Item:
-        headers = {'accept': '*/*'}
+    def activate_listing(self, item_id: str, priority_status_id: str | None = None,
+                         transaction_provider_id: PayGateway = PayGateway.LOCAL,
+                         keep_in_sale: bool | None = None) -> types.Item:
         statuses = [priority_status_id] if priority_status_id else []
-        payload = {'operationName': 'publishItem', 'query': QUERIES.get('publishItem'), 'variables': {'input': {'transactionProviderId': transaction_provider_id.name, 'priorityStatuses': statuses, 'itemId': item_id}}}
-        r = self.request('post', f'{self.base_url}/graphql', headers, payload).json()
-        return item(r['data']['publishItem'])
+        payload = {"itemId": item_id, "priorityStatuses": statuses, "transactionProviderId": transaction_provider_id.name}
+        if keep_in_sale is not None:
+            payload["keepInSale"] = bool(keep_in_sale)
+        return item(self._graphql("publishItem", {"input": payload, "showForbiddenImage": True})["publishItem"])
 
     def load_listings(self, game_id: str | None = None, category_id: str | None = None, count: int = 24, status: ListingStage = ListingStage.APPROVED, after_cursor: str | None = None) -> types.ItemProfileList:
         if not any([game_id, category_id]):
             raise TypeError('Не был передан ни один из обязательных аргументов: game_id, category_id')
-        headers = {'accept': '*/*'}
-        filter_data = {'gameId': game_id, 'status': [status.name] if status else None} if not category_id else {'gameCategoryId': category_id, 'status': [status.name] if status else None}
-        payload = {'operationName': 'items', 'variables': json.dumps({'pagination': {'first': count, 'after': after_cursor}, 'filter': filter_data}), 'extensions': json.dumps({'persistedQuery': {'version': 1, 'sha256Hash': PERSISTED_QUERIES.get('items')}})}
-        r = self.request('get', f'{self.base_url}/graphql', headers, payload).json()
-        return item_profile_list(r['data']['items'])
+        filters = {'gameCategoryId': category_id} if category_id else {'gameId': game_id}
+        filters['status'] = [status.name] if status else None
+        variables = {'pagination': {'first': count, 'after': after_cursor}, 'filter': filters, 'showForbiddenImage': True}
+        return item_profile_list(self._graphql('items', variables)['items'])
 
-    def load_listing(self, id: str | None = None, slug: str | None = None) -> types.MyItem | types.Item | types.ItemProfile:
+    def load_my_items(self, statuses: list[ListingStage] | None = None, count: int = 24, after_cursor: str | None = None) -> types.ItemProfileList:
+        filters = {'userId': self.id}
+        if statuses:
+            filters['status'] = [status.name for status in statuses]
+        variables = {'pagination': {'first': count, 'after': after_cursor}, 'filter': filters, 'showForbiddenImage': True}
+        return item_profile_list(self._graphql('items', variables)['items'])
+
+    def iter_my_items(self, statuses: list[ListingStage] | None = None, page_size: int = 24) -> Iterator[types.ItemProfile]:
+        cursor, visited = None, set()
+        for _ in range(MAX_PAGES):
+            page = self.load_my_items(statuses=statuses, count=page_size, after_cursor=cursor)
+            if page is None:
+                return
+            for entry in page.items:
+                if entry is not None:
+                    yield entry
+            info = page.page_info
+            if not info or not info.has_next_page:
+                return
+            cursor = info.end_cursor
+            if not cursor or cursor in visited:
+                raise ResponseContractError('Курсор списка лотов не сдвинулся')
+            visited.add(cursor)
+
+    def load_listing(self, id: str | None = None, slug: str | None = None) -> types.MyItem | types.Item | types.ItemProfile | None:
         if not any([id, slug]):
             raise TypeError('Не был передан ни один из обязательных аргументов: id, slug')
-        headers = {'accept': '*/*'}
-        payload = {'operationName': 'item', 'variables': json.dumps({'id': id, 'slug': slug, 'hasSupportAccess': False, 'showForbiddenImage': True}), 'extensions': json.dumps({'persistedQuery': {'version': 1, 'sha256Hash': PERSISTED_QUERIES.get('item')}})}
-        r = self.request('get', f'{self.base_url}/graphql', headers, payload).json()
-        data: dict = r['data']['item']
-        if data['__typename'] == 'MyItem':
-            _item = my_item(data)
-        elif data['__typename'] == 'ItemProfile':
-            _item = item_profile(data)
-        elif data['__typename'] in ['Item', 'ForeignItem']:
-            _item = item(data)
-        else:
-            _item = None
-        return _item
+        try:
+            data = self._graphql('item', {'id': id, 'slug': slug, 'hasSupportAccess': False, 'showForbiddenImage': True})['item']
+        except RequestApiError as error:
+            if error.error_code == 'NOT_FOUND':
+                return None
+            raise
+        if data is None:
+            return None
+        kind = data.get('__typename')
+        if kind == 'MyItem':
+            return my_item(data)
+        if kind in ('ItemProfile', 'MyItemProfile', 'ForeignItemProfile'):
+            return item_profile(data)
+        if kind in ('Item', 'ForeignItem'):
+            return item(data)
+        return None
 
     def load_boost_tiers(self, item_id: str, item_price: int) -> list[types.ItemPriorityStatus]:
-        headers = {'accept': '*/*'}
-        price = int(item_price)
-        payload = {'operationName': 'itemPriorityStatuses', 'variables': json.dumps({'itemId': item_id, 'price': price}), 'extensions': json.dumps({'persistedQuery': {'version': 1, 'sha256Hash': PERSISTED_QUERIES.get('itemPriorityStatuses')}})}
-        resp = self.request('get', f'{self.base_url}/graphql', headers, payload).json()
-        tiers_raw = resp.get('data', {}).get('itemPriorityStatuses', [])
-        self.logger.debug('itemPriorityStatuses[itemId=%s price=%s] → %s', item_id, price, tiers_raw)
-        return [item_priority_status(r) if isinstance(r, dict) else r for r in tiers_raw]
+        data = self._graphql('itemPriorityStatuses', {'itemId': item_id, 'price': int(item_price)})
+        rows = data.get('itemPriorityStatuses') or []
+        return [item_priority_status(row) for row in rows if isinstance(row, dict)]
 
-    def apply_boost(self, item_id: str, priority_status_id: str, payment_method_id: PayMethod | None = None, transaction_provider_id: PayGateway = PayGateway.LOCAL) -> types.Item:
-        headers = {'accept': '*/*'}
-        payload = {'operationName': 'increaseItemPriorityStatus', 'query': QUERIES.get('increaseItemPriorityStatus'), 'variables': {'input': {'itemId': item_id, 'priorityStatuses': [priority_status_id], 'transactionProviderData': {'paymentMethodId': payment_method_id.name if payment_method_id else None}, 'transactionProviderId': transaction_provider_id.name}}}
-        r = self.request('post', f'{self.base_url}/graphql', headers, payload).json()
-        return item(r['data']['increaseItemPriorityStatus'])
+    def apply_boost(self, item_id: str, priority_status_id: str, payment_method_id: PayMethod | None = None,
+                    transaction_provider_id: PayGateway = PayGateway.LOCAL,
+                    keep_in_sale: bool | None = None) -> types.Item:
+        payload = {'itemId': item_id, 'priorityStatuses': [priority_status_id],
+                   'transactionProviderId': transaction_provider_id.name}
+        if payment_method_id:
+            payload['transactionProviderData'] = {'paymentMethodId': payment_method_id.name}
+        if keep_in_sale is not None:
+            payload['keepInSale'] = bool(keep_in_sale)
+        data = self._graphql('increaseItemPriorityStatus', {'input': payload, 'showForbiddenImage': True})
+        return item(data['increaseItemPriorityStatus'])
 
     def load_providers(self, direction: TxDirection = TxDirection.IN) -> list[types.TransactionProvider]:
-        headers = {'accept': '*/*'}
-        payload = {'operationName': 'transactionProviders', 'variables': json.dumps({'filter': {'direction': direction.name if direction else None}}), 'extensions': json.dumps({'persistedQuery': {'version': 1, 'sha256Hash': PERSISTED_QUERIES.get('transactionProviders')}})}
-        r = self.request('get', f'{self.base_url}/graphql', headers, payload).json()
-        return [transaction_provider(provider) for provider in r['data']['transactionProviders']]
+        data = self._graphql('transactionProviders', {'filter': {'direction': direction.name if direction else None}})
+        return [transaction_provider(provider) for provider in data['transactionProviders'] or []]
 
     def load_txs(self, count: int = 24, operation: TxKind | None = None, min_value: int | None = None, max_value: int | None = None, provider_id: PayGateway | None = None, status: TxStage | None = None, after_cursor: str | None = None) -> TransactionList:
-        headers = {'accept': '*/*'}
-        payload = {'operationName': 'transactions', 'variables': {'pagination': {'first': count, 'after': after_cursor}, 'filter': {'userId': self.id}, 'hasSupportAccess': False}, 'extensions': {'persistedQuery': {'version': 1, 'sha256Hash': PERSISTED_QUERIES.get('transactions')}}}
+        filters: dict = {'userId': self.id}
         if operation:
-            payload['variables']['filter']['operation'] = [operation.name]
+            filters['operation'] = [operation.name]
         if min_value is not None or max_value is not None:
-            payload['variables']['filter']['value'] = {}
+            filters['value'] = {}
             if min_value is not None:
-                payload['variables']['filter']['value']['min'] = str(min_value)
+                filters['value']['min'] = str(min_value)
             if max_value is not None:
-                payload['variables']['filter']['value']['max'] = str(max_value)
+                filters['value']['max'] = str(max_value)
         if provider_id:
-            payload['variables']['filter']['providerId'] = [provider_id.name]
+            filters['providerId'] = [provider_id.name]
         if status:
-            payload['variables']['filter']['status'] = [status.name]
-        payload['variables'] = json.dumps(payload['variables'])
-        payload['extensions'] = json.dumps(payload['extensions'])
-        r = self.request('get', f'{self.base_url}/graphql', headers, payload).json()
-        return transaction_list(r['data']['transactions'])
+            filters['status'] = [status.name]
+        variables = {'pagination': {'first': count, 'after': after_cursor}, 'filter': filters, 'hasSupportAccess': False}
+        return transaction_list(self._graphql('transactions', variables)['transactions'])
 
     def cancel_tx(self, transaction_id: str) -> types.Transaction:
-        headers = {'accept': '*/*'}
-        payload = {'operationName': 'removeTransaction', 'query': QUERIES.get('removeTransaction'), 'variables': {'id': transaction_id}}
-        r = self.request('post', f'{self.base_url}/graphql', headers, payload).json()
-        return transaction(r['data']['removeTransaction'])
+        return transaction(self._graphql('removeTransaction', {'id': transaction_id})['removeTransaction'])

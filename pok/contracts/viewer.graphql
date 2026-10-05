@@ -1,0 +1,49 @@
+query viewer {
+  viewer {
+    ...Viewer
+    __typename
+  }
+}
+
+fragment Viewer on User {
+  id
+  username
+  email
+  role
+  hasFrozenBalance
+  supportChatId
+  systemChatId
+  unreadChatsCounter
+  isBlocked
+  isBlockedFor
+  isFundsProtectionActive
+  isVerified
+  createdAt
+  lastItemCreatedAt
+  hasConfirmedPhoneNumber
+  canPublishItems
+  chosenVerifiedCard {
+    ...MinimalUserBankCard
+    __typename
+  }
+  balance {
+    value
+    __typename
+  }
+  profile {
+    id
+    avatarURL
+    testimonialCounter
+    __typename
+  }
+  __typename
+}
+
+fragment MinimalUserBankCard on UserBankCard {
+  id
+  cardFirstSix
+  cardLastFour
+  cardType
+  isChosen
+  __typename
+}

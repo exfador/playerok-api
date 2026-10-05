@@ -20,7 +20,7 @@ logger = logging.getLogger('cxh.updater.apply')
 _PRESERVE = {
     '.git', '.github', '.venv', 'venv', '.idea', '.vscode', 'node_modules',
     '__pycache__',
-    'conf', 'db', 'logs',
+    'conf', 'db', 'logs', 'ext',
     'requirements.txt.local',
     'cookies.json', 'config.json',
 }

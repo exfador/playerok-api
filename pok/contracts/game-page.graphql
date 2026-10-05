@@ -1,0 +1,43 @@
+query GamePage($id: UUID, $slug: String) {
+  game(id: $id, slug: $slug) {
+    ...GamePageFragment
+    __typename
+  }
+}
+
+fragment GamePageFragment on Game {
+  id
+  slug
+  name
+  type
+  isNew
+  logo {
+    ...RegularFile
+    __typename
+  }
+  banner {
+    ...RegularFile
+    __typename
+  }
+  categories {
+    ...MinimalGameCategory
+    __typename
+  }
+  createdAt
+  __typename
+}
+
+fragment RegularFile on File {
+  id
+  url
+  filename
+  mime
+  __typename
+}
+
+fragment MinimalGameCategory on GameCategory {
+  id
+  slug
+  name
+  __typename
+}

@@ -1,0 +1,264 @@
+mutation updateItem($input: UpdateItemInput!, $addedAttachments: [Upload!], $showForbiddenImage: Boolean) {
+  updateItem(input: $input, addedAttachments: $addedAttachments) {
+    ...RegularItem
+    __typename
+  }
+}
+
+fragment RegularItem on Item {
+  ...RegularMyItem
+  ...RegularForeignItem
+  __typename
+}
+
+fragment RegularMyItem on MyItem {
+  ...ItemFields
+  prevPrice
+  priority
+  sequence
+  priorityPrice
+  statusExpirationDate
+  comment
+  viewsCounter
+  dealsCounter
+  pauseAvailable
+  republishAvailable
+  keepInSaleAvailable
+  keepInSale
+  statusDescription
+  editable
+  statusPayment {
+    ...StatusPaymentTransaction
+    __typename
+  }
+  moderator {
+    id
+    username
+    __typename
+  }
+  approvalDate
+  deletedAt
+  createdAt
+  updatedAt
+  mayBePublished
+  keepInSale
+  keepInSaleAvailable
+  prevFeeMultiplier
+  sellerNotifiedAboutFeeChange
+  postModerationCheckedAt
+  __typename
+}
+
+fragment RegularForeignItem on ForeignItem {
+  ...ItemFields
+  postModerationCheckedAt
+  __typename
+}
+
+fragment ItemFields on Item {
+  id
+  slug
+  name
+  description
+  rawPrice
+  price
+  attributes
+  status
+  priorityPosition
+  sellerType
+  feeMultiplier
+  user {
+    ...ItemUser
+    __typename
+  }
+  buyer {
+    ...ItemUser
+    __typename
+  }
+  attachments(showForbiddenImage: $showForbiddenImage) {
+    ...PartialFile
+    __typename
+  }
+  isAutomated
+  isAttachmentsForbidden
+  category {
+    ...RegularGameCategory
+    __typename
+  }
+  game {
+    ...RegularGameProfile
+    __typename
+  }
+  comment
+  dataFields {
+    ...GameCategoryDataFieldWithValue
+    __typename
+  }
+  obtainingType {
+    ...GameCategoryObtainingType
+    __typename
+  }
+  __typename
+}
+
+fragment StatusPaymentTransaction on Transaction {
+  id
+  operation
+  direction
+  providerId
+  status
+  statusDescription
+  statusExpirationDate
+  value
+  props {
+    paymentURL
+    __typename
+  }
+  __typename
+}
+
+fragment ItemUser on UserFragment {
+  ...UserEdgeNode
+  __typename
+}
+
+fragment PartialFile on File {
+  id
+  url
+  __typename
+}
+
+fragment RegularGameCategory on GameCategory {
+  id
+  slug
+  name
+  categoryId
+  gameId
+  obtaining
+  options {
+    ...RegularGameCategoryOption
+    __typename
+  }
+  props {
+    ...GameCategoryProps
+    __typename
+  }
+  noCommentFromBuyer
+  instructionForBuyer
+  instructionForSeller
+  useCustomObtaining
+  autoConfirmPeriod
+  autoModerationMode
+  agreements {
+    ...RegularGameCategoryAgreement
+    __typename
+  }
+  feeMultiplier
+  __typename
+}
+
+fragment RegularGameProfile on GameProfile {
+  id
+  name
+  type
+  slug
+  logo {
+    ...PartialFile
+    __typename
+  }
+  __typename
+}
+
+fragment GameCategoryDataFieldWithValue on GameCategoryDataFieldWithValue {
+  id
+  label
+  type
+  inputType
+  copyable
+  hidden
+  required
+  value
+  __typename
+}
+
+fragment GameCategoryObtainingType on GameCategoryObtainingType {
+  id
+  name
+  stockType
+  description
+  gameCategoryId
+  noCommentFromBuyer
+  instructionForBuyer
+  instructionForSeller
+  sequence
+  feeMultiplier
+  agreements {
+    ...MinimalGameCategoryAgreement
+    __typename
+  }
+  props {
+    minTestimonialsForSeller
+    __typename
+  }
+  __typename
+}
+
+fragment UserEdgeNode on UserFragment {
+  ...RegularUserFragment
+  __typename
+}
+
+fragment RegularGameCategoryOption on GameCategoryOption {
+  id
+  group
+  label
+  type
+  field
+  value
+  valueRangeLimit {
+    min
+    max
+    __typename
+  }
+  multiple
+  __typename
+}
+
+fragment GameCategoryProps on GameCategoryPropsObjectType {
+  minTestimonials
+  minTestimonialsForSeller
+  __typename
+}
+
+fragment RegularGameCategoryAgreement on GameCategoryAgreement {
+  description
+  gameCategoryId
+  gameCategoryObtainingTypeId
+  iconType
+  id
+  sequence
+  __typename
+}
+
+fragment MinimalGameCategoryAgreement on GameCategoryAgreement {
+  description
+  iconType
+  id
+  sequence
+  __typename
+}
+
+fragment RegularUserFragment on UserFragment {
+  id
+  username
+  role
+  avatarURL
+  isOnline
+  isBlocked
+  rating
+  testimonialCounter
+  createdAt
+  supportChatId
+  systemChatId
+  __typename
+}

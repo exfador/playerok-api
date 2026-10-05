@@ -1,0 +1,104 @@
+query deals($pagination: Pagination, $filter: ItemDealFilter!, $sort: Sort, $showForbiddenImage: Boolean) {
+  deals(pagination: $pagination, filter: $filter, sort: $sort) {
+    edges {
+      ...ItemDealEdgeFields
+      __typename
+    }
+    pageInfo {
+      startCursor
+      endCursor
+      hasPreviousPage
+      hasNextPage
+      __typename
+    }
+    totalCount
+    __typename
+  }
+}
+
+fragment ItemDealEdgeFields on ItemDealEdge {
+  cursor
+  node {
+    ...ItemDealEdgeNodeFields
+    __typename
+  }
+  __typename
+}
+
+fragment ItemDealEdgeNodeFields on ItemDeal {
+  ...PartialItemDeal
+  __typename
+}
+
+fragment PartialItemDeal on ItemDeal {
+  id
+  status
+  direction
+  statusDescription
+  hasProblem
+  props {
+    ...ItemDealProps
+    __typename
+  }
+  user {
+    ...RegularUserFragment
+    __typename
+  }
+  item {
+    id
+    slug
+    name
+    price
+    rawPrice
+    attachments(showForbiddenImage: $showForbiddenImage) {
+      ...PartialFile
+      __typename
+    }
+    isAttachmentsForbidden
+    user {
+      ...RegularUserFragment
+      __typename
+    }
+    __typename
+  }
+  testimonial {
+    id
+    rating
+    __typename
+  }
+  isAutomated
+  __typename
+}
+
+fragment ItemDealProps on ItemDealProps {
+  autoConfirmPeriod
+  confirmationRestriction
+  confirmationRestrictionTexts {
+    sellerDealSubtitle
+    buyerDealSubtitle
+    buyerTimerText
+    __typename
+  }
+  __typename
+}
+
+fragment RegularUserFragment on UserFragment {
+  id
+  username
+  role
+  avatarURL
+  isOnline
+  isBlocked
+  rating
+  testimonialCounter
+  createdAt
+  supportChatId
+  systemChatId
+  __typename
+}
+
+fragment PartialFile on File {
+  id
+  url
+  __typename
+}

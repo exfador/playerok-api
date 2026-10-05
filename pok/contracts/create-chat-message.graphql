@@ -1,0 +1,554 @@
+mutation createChatMessage($input: CreateChatMessageInput!, $file: Upload, $showForbiddenImage: Boolean) {
+  createChatMessage(input: $input, file: $file) {
+    ...RegularChatMessage
+    __typename
+  }
+}
+
+fragment RegularChatMessage on ChatMessage {
+  id
+  text
+  createdAt
+  deletedAt
+  isRead
+  isEdited
+  isSuspicious
+  isBulkMessaging
+  game {
+    ...RegularGameProfile
+    __typename
+  }
+  file {
+    ...PartialFile
+    __typename
+  }
+  user {
+    ...ChatMessageUserFields
+    __typename
+  }
+  deal {
+    ...ChatMessageItemDeal
+    __typename
+  }
+  item {
+    ...ItemEdgeNode
+    __typename
+  }
+  transaction {
+    ...RegularTransaction
+    __typename
+  }
+  moderator {
+    ...UserEdgeNode
+    __typename
+  }
+  eventByUser {
+    ...ChatMessageUserFields
+    __typename
+  }
+  eventToUser {
+    ...ChatMessageUserFields
+    __typename
+  }
+  isAutoResponse
+  event
+  buttons {
+    ...ChatMessageButton
+    __typename
+  }
+  images {
+    ...RegularFile
+    __typename
+  }
+  imageLinks
+  uncensorInfo {
+    count
+    lastEvent {
+      username
+      createdAt
+      __typename
+    }
+    __typename
+  }
+  plTokenAmount
+  __typename
+}
+
+fragment RegularGameProfile on GameProfile {
+  id
+  name
+  type
+  slug
+  logo {
+    ...PartialFile
+    __typename
+  }
+  __typename
+}
+
+fragment PartialFile on File {
+  id
+  url
+  __typename
+}
+
+fragment ChatMessageUserFields on UserFragment {
+  ...UserEdgeNode
+  __typename
+}
+
+fragment ChatMessageItemDeal on ItemDeal {
+  id
+  direction
+  status
+  statusDescription
+  hasProblem
+  props {
+    ...ItemDealProps
+    __typename
+  }
+  user {
+    ...ChatParticipant
+    __typename
+  }
+  testimonial {
+    ...ChatMessageDealTestimonial
+    __typename
+  }
+  item {
+    id
+    name
+    price
+    slug
+    rawPrice
+    sellerType
+    user {
+      ...ChatParticipant
+      __typename
+    }
+    category {
+      id
+      __typename
+    }
+    attachments(showForbiddenImage: $showForbiddenImage) {
+      ...PartialFile
+      __typename
+    }
+    isAttachmentsForbidden
+    comment
+    dataFields {
+      ...GameCategoryDataFieldWithValue
+      __typename
+    }
+    obtainingType {
+      ...GameCategoryObtainingType
+      __typename
+    }
+    __typename
+  }
+  obtainingFields {
+    ...GameCategoryDataFieldWithValue
+    __typename
+  }
+  automationObtainingFields {
+    ...ItemDealAutomationObtainingField
+    __typename
+  }
+  chat {
+    id
+    type
+    __typename
+  }
+  transaction {
+    id
+    statusExpirationDate
+    __typename
+  }
+  statusExpirationDate
+  commentFromBuyer
+  gameCategoryWarnings {
+    ...ItemDealWarningFragment
+    __typename
+  }
+  obtainingTypeWarnings {
+    ...ItemDealWarningFragment
+    __typename
+  }
+  __typename
+}
+
+fragment ItemEdgeNode on ItemProfile {
+  ...MyItemEdgeNode
+  ...ForeignItemEdgeNode
+  __typename
+}
+
+fragment RegularTransaction on Transaction {
+  id
+  operation
+  direction
+  providerId
+  provider {
+    ...RegularTransactionProvider
+    __typename
+  }
+  user {
+    ...RegularUserFragment
+    __typename
+  }
+  creator {
+    ...RegularUserFragment
+    __typename
+  }
+  status
+  statusDescription
+  statusExpirationDate
+  value
+  fee
+  createdAt
+  props {
+    ...RegularTransactionProps
+    __typename
+  }
+  verifiedAt
+  verifiedBy {
+    ...UserEdgeNode
+    __typename
+  }
+  completedBy {
+    ...UserEdgeNode
+    __typename
+  }
+  paymentMethodId
+  completedAt
+  isSuspicious
+  spbBankName
+  autoClaimedAt
+  __typename
+}
+
+fragment UserEdgeNode on UserFragment {
+  ...RegularUserFragment
+  __typename
+}
+
+fragment ChatMessageButton on ChatMessageButton {
+  type
+  url
+  text
+  __typename
+}
+
+fragment RegularFile on File {
+  id
+  url
+  filename
+  mime
+  __typename
+}
+
+fragment ItemDealProps on ItemDealProps {
+  autoConfirmPeriod
+  confirmationRestriction
+  confirmationRestrictionTexts {
+    sellerDealSubtitle
+    buyerDealSubtitle
+    buyerTimerText
+    __typename
+  }
+  __typename
+}
+
+fragment ChatParticipant on UserFragment {
+  ...RegularUserFragment
+  __typename
+}
+
+fragment ChatMessageDealTestimonial on Testimonial {
+  id
+  status
+  text
+  rating
+  createdAt
+  updatedAt
+  creator {
+    ...RegularUserFragment
+    __typename
+  }
+  moderator {
+    ...RegularUserFragment
+    __typename
+  }
+  user {
+    ...RegularUserFragment
+    __typename
+  }
+  __typename
+}
+
+fragment GameCategoryDataFieldWithValue on GameCategoryDataFieldWithValue {
+  id
+  label
+  type
+  inputType
+  copyable
+  hidden
+  required
+  value
+  __typename
+}
+
+fragment GameCategoryObtainingType on GameCategoryObtainingType {
+  id
+  name
+  stockType
+  description
+  gameCategoryId
+  noCommentFromBuyer
+  instructionForBuyer
+  instructionForSeller
+  sequence
+  feeMultiplier
+  agreements {
+    ...MinimalGameCategoryAgreement
+    __typename
+  }
+  props {
+    minTestimonialsForSeller
+    __typename
+  }
+  __typename
+}
+
+fragment ItemDealAutomationObtainingField on AutomationObtainingFieldItemDeals {
+  code
+  value
+  name
+  __typename
+}
+
+fragment ItemDealWarningFragment on ItemDealWarning {
+  id
+  status
+  title
+  text
+  __typename
+}
+
+fragment MyItemEdgeNode on MyItemProfile {
+  id
+  slug
+  priority
+  status
+  name
+  price
+  rawPrice
+  statusExpirationDate
+  sellerType
+  attachment(showForbiddenImage: $showForbiddenImage) {
+    ...PartialFile
+    __typename
+  }
+  isAttachmentsForbidden
+  user {
+    ...UserItemEdgeNode
+    __typename
+  }
+  game {
+    name
+    __typename
+  }
+  category {
+    name
+    __typename
+  }
+  approvalDate
+  createdAt
+  priorityPosition
+  viewsCounter
+  dealsCounter
+  keepInSale
+  feeMultiplier
+  isAutomated
+  __typename
+}
+
+fragment ForeignItemEdgeNode on ForeignItemProfile {
+  id
+  slug
+  priority
+  status
+  name
+  price
+  rawPrice
+  sellerType
+  attachment(showForbiddenImage: $showForbiddenImage) {
+    ...PartialFile
+    __typename
+  }
+  isAttachmentsForbidden
+  user {
+    ...UserItemEdgeNode
+    __typename
+  }
+  game {
+    name
+    __typename
+  }
+  category {
+    name
+    __typename
+  }
+  approvalDate
+  priorityPosition
+  createdAt
+  viewsCounter
+  dealsCounter
+  feeMultiplier
+  isAutomated
+  __typename
+}
+
+fragment RegularTransactionProvider on TransactionProvider {
+  id
+  name
+  fee
+  minFeeAmount
+  description
+  account {
+    ...RegularTransactionProviderAccount
+    __typename
+  }
+  props {
+    ...TransactionProviderPropsFragment
+    __typename
+  }
+  limits {
+    ...ProviderLimits
+    __typename
+  }
+  paymentMethods {
+    ...TransactionPaymentMethod
+    __typename
+  }
+  __typename
+}
+
+fragment RegularUserFragment on UserFragment {
+  id
+  username
+  role
+  avatarURL
+  isOnline
+  isBlocked
+  rating
+  testimonialCounter
+  createdAt
+  supportChatId
+  systemChatId
+  __typename
+}
+
+fragment RegularTransactionProps on TransactionPropsFragment {
+  creatorId
+  dealId
+  paidFromPendingIncome
+  paymentURL
+  successURL
+  fee
+  paymentAccount {
+    id
+    value
+    __typename
+  }
+  paymentGateway
+  alreadySpent
+  exchangeRate
+  amountAfterConversionRub
+  amountAfterConversionUsdt
+  fragmentUsername
+  userData {
+    account
+    email
+    ipAddress
+    phoneNumber
+    __typename
+  }
+  __typename
+}
+
+fragment MinimalGameCategoryAgreement on GameCategoryAgreement {
+  description
+  iconType
+  id
+  sequence
+  __typename
+}
+
+fragment UserItemEdgeNode on UserFragment {
+  ...UserEdgeNode
+  __typename
+}
+
+fragment RegularTransactionProviderAccount on TransactionProviderAccount {
+  id
+  value
+  userId
+  providerId
+  paymentMethodId
+  __typename
+}
+
+fragment TransactionProviderPropsFragment on TransactionProviderPropsFragment {
+  requiredUserData {
+    ...TransactionProviderRequiredUserData
+    __typename
+  }
+  tooltip
+  __typename
+}
+
+fragment ProviderLimits on ProviderLimits {
+  incoming {
+    ...ProviderLimitRange
+    __typename
+  }
+  outgoing {
+    ...ProviderLimitRange
+    __typename
+  }
+  __typename
+}
+
+fragment TransactionPaymentMethod on TransactionPaymentMethod {
+  id
+  name
+  fee
+  providerId
+  account {
+    ...RegularTransactionProviderAccount
+    __typename
+  }
+  props {
+    ...TransactionProviderPropsFragment
+    __typename
+  }
+  limits {
+    ...ProviderLimits
+    __typename
+  }
+  __typename
+}
+
+fragment TransactionProviderRequiredUserData on TransactionProviderRequiredUserData {
+  email
+  phoneNumber
+  eripAccountNumber
+  __typename
+}
+
+fragment ProviderLimitRange on ProviderLimitRange {
+  min
+  max
+  __typename
+}

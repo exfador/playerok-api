@@ -3,4 +3,4 @@ target-version = "py310"
 exclude = [".venv", "venv", "__pycache__"]
 
 [tool.ruff.lint]
-select = ["E9", "F63", "F7", "F82"]
+select = ["E9", "F63", "F7", "F82", "F811", "F841", "B006", "B008", "B012", "B015", "B018", "B023"]

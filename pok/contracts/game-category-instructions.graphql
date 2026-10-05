@@ -1,0 +1,37 @@
+query gameCategoryInstructions($pagination: Pagination, $filter: GameCategoryInstructionFilter!) {
+  gameCategoryInstructions(pagination: $pagination, filter: $filter) {
+    ...GameCategoryInstructionList
+    __typename
+  }
+}
+
+fragment GameCategoryInstructionList on GameCategoryInstructionList {
+  edges {
+    ...GameCategoryInstructionEdge
+    __typename
+  }
+  pageInfo {
+    startCursor
+    endCursor
+    hasPreviousPage
+    hasNextPage
+    __typename
+  }
+  totalCount
+  __typename
+}
+
+fragment GameCategoryInstructionEdge on GameCategoryInstructionEdge {
+  cursor
+  node {
+    ...MinimalGameCategoryInstruction
+    __typename
+  }
+  __typename
+}
+
+fragment MinimalGameCategoryInstruction on GameCategoryInstruction {
+  id
+  text
+  __typename
+}

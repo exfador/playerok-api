@@ -77,6 +77,7 @@ class AccountProfile:
         self.unread_chats_counter: int | None = unread_chats_counter
 
 class UserProfile:
+    is_vip: bool | None = None
 
     def __init__(self, id: str, username: str, role: AccountRole, avatar_url: str, is_online: bool, is_blocked: bool, rating: int, reviews_count: int, support_chat_id: str, system_chat_id: str | None, created_at: str | None):
         self.id: str = id
@@ -93,7 +94,7 @@ class UserProfile:
 
     def load_listings(self, count: int=24, game_id: str | None=None, category_id: str | None=None, statuses: list[ListingStage] | None=None, after_cursor: str | None=None) -> ItemProfileList:
         from .client import get_account
-        account = get_account()
+        account = getattr(self, 'account', None) or get_account()
         headers = {'Accept': '*/*', 'Content-Type': 'application/json', 'Origin': account.base_url}
         filter = {'userId': self.id, 'status': [status.name for status in statuses] if statuses else None}
         if game_id:
@@ -106,7 +107,7 @@ class UserProfile:
 
     def get_reviews(self, count: int=24, status: ReviewState=ReviewState.APPROVED, comment_required: bool=False, rating: int | None=None, game_id: str | None=None, category_id: str | None=None, min_item_price: int | None=None, max_item_price: int | None=None, sort_direction: OrderDir=OrderDir.DESC, sort_field: str='createdAt', after_cursor: str | None=None) -> ReviewList:
         from .client import get_account
-        account = get_account()
+        account = getattr(self, 'account', None) or get_account()
         headers = {'Accept': '*/*', 'Content-Type': 'application/json', 'Origin': account.base_url}
         filters = {'userId': self.id, 'status': [status.name] if status else None}
         if comment_required is not None:
@@ -134,6 +135,7 @@ class Event:
         pass
 
 class ItemDeal:
+    is_automated: bool | None = None
 
     def __init__(self, id: str, status: DealStage, status_expiration_date: str | None, status_description: str | None, direction: DealFlow, obtaining: str | None, has_problem: bool, report_problem_enabled: bool | None, completed_user: UserProfile | None, props: str | None, previous_status: DealStage | None, completed_at: str | None, created_at: str | None, logs: list[ItemLog] | None, transaction: Transaction | None, user: UserProfile, chat: Chat | None, item: 'Item | MyItem | ItemProfile', review: Review | None, obtaining_fields: list[GameCategoryDataField] | None, comment_from_buyer: str | None):
         self.id: str = id
@@ -197,6 +199,7 @@ class GameCategoryAgreementList:
         self.total_count: int = total_count
 
 class GameCategoryObtainingType:
+    stock_type: str | None = None
 
     def __init__(self, id: str, name: str, description: str, game_category_id: str, no_comment_from_buyer: bool, instruction_for_buyer: str | None, instruction_for_seller: str | None, sequence: int, fee_multiplier: float, agreements: list[GameCategoryAgreement], props: GameCategoryProps):
         self.id: str = id
@@ -260,6 +263,7 @@ class GameCategoryProps:
         self.min_reviews_for_seller: int = min_reviews_for_seller
 
 class GameCategoryOption:
+    multiple: bool | None = None
 
     def __init__(self, id: str, group: str, label: str, type: OptionStyle, field: str, value: str, value_range_limit: int | None):
         self.id: str = id
@@ -371,7 +375,39 @@ class ItemLog:
         self.created_at: str = created_at
         self.user: UserProfile = user
 
-class Item:
+class ListingCapabilities:
+    is_automated: bool | None = None
+    keep_in_sale: bool | None = None
+    keep_in_sale_available: bool | None = None
+    pause_available: bool | None = None
+    republish_available: bool | None = None
+    may_be_published: bool | None = None
+    post_moderation_checked_at: str | None = None
+    is_attachments_forbidden: bool | None = None
+    characteristics: list | None = None
+    deals_counter: int | None = None
+
+    @property
+    def required_seller_reviews(self) -> int:
+        limits = []
+        for source in (getattr(self, 'obtaining_type', None), getattr(self, 'category', None)):
+            value = getattr(getattr(source, 'props', None), 'min_reviews_for_seller', None)
+            if isinstance(value, int) and value > 0:
+                limits.append(value)
+        return max(limits, default=0)
+
+    @property
+    def seller_reviews(self) -> int | None:
+        value = getattr(getattr(self, 'user', None), 'reviews_count', None)
+        return value if isinstance(value, int) else None
+
+    @property
+    def lacks_seller_reviews(self) -> bool:
+        have = self.seller_reviews
+        return have is not None and have < self.required_seller_reviews
+
+
+class Item(ListingCapabilities):
 
     def __init__(self, id: str, slug: str, name: str, description: str, obtaining_type: GameCategoryObtainingType | None, price: int, raw_price: int, priority_position: int, attachments: list[FileObject], attributes: dict, category: GameCategory, comment: str | None, data_fields: list[GameCategoryDataField] | None, fee_multiplier: float, game: GameProfile, seller_type: AccountRole, status: ListingStage, user: UserProfile):
         self.id: str = id
@@ -394,7 +430,7 @@ class Item:
         self.status: ListingStage = status
         self.user: UserProfile = user
 
-class MyItem:
+class MyItem(ListingCapabilities):
 
     def __init__(self, id: str, slug: str, name: str, description: str, obtaining_type: GameCategoryObtainingType | None, price: int, raw_price: int, priority_position: int, attachments: list[FileObject], attributes: dict, buyer: UserProfile, category: GameCategory, comment: str | None, data_fields: list[GameCategoryDataField] | None, fee_multiplier: float, game: GameProfile, seller_type: AccountRole, status: ListingStage, user: UserProfile, prev_price: int, prev_fee_multiplier: float, seller_notified_about_fee_change: bool, priority: BoostLevel, priority_price: int, sequence: int | None, status_expiration_date: str | None, status_description: str | None, status_payment: Transaction | None, views_counter: int, is_editable: bool, approval_date: str | None, deleted_at: str | None, updated_at: str | None, created_at: str | None):
         self.id: str = id
@@ -432,7 +468,7 @@ class MyItem:
         self.updated_at: str | None = updated_at
         self.created_at: str | None = created_at
 
-class ItemProfile:
+class ItemProfile(ListingCapabilities):
 
     def __init__(self, id: str, slug: str, priority: BoostLevel, status: ListingStage, name: str, price: int, raw_price: int, seller_type: AccountRole, attachment: FileObject, user: UserProfile, approval_date: str, priority_position: int, views_counter: int | None, fee_multiplier: float, created_at: str):
         self.id: str = id
@@ -618,8 +654,11 @@ class TemporaryAttachmentUploadOutput:
         self.expires_at: str | None = expires_at
 
 class ChatMessage:
+    image_links: list[str] | None = None
+    pl_token_amount: int | float | None = None
+    uncensor_info: dict | None = None
 
-    def __init__(self, id: str, text: str, created_at: str, deleted_at: str | None, is_read: bool, is_suspicious: bool, is_bulk_messaging: bool, game: Game | None, file: FileObject | None, images: list[FileObject] | None, user: UserProfile, deal: ItemDeal | None, item: ItemProfile | None, transaction: Transaction | None, moderator: Moderator | None, event_by_user: UserProfile | None, event_to_user: UserProfile | None, is_auto_response: bool, event: Event | None, buttons: list[ChatMessageButton]):
+    def __init__(self, id: str, text: str, created_at: str, deleted_at: str | None, is_read: bool, is_suspicious: bool, is_bulk_messaging: bool, game: Game | None, file: FileObject | None, images: list[FileObject] | None, user: UserProfile, deal: ItemDeal | None, item: ItemProfile | None, transaction: Transaction | None, moderator: Moderator | None, event_by_user: UserProfile | None, event_to_user: UserProfile | None, is_auto_response: bool, event: str | None, buttons: list[ChatMessageButton]):
         self.id: str = id
         self.text: str = text
         self.created_at: str = created_at
@@ -638,7 +677,7 @@ class ChatMessage:
         self.event_by_user: UserProfile | None = event_by_user
         self.event_to_user: UserProfile | None = event_to_user
         self.is_auto_response: bool = is_auto_response
-        self.event: Event | None = event
+        self.event: str | None = event
         self.buttons: list[ChatMessageButton] = buttons
 
 class ChatMessagePageInfo:

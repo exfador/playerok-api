@@ -46,8 +46,9 @@ class Signal:
                 logger.error(
                     '%s[%s] %s.%s → %s%s',
                     Fore.LIGHTRED_EX, self._name,
-                    fn.__module__, fn.__qualname__, exc, Fore.RESET,
+                    getattr(fn, '__module__', '?'), getattr(fn, '__qualname__', repr(fn)), exc, Fore.RESET,
                 )
+                logger.debug('Трассировка обработчика %s', self._name, exc_info=True)
 
 
 def _make_sys_signals() -> dict[str, Signal]:
@@ -84,6 +85,8 @@ def _sys_sig(event: str) -> Signal:
 
 
 def _mkt_sig(event: MarketEvent) -> Signal:
+    if event not in _MKT:
+        _MKT[event] = Signal(getattr(event, 'name', str(event)).lower())
     return _MKT[event]
 
 

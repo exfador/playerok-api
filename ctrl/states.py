@@ -5,6 +5,10 @@ class PduGateGrp(StatesGroup):
     pdu_gate_secret = State()
 
 
+class PduAccessGrp(StatesGroup):
+    pdu_new_password = State()
+
+
 class PduReplyDraftGrp(StatesGroup):
     pdu_reply_body = State()
 
@@ -13,7 +17,6 @@ class PduConnGrp(StatesGroup):
     pdu_golden_key = State()
     pdu_browser_ua = State()
     pdu_http_timeout = State()
-    pdu_listener_delay = State()
     pdu_pl_proxy_line = State()
     pdu_tg_proxy_line = State()
     pdu_wm_text = State()
@@ -34,6 +37,7 @@ class PduAddonGrp(StatesGroup):
 
 class PduReviveGrp(StatesGroup):
     pdu_revive_poll_sec = State()
+    pdu_revive_limit = State()
     pdu_revive_phrase_line = State()
     pdu_revive_phrase_bulk = State()
 
@@ -45,6 +49,8 @@ class PduSealGrp(StatesGroup):
 
 class PduBoostGrp(StatesGroup):
     pdu_boost_interval_sec = State()
+    pdu_boost_limit = State()
+    pdu_daily_limit = State()
     pdu_boost_allow_line = State()
     pdu_boost_allow_bulk = State()
     pdu_boost_deny_line = State()

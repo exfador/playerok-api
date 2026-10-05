@@ -77,7 +77,8 @@ class PersistenceHardeningTests(unittest.TestCase):
             loaded = _load(str(path), {'safe': True})
             self.assertEqual(loaded, {'safe': True})
             self.assertEqual(Path(str(path) + '.corrupt.bak').read_text(), '{invalid')
-            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            if os.name != 'nt':
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
     def test_db_invalid_json_is_backed_up_and_default_is_not_shared(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -88,7 +89,8 @@ class PersistenceHardeningTests(unittest.TestCase):
             first.append('local mutation')
             self.assertEqual(Path(str(path) + '.corrupt.bak').read_text(), '{invalid')
             self.assertEqual(AppDb.get('temporary', [entry]), [])
-            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            if os.name != 'nt':
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
 
 class ApiContractHardeningTests(unittest.TestCase):
@@ -284,7 +286,7 @@ class FeedHardeningTests(unittest.TestCase):
             def settimeout(self, value):
                 pass
 
-            def connect(self, **kwargs):
+            def connect(self, *args, **kwargs):
                 entered.set()
                 released.wait(timeout=2)
                 raise __import__('websocket').WebSocketException('closed')
@@ -335,7 +337,7 @@ class BotHardeningTests(unittest.TestCase):
         with patch('bot.core.Thread', FakeThread):
             asyncio.run(bridge._on_alive())
             asyncio.run(bridge._on_alive())
-        self.assertEqual(len(created), 8)
+        self.assertEqual(len(created), 7)
 
     def test_alive_retry_starts_only_worker_that_failed(self):
         bridge = object.__new__(MarketBridge)
@@ -389,17 +391,21 @@ class BotHardeningTests(unittest.TestCase):
         self.assertEqual(calls, ['item-id'])
 
     def test_listing_pagination_rejects_repeated_cursor(self):
-        bridge = object.__new__(MarketBridge)
-        bridge.saved_items = []
+        from pok.conn import Conn
+        from pok.transport import ResponseContractError
+        conn = object.__new__(Conn)
         page = SimpleNamespace(
             items=[],
             page_info=SimpleNamespace(has_next_page=True, end_cursor='same-cursor'),
         )
-        user = SimpleNamespace(load_listings=lambda **kwargs: page)
-        bridge.account = SimpleNamespace(id='user-id', load_user=lambda user_id: user)
-        with patch('bot.core.time.sleep', return_value=None):
-            with self.assertRaises(RuntimeError):
-                bridge._listings()
+        conn.load_my_items = lambda **kwargs: page
+        with self.assertRaises(ResponseContractError):
+            list(conn.iter_my_items())
+        bridge = object.__new__(MarketBridge)
+        bridge.saved_items = []
+        bridge.account = conn
+        with self.assertRaises(ResponseContractError):
+            bridge._listings()
 
     def test_signal_registration_is_idempotent(self):
         signal = Signal('test')

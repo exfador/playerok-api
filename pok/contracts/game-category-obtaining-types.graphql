@@ -1,0 +1,61 @@
+query gameCategoryObtainingTypes($pagination: Pagination, $filter: GameCategoryObtainingTypeFilter!) {
+  gameCategoryObtainingTypes(pagination: $pagination, filter: $filter) {
+    ...GameCategoryObtainingTypeList
+    __typename
+  }
+}
+
+fragment GameCategoryObtainingTypeList on GameCategoryObtainingTypeList {
+  edges {
+    ...GameCategoryObtainingTypeEdge
+    __typename
+  }
+  pageInfo {
+    startCursor
+    endCursor
+    hasPreviousPage
+    hasNextPage
+    __typename
+  }
+  totalCount
+  __typename
+}
+
+fragment GameCategoryObtainingTypeEdge on GameCategoryObtainingTypeEdge {
+  cursor
+  node {
+    ...GameCategoryObtainingType
+    __typename
+  }
+  __typename
+}
+
+fragment GameCategoryObtainingType on GameCategoryObtainingType {
+  id
+  name
+  stockType
+  description
+  gameCategoryId
+  noCommentFromBuyer
+  instructionForBuyer
+  instructionForSeller
+  sequence
+  feeMultiplier
+  agreements {
+    ...MinimalGameCategoryAgreement
+    __typename
+  }
+  props {
+    minTestimonialsForSeller
+    __typename
+  }
+  __typename
+}
+
+fragment MinimalGameCategoryAgreement on GameCategoryAgreement {
+  description
+  iconType
+  id
+  sequence
+  __typename
+}

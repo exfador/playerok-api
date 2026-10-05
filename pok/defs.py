@@ -126,6 +126,7 @@ class DealStage(Enum):
     CONFIRMED_AUTOMATICALLY = 4
     ROLLED_BACK = 5
     FAILED = 6
+    HAS_PROBLEM = 7
 
 class DealFlow(Enum):
     IN = 0
@@ -226,7 +227,7 @@ class GameCategoryDataFieldInputTypes(Enum):
 
 class GameCategoryAutoConfirmPeriods(Enum):
     SEVEN_DAYS = 0
-    SEVEN_DEYS = 0
+    SEVEN_DEYS = SEVEN_DAYS
     TWO_DAYS = 1
     FIFTEEN_DAYS = 2
     THIRTY_DAYS = 3
@@ -239,12 +240,11 @@ class CloudflareDetectedException(Exception):
 
     def __init__(self, response: requests.Response):
         self.response = response
-        self.status_code = self.response.status_code
-        self.html_text = self.response.text
+        self.status_code = getattr(response, 'status_code', None)
+        self.html_text = getattr(response, 'text', '')
 
     def __str__(self):
-        msg = f'Ошибка: CloudFlare заметил подозрительную активность при отправке запроса на сайт Playerok.\nКод ошибки: {self.status_code}\nОтвет: {self.html_text}'
-        return msg
+        return f'Playerok вернул проверку браузера (HTTP {self.status_code}). Обновите Cookie и проверьте IP/User-Agent.'
 
 
 class BotCheckDetectedException(Exception):
@@ -265,27 +265,28 @@ class RequestFailedError(Exception):
 
     def __init__(self, response: requests.Response):
         self.response = response
-        self.status_code = self.response.status_code
-        self.html_text = self.response.text
+        self.status_code = getattr(response, 'status_code', None)
+        self.html_text = getattr(response, 'text', '')
 
     def __str__(self):
-        msg = f'Ошибка запроса к {self.response.url}\nКод ошибки: {self.status_code}\nОтвет: {self.html_text}'
-        return msg
+        return f'Playerok ответил ошибкой HTTP {self.status_code}'
 
 class RequestApiError(Exception):
 
     def __init__(self, response: requests.Response):
         self.response = response
-        self.json = response.json()
-        errs = self.json.get('errors') or []
-        first = errs[0] if errs else {}
-        self.error_message = first.get('message') or str(first) or 'Неизвестная ошибка API'
+        try:
+            self.json = response.json()
+        except Exception:
+            self.json = {}
+        errs = (self.json.get('errors') if isinstance(self.json, dict) else None) or []
+        first = errs[0] if errs and isinstance(errs[0], dict) else {}
+        self.error_message = first.get('message') or 'Неизвестная ошибка API'
         ext = first.get('extensions') or {}
         self.error_code = ext.get('code', 'UNKNOWN')
 
     def __str__(self):
-        msg = f'Ошибка запроса к {self.response.url}\nКод ошибки: {self.error_code}\nСообщение: {self.error_message}'
-        return self.error_message or msg
+        return f'{self.error_message} ({self.error_code})'
 
 class RequestSendingError(Exception):
 
@@ -294,8 +295,7 @@ class RequestSendingError(Exception):
         self.error = error
 
     def __str__(self):
-        msg = f'Ошибка при попытке отправить запрос к {self.url}\nТекст ошибки: {self.error}'
-        return msg
+        return f'Не удалось выполнить запрос к Playerok: {self.error}'
 
 class UnauthorizedError(Exception):
 

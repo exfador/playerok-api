@@ -214,7 +214,7 @@ def fac_028(username: str, deal_id: str) -> InlineKeyboardMarkup:
 
 def fac_030(username: str, deal_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text='⭐  К отзыву', callback_data=calls.PduDealMemo(de_id=deal_id, do='answer_rev').pack()),
+        InlineKeyboardButton(text='⭐  К отзыву', url=f'https://playerok.com/deal/{deal_id}'),
         InlineKeyboardButton(text='💬  Написать', callback_data=calls.PduNickMemo(name=username, do='send_mess').pack()),
     ]])
 
@@ -232,7 +232,7 @@ def fac_121(placeholder: str) -> str:
 
 
 def fac_014(calling_name: str, chat_link: str) -> str:
-    return f'🔔 <b>{calling_name}</b> вызывает вас в чат\n\n{chat_link}'
+    return f'🔔 <b>{html_module.escape(calling_name or "—")}</b> вызывает вас в чат\n\n{html_module.escape(chat_link)}'
 
 
 def fac_040() -> str:
@@ -245,6 +245,9 @@ def fac_040() -> str:
 
 def fac_039() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text='📦 Мои лоты', callback_data=calls.PduItemsGrid(page=0).pack()),
+        ],
         [
             InlineKeyboardButton(text='⚙️ Настройки', callback_data=calls.PduPrefsScope(to='index').pack()),
             InlineKeyboardButton(text='👤 Профиль', callback_data=calls.PduRootNav(to='profile').pack()),
@@ -259,9 +262,6 @@ def fac_039() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(text='📢 Наш канал', url='https://t.me/coxerhub_playerok'),
             InlineKeyboardButton(text='💬 Чат', url='https://t.me/coxerhub_ch'),
-        ],
-        [
-            InlineKeyboardButton(text='🚀 Накрутка', url='https://neversmm.ru'),
         ],
         [InlineKeyboardButton(text='🐙 GitHub', url='https://github.com/exfador/playerok-api')],
         [InlineKeyboardButton(text='🛒 Приобрести плагины', url='https://t.me/exfador')],
@@ -281,13 +281,18 @@ def fac_system_text() -> str:
     else:
         status = '⏳ <i>Ещё не проверяли — нажмите «Проверить».</i>'
     checked_line = f'\n🕒 Последняя проверка: <code>{iso_to_display_str(checked)}</code>' if checked else ''
+    auto = bool(((cfg.read('config') or {}).get('updater') or {}).get('enabled'))
+    tail = (
+        'Бот сам проверяет релизы в репозитории и пришлёт уведомление о новой версии. Проверить сейчас — кнопкой ниже.'
+        if auto else
+        'Автопроверка релизов выключена (Настройки → Обновления). Проверить вручную — кнопкой ниже.'
+    )
     return (
         '🛠 <b>Система</b>\n\n'
         f'• Текущая версия: <code>v{VERSION}</code>\n'
         f'• {status}'
         f'{checked_line}\n\n'
-        'Бот автоматически проверяет релизы в репозитории и пришлёт уведомление, '
-        'когда появится новая версия. Вручную — кнопкой ниже.'
+        f'{tail}'
     )
 
 
@@ -303,6 +308,7 @@ def fac_system_kb() -> InlineKeyboardMarkup:
         if html_url:
             rows.append([InlineKeyboardButton(text='📝 Что нового', url=html_url)])
     rows.append([InlineKeyboardButton(text='🔄 Проверить обновления', callback_data=CX.sys_chk)])
+    rows.append([InlineKeyboardButton(text='🗂 Логи', callback_data=calls.PduRootNav(to='logs').pack())])
     rows.append([InlineKeyboardButton(text='🐙 GitHub', url='https://github.com/exfador/playerok-api/releases')])
     rows.append([InlineKeyboardButton(text='⬅️ Меню', callback_data=calls.PduRootNav(to='default').pack())])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -311,7 +317,6 @@ def fac_system_kb() -> InlineKeyboardMarkup:
 def fac_122(playerok_ok: bool = True) -> str:
     text = (
         f'🚀 <b>Панель готова</b>\n\n{fac_003()}\n\n'
-        f'Лучший сервис по накрутке — <a href="https://neversmm.ru">neversmm.ru</a>\n'
         f'Канал по плеерку — <a href="https://t.me/coxerhub_playerok">t.me/coxerhub_playerok</a>\n\n'
         f'Версия проекта: <code>v{VERSION}</code>'
     )
@@ -329,7 +334,10 @@ def fac_122_kb() -> InlineKeyboardMarkup:
 
 def fac_049() -> str:
     from bot.core import live_bridge
-    acc = live_bridge().account.get()
+    engine = live_bridge()
+    if engine is None:
+        raise RuntimeError('Движок Playerok ещё запускается — откройте профиль через несколько секунд')
+    acc = engine.account.get()
     p = acc.profile
     bal = p.balance
     bal_total = f'{bal.value} ₽' if bal else '—'
@@ -377,13 +385,17 @@ def fac_038() -> str:
     return (
         '🗂 <b>Логи работы</b>\n\n'
         f'Максимальный размер файла: <code>{max_mb} МБ</code>.\n'
-        'Когда файл вырастет до лимита, он обнуляется и пишется заново.'
+        'Когда файл вырастет до лимита, он обнуляется и пишется заново.\n\n'
+        'Лог за другой день: <code>/logs ДД.ММ.ГГГГ</code>.'
     )
 
 
 def fac_037() -> InlineKeyboardMarkup:
+    max_mb = (cfg.read('config').get('logs') or {}).get('max_mb') or '—'
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text='⬅️ Меню', callback_data=calls.PduRootNav(to='default').pack())],
+        [InlineKeyboardButton(text='📥 Скачать лог за сегодня', callback_data=CX.log_sn)],
+        [InlineKeyboardButton(text=f'📏 Размер файла: {max_mb} МБ', callback_data=CX.log_mb)],
+        [InlineKeyboardButton(text='⬅️ Назад', callback_data=calls.PduRootNav(to='system').pack())],
     ])
 
 

@@ -1,0 +1,55 @@
+query gameCategoryDataFields($pagination: Pagination, $filter: GameCategoryDataFieldFilter!) {
+  gameCategoryDataFields(pagination: $pagination, filter: $filter) {
+    ...GameCategoryDataFieldList
+    __typename
+  }
+}
+
+fragment GameCategoryDataFieldList on GameCategoryDataFieldList {
+  edges {
+    ...GameCategoryDataFieldEdge
+    __typename
+  }
+  pageInfo {
+    startCursor
+    endCursor
+    hasPreviousPage
+    hasNextPage
+    __typename
+  }
+  totalCount
+  __typename
+}
+
+fragment GameCategoryDataFieldEdge on GameCategoryDataFieldEdge {
+  cursor
+  node {
+    ...MinimalGameCategoryDataField
+    __typename
+  }
+  __typename
+}
+
+fragment MinimalGameCategoryDataField on GameCategoryDataField {
+  id
+  label
+  type
+  inputType
+  copyable
+  hidden
+  required
+  sequence
+  validationRules {
+    ...GameCategoryDataFieldValidationRules
+    __typename
+  }
+  __typename
+}
+
+fragment GameCategoryDataFieldValidationRules on GameCategoryDataFieldValidationRules {
+  id
+  minLength
+  maxLength
+  regExp
+  __typename
+}

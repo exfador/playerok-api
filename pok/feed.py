@@ -15,8 +15,45 @@ from .conn import Conn
 from .models import ChatMessage, Chat
 from .defs import MarketEvent, RoomKind
 from .gql import chat, chat_message, QUERIES
+from .response import merge_chat_update, system_event_name
+from .stream import proxy_options
 from . import models as types
+from constants.stream import (
+    HYDRATION_ATTEMPTS,
+    HYDRATION_DELAY,
+    MAX_CHAT_SUBSCRIPTIONS,
+    MAX_PARSED_MESSAGE_IDS,
+    MAX_TRACKED_CHATS,
+    MAX_WATCHED_REVIEWS,
+    REVIEW_WATCH_SECONDS,
+)
+from collections import OrderedDict
 import time as time_module
+
+
+class _BoundedSet:
+
+    def __init__(self, limit: int):
+        self.limit = limit
+        self._items: OrderedDict = OrderedDict()
+
+    def __contains__(self, key) -> bool:
+        return key in self._items
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def add(self, key) -> None:
+        self._items[key] = None
+        self._items.move_to_end(key)
+        while len(self._items) > self.limit:
+            self._items.popitem(last=False)
+
+    def discard(self, key) -> None:
+        self._items.pop(key, None)
+
+    def clear(self) -> None:
+        self._items.clear()
 
 
 def _parse_api_datetime(value: str) -> datetime:
@@ -132,8 +169,10 @@ class ListingShippedNotice(StreamCell):
 
 class Feed:
 
-    def __init__(self, conn: Conn, ws_path: str = '/chats'):
+    def __init__(self, conn: Conn, ws_path: str = '/chats', processed_deals: list | None = None,
+                 since: datetime | None = None):
         self.conn: Conn = conn
+        self._since = since or datetime.now(timezone.utc)
         self.ws_path = '/' + (ws_path or 'chats').strip('/')
         self.chat_subscriptions = {}
         self.review_check_deals = []
@@ -142,9 +181,7 @@ class Feed:
         self.review_deal_times = {}
         self.review_watch_times = {}
         self.chats = []
-        self.processed_deals = []
-        self.active_deals = {}
-        self.last_st_deal_times = {}
+        self.processed_deals = processed_deals if processed_deals is not None else []
         self.ws = None
         self.q = None
         self._stop_event = ThreadingEvent()
@@ -161,8 +198,11 @@ class Feed:
         self._consecutive_failures = 0
         self._pending_ping_nonce: str | None = None
         self._possible_new_chat = ThreadingEvent()
+        self._recover_missed = ThreadingEvent()
+        self._deals_lock = Lock()
+        self._core_subscriptions: dict[str, str] = {}
         self._last_chat_check = 0
-        self._parsed_ws_message_ids: set = set()
+        self._parsed_ws_message_ids = _BoundedSet(MAX_PARSED_MESSAGE_IDS)
         self._ws_message_dedupe_lock = Lock()
         self._ws_send_lock = Lock()
         self._ws_generation_lock = Lock()
@@ -219,18 +259,24 @@ class Feed:
     def _sleep(self, seconds: float) -> bool:
         return self._stop_event.wait(seconds)
 
+    def _report_failure(self, what: str) -> None:
+        import sys
+        error = sys.exc_info()[1]
+        self.logger.warning('%s: %s: %s', what, type(error).__name__ if error else '—', str(error)[:300] if error else '')
+        self.logger.debug('Трассировка: %s', traceback.format_exc())
+
     def _get_actual_message(self, message_id: str, chat_id: str):
-        for _ in range(3):
-            if self._sleep(6):
-                return
+        for attempt in range(HYDRATION_ATTEMPTS):
             try:
                 msg_list = self.conn.load_messages(chat_id, count=12)
-            except Exception:
-                return
-            try:
-                return [msg for msg in msg_list.messages if msg.id == message_id][0]
-            except Exception:
-                pass
+                match = next((msg for msg in msg_list.messages if msg.id == message_id), None)
+                if match is not None and match.deal is not None:
+                    return match
+            except Exception as exc:
+                self.logger.debug('Не удалось дозагрузить сообщение %s: %s', message_id, exc)
+            if attempt + 1 < HYDRATION_ATTEMPTS and self._sleep(HYDRATION_DELAY):
+                return None
+        return None
 
     def _message_shell_empty(self, message: ChatMessage) -> bool:
         if message is None:
@@ -261,58 +307,41 @@ class Feed:
                     break
         return message
 
-    def _set_active_deal(self, chat_obj: types.Chat, deal: types.ItemDeal, status_date: datetime):
-        if chat_obj.id not in self.active_deals:
-            self.active_deals[chat_obj.id] = []
-        try:
-            deal_tuple = next((t for t in self.active_deals[chat_obj.id] if t[0] == deal.id))
-        except StopIteration:
-            deal_tuple = ()
-        if not deal_tuple:
-            self.active_deals[chat_obj.id].append((deal.id, deal.status, status_date))
-        else:
-            indx = self.active_deals[chat_obj.id].index(deal_tuple)
-            self.active_deals[chat_obj.id][indx] = (deal.id, deal.status, status_date)
+    _SYSTEM_EVENTS = frozenset({
+        'ITEM_PAID', 'ITEM_SENT', 'DEAL_CONFIRMED', 'DEAL_ROLLED_BACK',
+        'DEAL_HAS_PROBLEM', 'DEAL_PROBLEM_RESOLVED',
+    })
 
     def _parse_message_events(self, message: ChatMessage, chat_obj: Chat) -> list:
         if not message:
             return []
-        if message.text == '{{ITEM_PAID}}':
-            actual_msg = self._get_actual_message(message.id, chat_obj.id) or message
-            if actual_msg and actual_msg.deal:
-                deal_id = actual_msg.deal.id
-                if deal_id not in self.review_check_deals:
-                    self.review_check_deals.append(deal_id)
-                if deal_id not in self.processed_deals:
-                    self.processed_deals.append(deal_id)
-                else:
+        event = system_event_name(message)
+        if event not in self._SYSTEM_EVENTS:
+            return [ChatIngress(message, chat_obj)]
+        actual_msg = message if message.deal is not None else (self._get_actual_message(message.id, chat_obj.id) or message)
+        deal = actual_msg.deal
+        if deal is None:
+            return [ChatIngress(message, chat_obj)]
+        if event == 'ITEM_PAID':
+            with self._deals_lock:
+                if deal.id in self.processed_deals:
                     return []
-                return [DealCreatedNotice(actual_msg.deal, chat_obj), ListingPaidNotice(actual_msg.deal, chat_obj)]
-        elif message.text == '{{ITEM_SENT}}':
-            actual_msg = self._get_actual_message(message.id, chat_obj.id) or message
-            if actual_msg and actual_msg.deal:
-                return [ListingShippedNotice(actual_msg.deal, chat_obj), DealStageChanged(actual_msg.deal, chat_obj)]
-        elif message.text == '{{DEAL_CONFIRMED}}':
-            actual_msg = self._get_actual_message(message.id, chat_obj.id) or message
-            if actual_msg and actual_msg.deal:
-                deal_id = actual_msg.deal.id
-                if deal_id not in self.review_check_deals and deal_id not in self.review_watch_deals:
-                    self.review_check_deals.append(deal_id)
-                return [DealConfirmedNotice(actual_msg.deal, chat_obj), DealStageChanged(actual_msg.deal, chat_obj)]
-        elif message.text == '{{DEAL_ROLLED_BACK}}':
-            actual_msg = self._get_actual_message(message.id, chat_obj.id) or message
-            if actual_msg and actual_msg.deal:
-                return [DealRefundedNotice(actual_msg.deal, chat_obj), DealStageChanged(actual_msg.deal, chat_obj)]
-        elif message.text == '{{DEAL_HAS_PROBLEM}}':
-            actual_msg = self._get_actual_message(message.id, chat_obj.id) or message
-            if actual_msg and actual_msg.deal:
-                return [DealDisputeRaised(actual_msg.deal, chat_obj), DealStageChanged(actual_msg.deal, chat_obj)]
-        elif message.text == '{{DEAL_PROBLEM_RESOLVED}}':
-            actual_msg = self._get_actual_message(message.id, chat_obj.id) or message
-            if actual_msg and actual_msg.deal:
-                ru = getattr(getattr(actual_msg, 'user', None), 'username', None)
-                return [DealDisputeCleared(actual_msg.deal, chat_obj, resolver_username=ru)]
-        return [ChatIngress(message, chat_obj)]
+                self.processed_deals.append(deal.id)
+                if len(self.processed_deals) > 5000:
+                    del self.processed_deals[:1000]
+            return [DealCreatedNotice(deal, chat_obj), ListingPaidNotice(deal, chat_obj)]
+        if event == 'ITEM_SENT':
+            return [ListingShippedNotice(deal, chat_obj), DealStageChanged(deal, chat_obj)]
+        if event == 'DEAL_CONFIRMED':
+            if deal.id not in self.review_check_deals and deal.id not in self.review_watch_deals:
+                self.review_check_deals.append(deal.id)
+            return [DealConfirmedNotice(deal, chat_obj), DealStageChanged(deal, chat_obj)]
+        if event == 'DEAL_ROLLED_BACK':
+            return [DealRefundedNotice(deal, chat_obj), DealStageChanged(deal, chat_obj)]
+        if event == 'DEAL_HAS_PROBLEM':
+            return [DealDisputeRaised(deal, chat_obj), DealStageChanged(deal, chat_obj)]
+        resolver = getattr(getattr(actual_msg, 'user', None), 'username', None)
+        return [DealDisputeCleared(deal, chat_obj, resolver_username=resolver)]
 
     def _generation_is_current(self, generation: int | None) -> bool:
         if generation is None:
@@ -343,14 +372,45 @@ class Feed:
             },
         }, generation)
 
+    def _subscribe_core(self, operation: str, variables: dict, generation: int | None = None):
+        sub_id = str(uuid.uuid4())
+        sent = self._send_ws({'id': sub_id, 'payload': {'extensions': {}, 'operationName': operation, 'query': QUERIES.get(operation), 'variables': variables}, 'type': 'subscribe'}, generation)
+        if sent and self._generation_is_current(generation):
+            self._core_subscriptions[sub_id] = operation
+
     def _subscribe_chat_updated(self, generation: int | None = None):
-        self._send_ws({'id': str(uuid.uuid4()), 'payload': {'extensions': {}, 'operationName': 'chatUpdated', 'query': QUERIES.get('chatUpdated'), 'variables': {'filter': {'userId': self.conn.id}, 'showForbiddenImage': True}}, 'type': 'subscribe'}, generation)
+        self._subscribe_core('chatUpdated', {'filter': {'userId': self.conn.id}, 'showForbiddenImage': True}, generation)
 
     def _subscribe_chat_marked_as_read(self, generation: int | None = None):
-        self._send_ws({'id': str(uuid.uuid4()), 'payload': {'extensions': {}, 'operationName': 'chatMarkedAsRead', 'query': QUERIES.get('chatMarkedAsRead'), 'variables': {'filter': {'userId': self.conn.id}, 'showForbiddenImage': True}}, 'type': 'subscribe'}, generation)
+        self._subscribe_core('chatMarkedAsRead', {'filter': {'userId': self.conn.id}, 'showForbiddenImage': True}, generation)
 
     def _subscribe_user_updated(self, generation: int | None = None):
-        self._send_ws({'id': str(uuid.uuid4()), 'payload': {'extensions': {}, 'operationName': 'userUpdated', 'query': QUERIES.get('userUpdated'), 'variables': {'userId': self.conn.id}}, 'type': 'subscribe'}, generation)
+        self._subscribe_core('userUpdated', {'userId': self.conn.id}, generation)
+
+    def _handle_subscription_end(self, msg_data: dict, generation: int | None) -> None:
+        sub_id = msg_data.get('id')
+        chat_id = self.chat_subscriptions.pop(sub_id, None)
+        operation = self._core_subscriptions.pop(sub_id, None)
+        if msg_data.get('type') != 'error':
+            if operation and self._generation_is_current(generation):
+                self.logger.warning('Сервер завершил подписку %s — переподключение', operation)
+                self._close_current(generation)
+            return
+        errors = msg_data.get('payload')
+        details = '; '.join(str(e.get('message') or e) for e in errors if isinstance(e, dict)) if isinstance(errors, list) else str(errors)
+        target = operation or (f'чат {chat_id}' if chat_id else sub_id)
+        self.logger.warning('Подписка WebSocket отклонена (%s): %s', target, details[:300])
+        with self._health_lock:
+            self._last_error = f'subscription {target}: {details[:200]}'
+
+    def _close_current(self, generation: int | None) -> None:
+        with self._ws_generation_lock:
+            ws = self.ws if generation is None or generation == self._ws_generation else None
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
 
     def _subscribe_chat_message_created(self, chat_id, generation: int | None = None):
         _uuid = str(uuid.uuid4())
@@ -398,8 +458,6 @@ class Feed:
                 if key in self._parsed_ws_message_ids:
                     return []
                 self._parsed_ws_message_ids.add(key)
-                if len(self._parsed_ws_message_ids) > 50000:
-                    self._parsed_ws_message_ids.clear()
         try:
             out = self._parse_message_events(message, chat_obj)
         except Exception:
@@ -412,9 +470,19 @@ class Feed:
                 self._parsed_ws_message_ids.discard(key)
         return self._apply_deal_event_cooldown(out)
 
+    def _merge_chat(self, incoming: Chat) -> Chat:
+        existing = next((c for c in list(self.chats) if c.id == incoming.id), None)
+        if existing is None and (not incoming.type or not incoming.users):
+            try:
+                existing = self.conn.load_chat(incoming.id)
+            except Exception as exc:
+                self.logger.warning('Не удалось загрузить новый чат %s: %s', incoming.id, exc)
+        return merge_chat_update(existing, incoming)
+
     def _process_new_chat_message(self, chat_obj, message, generation: int | None = None):
         events = []
-        message = self._hydrate_message_if_needed(message, chat_obj.id)
+        if message is not None:
+            message = self._hydrate_message_if_needed(message, chat_obj.id)
         if not self._generation_is_current(generation):
             return events
         is_subscribed = self._is_chat_subscribed(chat_obj.id)
@@ -427,14 +495,34 @@ class Feed:
                     self.chats.remove(old_chat)
                     self.chats.append(chat_obj)
                     break
+        if len(self.chats) > MAX_TRACKED_CHATS:
+            del self.chats[:len(self.chats) - MAX_TRACKED_CHATS]
         if not is_subscribed:
             self._subscribe_chat_message_created(chat_obj.id, generation)
+            self._trim_chat_subscriptions(generation)
             if is_new_chat:
                 events.append(RoomSnapshotReady(chat_obj))
-        events.extend(self._events_for_chat_message(chat_obj, message))
+        if message is not None:
+            events.extend(self._events_for_chat_message(chat_obj, message))
         if not self._generation_is_current(generation):
             return []
         return events
+
+    def _recent_chats(self) -> list:
+        return self.chats[-MAX_CHAT_SUBSCRIPTIONS:]
+
+    def _trim_chat_subscriptions(self, generation: int | None = None) -> None:
+        if len(self.chat_subscriptions) <= MAX_CHAT_SUBSCRIPTIONS:
+            return
+        active = {c.id for c in self._recent_chats()}
+        for sub_id, chat_id in list(self.chat_subscriptions.items()):
+            if chat_id in active:
+                continue
+            self.chat_subscriptions.pop(sub_id, None)
+            try:
+                self._send_ws({'id': sub_id, 'type': 'complete'}, generation)
+            except Exception as exc:
+                self.logger.debug('Не удалось завершить подписку %s: %s', sub_id, exc)
 
     def _proccess_new_chat_message(self, chat_obj, message):
         return self._process_new_chat_message(chat_obj, message)
@@ -466,7 +554,11 @@ class Feed:
                         self._pending_ping_nonce = None
                         self._last_pong_at = now
                 return
-            payload_data = msg_data.get('payload', {}).get('data', {})
+            if message_type in ('error', 'complete'):
+                self._handle_subscription_end(msg_data, generation)
+                return
+            payload = msg_data.get('payload')
+            payload_data = (payload.get('data') if isinstance(payload, dict) else None) or {}
             self.logger.debug(
                 'WS -> type=%s data_keys=%s',
                 msg_data.get('type'),
@@ -475,10 +567,11 @@ class Feed:
             if message_type == 'connection_ack':
                 try:
                     self.chat_subscriptions.clear()
+                    self._core_subscriptions.clear()
                     self._subscribe_chat_updated(generation)
                     self._subscribe_chat_marked_as_read(generation)
                     self._subscribe_user_updated(generation)
-                    for chat_ in self.chats:
+                    for chat_ in self._recent_chats():
                         self._subscribe_chat_message_created(chat_.id, generation)
                 except Exception as exc:
                     with self._health_lock:
@@ -496,14 +589,22 @@ class Feed:
                         self._connected_at = now
                         self._last_error = None
                         self._consecutive_failures = 0
+                        reconnected = self._last_disconnect_at is not None
+                    if reconnected:
+                        self._recover_missed.set()
+                        self._possible_new_chat.set()
             else:
-                if 'userUpdated' in payload_data:
-                    unread_chats = payload_data['userUpdated'].get('unreadChatsCounter', 0)
+                updated_user = payload_data.get('userUpdated')
+                if isinstance(updated_user, dict):
+                    try:
+                        unread_chats = int(updated_user.get('unreadChatsCounter') or 0)
+                    except (TypeError, ValueError):
+                        unread_chats = 0
                     if unread_chats > 0:
                         self._possible_new_chat.set()
-                if 'chatUpdated' in payload_data:
-                    _chat = chat(payload_data['chatUpdated'])
-                    _message = chat_message(payload_data['chatUpdated']['lastMessage'])
+                if payload_data.get('chatUpdated'):
+                    _chat = self._merge_chat(chat(payload_data['chatUpdated']))
+                    _message = chat_message(payload_data['chatUpdated'].get('lastMessage'))
                     events = self._process_new_chat_message(_chat, _message, generation)
                     for event in events:
                         if self._generation_is_current(generation):
@@ -523,7 +624,7 @@ class Feed:
                         if self._generation_is_current(generation):
                             self.q.put(event)
         except Exception:
-            self.logger.debug(f'Ошибка обработки сообщения в WebSocket`е: {traceback.format_exc()}')
+            self._report_failure('Ошибка обработки сообщения WebSocket')
 
     def _dispatch_ws_message(self, msg: str, generation: int) -> bool:
         if not self._ws_capacity.acquire(blocking=False):
@@ -556,11 +657,16 @@ class Feed:
         return self.process_ws_message(msg)
 
     def listen_new_messages(self):
-        base_headers = {'accept-encoding': 'gzip, deflate, br, zstd', 'accept-language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7', 'cache-control': 'no-cache', 'connection': 'Upgrade', 'origin': 'https://playerok.com', 'pragma': 'no-cache', 'sec-websocket-extensions': 'permessage-deflate; client_max_window_bits', 'user-agent': self.conn.user_agent}
-        try:
-            self.chats = self.conn.load_chats(count=24).chats
-        except Exception:
-            self.chats = []
+        base_headers = {'accept-language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7', 'cache-control': 'no-cache', 'pragma': 'no-cache', 'user-agent': self.conn.user_agent}
+        self.chats = []
+        for attempt in range(5):
+            try:
+                self.chats = [c for c in self.conn.load_chats(count=24).chats if c is not None]
+                break
+            except Exception as exc:
+                self.logger.warning('Не удалось загрузить список чатов (%s/5): %s', attempt + 1, exc)
+                if self._sleep(min(30, 3 * (attempt + 1))):
+                    return
         for chat_ in self.chats:
             yield RoomSnapshotReady(chat_)
         while not self._stop_event.is_set():
@@ -569,7 +675,6 @@ class Feed:
             retry_delay = 0
             try:
                 cookie_hdr = self.conn._cookie_header() or f'token={self.conn.token}'
-                headers = {**base_headers, 'cookie': cookie_hdr}
                 with self._ws_generation_lock:
                     self._ws_generation += 1
                     generation = self._ws_generation
@@ -580,10 +685,13 @@ class Feed:
                     self.ws = ws
                     self._ws_generation_socket = ws
                 ws.connect(
-                    url='wss://ws.playerok.com/graphql',
-                    header=[f'{k}: {v}' for k, v in headers.items()],
+                    'wss://ws.playerok.com/graphql',
+                    origin='https://playerok.com',
+                    cookie=cookie_hdr,
+                    header=[f'{k}: {v}' for k, v in base_headers.items()],
                     subprotocols=['graphql-transport-ws'],
                     timeout=30,
+                    **proxy_options(getattr(self.conn, 'proxy_url', None)),
                 )
                 if not self._generation_is_current(generation) or self._stop_event.is_set():
                     return
@@ -624,11 +732,11 @@ class Feed:
                         self._send_ws({'type': 'ping', 'payload': {'nonce': nonce}}, generation)
                         continue
                     if not msg:
+                        with self._health_lock:
+                            acked = self._connected
+                        if not acked:
+                            raise ConnectionError('Playerok закрыл WebSocket до подтверждения — вероятно, Cookie устарели или не подходят к IP/User-Agent')
                         raise ConnectionError('Playerok WebSocket closed')
-                    try:
-                        incoming_type = json.loads(msg).get('type')
-                    except (json.JSONDecodeError, AttributeError):
-                        incoming_type = None
                     self._dispatch_incoming_ws_message(msg, generation)
                     with self._health_lock:
                         pending_after = self._pending_ping_nonce
@@ -699,19 +807,24 @@ class Feed:
             del self.review_deal_times[deal_id]
         return False
 
-    def _should_check_watch_deal(self, deal_id, delay=90, max_tries=100000) -> bool:
+    def _forget_watched_review(self, deal_id) -> None:
+        if deal_id in self.review_watch_deals:
+            self.review_watch_deals.remove(deal_id)
+        self.review_snapshots.pop(deal_id, None)
+        self.review_watch_times.pop(deal_id, None)
+
+    def _should_check_watch_deal(self, deal_id, delay=120, lifetime=REVIEW_WATCH_SECONDS) -> bool:
         now = time.time()
-        info = self.review_watch_times.get(deal_id, {'last': 0, 'tries': 0})
-        last_time = info['last']
-        tries = info['tries']
-        if now - last_time > delay:
-            self.review_watch_times[deal_id] = {'last': now, 'tries': tries + 1}
+        while len(self.review_watch_deals) > MAX_WATCHED_REVIEWS:
+            self._forget_watched_review(self.review_watch_deals[0])
+        info = self.review_watch_times.setdefault(deal_id, {'last': 0, 'tries': 0, 'started': now})
+        if now - info.get('started', now) > lifetime:
+            self._forget_watched_review(deal_id)
+            return False
+        if now - info['last'] > delay:
+            info['last'] = now
+            info['tries'] += 1
             return True
-        if tries >= max_tries:
-            if deal_id in self.review_watch_deals:
-                self.review_watch_deals.remove(deal_id)
-            self.review_snapshots.pop(deal_id, None)
-            self.review_watch_times.pop(deal_id, None)
         return False
 
     def _resolve_deal_chat(self, deal: types.ItemDeal) -> None:
@@ -776,6 +889,26 @@ class Feed:
         if sleep_time > 0:
             self._sleep(sleep_time)
 
+    def _deal_processed(self, deal_id: str) -> bool:
+        with self._deals_lock:
+            return deal_id in self.processed_deals
+
+    def _recent_paid_messages(self, chat_id: str, window: float = 600) -> list:
+        now = datetime.now(timezone.utc)
+        found = []
+        for msg in self.conn.load_messages(chat_id, count=12).messages:
+            if not msg or system_event_name(msg) != 'ITEM_PAID':
+                continue
+            try:
+                created = _parse_api_datetime(msg.created_at)
+            except (TypeError, ValueError, AttributeError):
+                continue
+            deal_id = getattr(getattr(msg, 'deal', None), 'id', None)
+            fresh = created >= self._since and (now - created).total_seconds() <= window
+            if fresh and not (deal_id and self._deal_processed(deal_id)):
+                found.append(msg)
+        return list(reversed(found))
+
     def listen_new_deals(self):
         while not self._stop_event.is_set():
             try:
@@ -786,83 +919,40 @@ class Feed:
                 self._wait_for_check_new_chats()
                 self._last_chat_check = time.time()
                 self._possible_new_chat.clear()
+                recovering = self._recover_missed.is_set()
+                self._recover_missed.clear()
                 known_chat_ids = [c.id for c in self.chats]
+                chats = []
                 for _ in range(3):
+                    if self._sleep(2):
+                        return
                     try:
-                        if self._sleep(6):
-                            return
-                        chats = self.conn.load_chats(count=5, type=RoomKind.PM).chats
+                        chats = [c for c in self.conn.load_chats(count=10 if recovering else 5, type=RoomKind.PM).chats if c is not None]
                         break
-                    except Exception:
-                        chats = []
+                    except Exception as exc:
+                        self.logger.debug('Не удалось получить последние чаты: %s', exc)
                 for chat_obj in chats:
-                    if chat_obj.id in known_chat_ids:
-                        if chat_obj.last_message and chat_obj.last_message.text == '{{ITEM_PAID}}':
-                            lm = chat_obj.last_message
-                            lm_deal = getattr(lm, 'deal', None)
-                            lm_deal_id = getattr(lm_deal, 'id', None) if lm_deal else None
-                            if lm_deal_id and lm_deal_id not in self.processed_deals:
-                                events = self._process_new_chat_message(chat_obj, lm)
-                                for event in events:
-                                    yield event
+                    last = chat_obj.last_message
+                    last_is_paid = bool(last) and system_event_name(last) == 'ITEM_PAID'
+                    known = chat_obj.id in known_chat_ids
+                    if last_is_paid:
+                        last_deal_id = getattr(getattr(last, 'deal', None), 'id', None)
+                        if not known or (last_deal_id and not self._deal_processed(last_deal_id)):
+                            for event in self._process_new_chat_message(chat_obj, last):
+                                yield event
                         continue
-                    if chat_obj.last_message and chat_obj.last_message.text == '{{ITEM_PAID}}':
-                        events = self._process_new_chat_message(chat_obj, chat_obj.last_message)
-                        for event in events:
-                            yield event
+                    if known and not recovering:
                         continue
                     try:
-                        msg_list = self.conn.load_messages(chat_obj.id, count=12)
-                        new_paid_msg = next((msg for msg in msg_list.messages if msg.text == '{{ITEM_PAID}}' and (datetime.now(timezone.utc) - _parse_api_datetime(msg.created_at)).total_seconds() <= 120), None)
-                        if new_paid_msg:
-                            events = self._process_new_chat_message(chat_obj, new_paid_msg)
-                            for event in events:
+                        for paid_msg in self._recent_paid_messages(chat_obj.id):
+                            for event in self._process_new_chat_message(chat_obj, paid_msg):
                                 yield event
                     except Exception:
-                        self.logger.debug(f'Ошибка получения истории для нового чата {chat_obj.id}: {traceback.format_exc()}')
+                        self._report_failure(f'Ошибка получения истории чата {chat_obj.id}')
             except websocket._exceptions.WebSocketException:
                 pass
             except Exception:
-                self.logger.debug(f'Ошибка проверки новых сделок: {traceback.format_exc()}')
-
-    def listen_deal_statuses(self):
-        while not self._stop_event.is_set():
-            for chat_id, deals in list(self.active_deals.items()):
-                messages = []
-                for _ in range(3):
-                    try:
-                        msg_list = self.conn.load_messages(chat_id, 24)
-                        messages = sorted(msg_list.messages, key=lambda x: _parse_api_datetime(x.created_at))
-                        break
-                    except Exception:
-                        if self._sleep(6):
-                            return
-                for deal_id, last_status, status_date in list(deals):
-                    try:
-                        normalized_status_date = status_date
-                        if normalized_status_date.tzinfo is None:
-                            normalized_status_date = normalized_status_date.replace(tzinfo=timezone.utc)
-                        else:
-                            normalized_status_date = normalized_status_date.astimezone(timezone.utc)
-                        status_msgs = [msg for msg in messages if msg.deal and msg.deal.status and (_parse_api_datetime(msg.created_at) >= normalized_status_date)]
-                        for msg in status_msgs:
-                            msg_date = _parse_api_datetime(msg.created_at)
-                            if msg.deal.status == last_status and msg_date == status_date:
-                                continue
-                            try:
-                                chat_obj = self.conn.load_chat(chat_id)
-                            except Exception:
-                                continue
-                            events = self._parse_message_events(msg, chat_obj)
-                            for event in events:
-                                yield event
-                            self._set_active_deal(chat_obj, msg.deal, msg_date)
-                    except Exception:
-                        self.logger.debug(f'Ошибка проверки статусов в сделке {deal_id}: {traceback.format_exc()}')
-                    if self._sleep(8):
-                        return
-            if self._sleep(1):
-                return
+                self._report_failure('Ошибка проверки новых сделок')
 
     def listen(self, get_new_message_events: bool = True, get_new_review_events: bool = True) -> Generator:
         if not any((get_new_review_events, get_new_message_events)):

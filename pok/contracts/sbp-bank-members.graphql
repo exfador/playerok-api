@@ -1,0 +1,13 @@
+query SbpBankMembers {
+  sbpBankMembers {
+    ...SBPBankMember
+    __typename
+  }
+}
+
+fragment SBPBankMember on SBPBankMember {
+  id
+  name
+  icon
+  __typename
+}

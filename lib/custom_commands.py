@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import secrets
 from typing import Any
 
@@ -49,7 +50,7 @@ def cc_get_items(raw: Any) -> list[dict]:
                 if not trig.startswith('!'):
                     trig = f'!{trig}'
                 out.append({
-                    'id':          secrets.token_hex(6),
+                    'id':          hashlib.sha256(trig.lower().encode('utf-8')).hexdigest()[:12],
                     'trigger':     trig,
                     'events':      [],
                     'reply_lines': [str(x) for x in v],

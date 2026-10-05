@@ -1,4 +1,3 @@
-
 import asyncio
 import logging
 import os
@@ -7,10 +6,6 @@ import sys
 from typing import Dict, Any, Optional, List, overload, Literal
 
 from colorama import Fore, init as colorama_init
-
-from lib.tls_patch import apply_tls_patch
-
-apply_tls_patch()
 
 import lib.consts as const
 import lib.cfg as cfgmod
@@ -89,14 +84,18 @@ class CXHBot:
             if not quiet:
                 self._log_status('success', 'Прокси Playerok в порядке')
 
-        if not ut.account_reachable():
-            self._log_status('error', 'Playerok: аккаунт, токен или сеть — ошибка')
+        account, account_error = await asyncio.to_thread(ut.probe_account)
+        if account is None:
+            self._log_status('error', f'Playerok: аккаунт, Cookie или сеть — {account_error}')
             return False
+        try:
+            if account.is_blocked:
+                self._log_status('error', 'Аккаунт заблокирован на Playerok')
+                return False
+        finally:
+            account.close()
         if not quiet:
-            self._log_status('success', 'Аккаунт Playerok доступен')
-        if ut.account_banned():
-            self._log_status('error', 'Аккаунт заблокирован на Playerok')
-            return False
+            self._log_status('success', f'Аккаунт Playerok доступен: {account.username}')
 
         if cfg['bot']['proxy']:
             if not ut.proxy_reachable(cfg['bot']['proxy'], 'https://api.telegram.org/'):
@@ -413,7 +412,7 @@ class CXHBot:
         from bot.core import make_bridge
         from pok.defs import RequestSendingError
         try:
-            bridge = make_bridge()
+            bridge = await asyncio.to_thread(make_bridge)
             self._bridge = bridge
             await bridge.start()
             await self._shutdown_event.wait()
@@ -428,8 +427,7 @@ class CXHBot:
         self._shutdown_event = asyncio.Event()
         ut.clear_terminal()
         quick_restart = os.environ.pop('CXH_FAST_REBOOT', None) == '1'
-        ut.check_requirements('requirements.txt')
-        ut.monkey_patch_http()
+        ut.check_requirements(os.path.join(ut.project_root_dir(), 'requirements.txt'))
         ut.setup_logging()
         ut.set_console_title(f'CXH Playerok {const.VERSION}')
 

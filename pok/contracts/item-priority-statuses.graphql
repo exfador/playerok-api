@@ -1,0 +1,20 @@
+query itemPriorityStatuses($price: NonNegativeFloat!, $itemId: UUID) {
+  itemPriorityStatuses(price: $price, itemId: $itemId) {
+    ...MinimalItemPriorityStatus
+    __typename
+  }
+}
+
+fragment MinimalItemPriorityStatus on ItemPriorityStatus {
+  id
+  price
+  name
+  type
+  period
+  priceRange {
+    min
+    max
+    __typename
+  }
+  __typename
+}

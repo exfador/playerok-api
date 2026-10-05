@@ -1,0 +1,317 @@
+mutation updateDeal($input: UpdateItemDealInput!, $showForbiddenImage: Boolean) {
+  updateDeal(input: $input) {
+    ...RegularItemDeal
+    __typename
+  }
+}
+
+fragment RegularItemDeal on ItemDeal {
+  id
+  status
+  direction
+  statusExpirationDate
+  statusDescription
+  obtaining
+  hasProblem
+  reportProblemEnabled
+  completedBy {
+    ...MinimalUserFragment
+    __typename
+  }
+  props {
+    ...ItemDealProps
+    __typename
+  }
+  prevStatus
+  completedAt
+  createdAt
+  logs {
+    ...ItemLog
+    __typename
+  }
+  transaction {
+    ...ItemDealTransaction
+    __typename
+  }
+  user {
+    ...UserEdgeNode
+    __typename
+  }
+  chat {
+    ...RegularChatId
+    __typename
+  }
+  item {
+    ...PartialDealItem
+    __typename
+  }
+  testimonial {
+    ...RegularItemDealTestimonial
+    __typename
+  }
+  obtainingFields {
+    ...GameCategoryDataFieldWithValue
+    __typename
+  }
+  commentFromBuyer
+  isAutomated
+  __typename
+}
+
+fragment MinimalUserFragment on UserFragment {
+  id
+  username
+  role
+  __typename
+}
+
+fragment ItemDealProps on ItemDealProps {
+  autoConfirmPeriod
+  confirmationRestriction
+  confirmationRestrictionTexts {
+    sellerDealSubtitle
+    buyerDealSubtitle
+    buyerTimerText
+    __typename
+  }
+  __typename
+}
+
+fragment ItemLog on ItemLog {
+  id
+  event
+  createdAt
+  user {
+    ...UserEdgeNode
+    __typename
+  }
+  __typename
+}
+
+fragment ItemDealTransaction on Transaction {
+  id
+  operation
+  direction
+  providerId
+  status
+  value
+  createdAt
+  paymentMethodId
+  statusExpirationDate
+  __typename
+}
+
+fragment UserEdgeNode on UserFragment {
+  ...RegularUserFragment
+  __typename
+}
+
+fragment RegularChatId on Chat {
+  id
+  __typename
+}
+
+fragment PartialDealItem on Item {
+  ...PartialDealMyItem
+  ...PartialDealForeignItem
+  __typename
+}
+
+fragment RegularItemDealTestimonial on Testimonial {
+  id
+  status
+  text
+  rating
+  createdAt
+  updatedAt
+  creator {
+    ...RegularUserFragment
+    __typename
+  }
+  moderator {
+    ...RegularUserFragment
+    __typename
+  }
+  user {
+    ...RegularUserFragment
+    __typename
+  }
+  __typename
+}
+
+fragment GameCategoryDataFieldWithValue on GameCategoryDataFieldWithValue {
+  id
+  label
+  type
+  inputType
+  copyable
+  hidden
+  required
+  value
+  __typename
+}
+
+fragment RegularUserFragment on UserFragment {
+  id
+  username
+  role
+  avatarURL
+  isOnline
+  isBlocked
+  rating
+  testimonialCounter
+  createdAt
+  supportChatId
+  systemChatId
+  __typename
+}
+
+fragment PartialDealMyItem on MyItem {
+  id
+  slug
+  priority
+  status
+  description
+  name
+  price
+  priorityPrice
+  rawPrice
+  statusExpirationDate
+  sellerType
+  approvalDate
+  createdAt
+  priorityPosition
+  viewsCounter
+  feeMultiplier
+  comment
+  attachments(showForbiddenImage: $showForbiddenImage) {
+    ...RegularFile
+    __typename
+  }
+  isAttachmentsForbidden
+  user {
+    ...UserEdgeNode
+    __typename
+  }
+  game {
+    ...RegularGameProfile
+    __typename
+  }
+  category {
+    ...MinimalGameCategory
+    __typename
+  }
+  dataFields {
+    ...GameCategoryDataFieldWithValue
+    __typename
+  }
+  characteristics {
+    label
+    value
+    __typename
+  }
+  obtainingType {
+    ...MinimalGameCategoryObtainingType
+    __typename
+  }
+  __typename
+}
+
+fragment PartialDealForeignItem on ForeignItem {
+  id
+  slug
+  priority
+  status
+  description
+  name
+  price
+  rawPrice
+  sellerType
+  approvalDate
+  priorityPosition
+  createdAt
+  viewsCounter
+  feeMultiplier
+  comment
+  attachments(showForbiddenImage: $showForbiddenImage) {
+    ...RegularFile
+    __typename
+  }
+  isAttachmentsForbidden
+  user {
+    ...UserEdgeNode
+    __typename
+  }
+  game {
+    ...RegularGameProfile
+    __typename
+  }
+  category {
+    ...MinimalGameCategory
+    __typename
+  }
+  dataFields {
+    ...GameCategoryDataFieldWithValue
+    __typename
+  }
+  characteristics {
+    label
+    value
+    __typename
+  }
+  obtainingType {
+    ...MinimalGameCategoryObtainingType
+    __typename
+  }
+  __typename
+}
+
+fragment RegularFile on File {
+  id
+  url
+  filename
+  mime
+  __typename
+}
+
+fragment RegularGameProfile on GameProfile {
+  id
+  name
+  type
+  slug
+  logo {
+    ...PartialFile
+    __typename
+  }
+  __typename
+}
+
+fragment MinimalGameCategory on GameCategory {
+  id
+  slug
+  name
+  __typename
+}
+
+fragment MinimalGameCategoryObtainingType on GameCategoryObtainingType {
+  id
+  name
+  description
+  gameCategoryId
+  noCommentFromBuyer
+  instructionForBuyer
+  instructionForSeller
+  sequence
+  feeMultiplier
+  props {
+    minTestimonialsForSeller
+    __typename
+  }
+  __typename
+}
+
+fragment PartialFile on File {
+  id
+  url
+  __typename
+}

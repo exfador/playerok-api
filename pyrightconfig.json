@@ -1,9 +1,11 @@
 {
     "include": [
         "bot",
+        "constants",
         "ctrl",
         "lib",
         "pok",
+        "scripts",
         "main.py"
     ],
     "exclude": [

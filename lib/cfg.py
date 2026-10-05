@@ -49,24 +49,25 @@ _DEFAULTS: dict[str, Any] = {
         'user_agent': '', 'proxy': '',
         'proxy_prompt_ok': False, 'user_agent_prompt_ok': False,
         'cookies_prompt_ok': False,
-        'timeout': 30, 'listener_delay': None,
+        'timeout': 30,
     },
     'bot': {
         'token': '', 'proxy': '', 'proxy_prompt_ok': False,
         'password_hash': '', 'admins': [],
     },
     'features': {
-        'watermark': {'enabled': True, 'text': 'CXH Playerok', 'position': 'end'},
+        'watermark': {'enabled': False, 'text': 'CXH Playerok', 'position': 'end'},
         'read_chat': True, 'greet': True, 'commands': True, 'deliveries': True,
     },
     'auto': {
         'restore': {
             'sold': True, 'expired': False, 'all': True,
-            'premium': False,
+            'premium': False, 'premium_max_price': 50, 'keep_in_sale': False,
             'poll': {'enabled': False, 'interval': 300},
         },
-        'confirm': {'enabled': False, 'all': True},
-        'bump':    {'enabled': False, 'interval': 3600, 'all': False},
+        'confirm': {'enabled': False, 'all': True, 'only_delivered': True},
+        'bump':    {'enabled': False, 'interval': 3600, 'all': False, 'max_price': 50},
+        'daily_limit': 200,
     },
     'alerts': {
         'enabled': True,
@@ -76,8 +77,8 @@ _DEFAULTS: dict[str, Any] = {
             'update': True, 'broadcast': True,
         },
     },
-    'updater': {'enabled': True, 'interval_sec': 3600, 'auto_update': False, 'notify': True},
-    'broadcast': {'enabled': True, 'interval_sec': 1800, 'source': 'https://api.github.com/gists/89e52dbb3ca81aee82b6a3d8b51b55e2'},
+    'updater': {'enabled': False, 'interval_sec': 3600, 'auto_update': False, 'notify': True},
+    'broadcast': {'enabled': False, 'interval_sec': 1800, 'source': 'https://api.github.com/gists/89e52dbb3ca81aee82b6a3d8b51b55e2'},
     'logs':    {'max_mb': 300},
     'debug':   {'verbose': False},
     'display': {'timezone': ''},
@@ -91,7 +92,18 @@ def _project_path(relative_path: str) -> str:
 
 
 _CFG = _CfgFile('config',             _project_path('conf/config.json'),             True,  _DEFAULTS)
-_MSG = _CfgFile('messages',           _project_path('conf/messages.json'),           False, {})
+SYSTEM_MESSAGES: dict[str, dict] = {
+    'first_message': {'enabled': False, 'title': 'Приветствие', 'text': ['Здравствуйте, $buyer! Спасибо за покупку.']},
+    'new_deal': {'enabled': False, 'title': 'Новая сделка', 'text': ['Оплата за «$product» получена, заказ уже в работе.']},
+    'deal_sent': {'enabled': False, 'title': 'Товар отправлен', 'text': ['Заказ «$product» отправлен. Проверьте и подтвердите получение.']},
+    'deal_confirmed': {'enabled': False, 'title': 'Сделка завершена', 'text': ['Спасибо за покупку, $buyer! Буду рад отзыву.']},
+    'deal_refunded': {'enabled': False, 'title': 'Возврат', 'text': ['Средства за «$product» возвращены.']},
+    'new_review': {'enabled': False, 'title': 'Новый отзыв', 'text': ['Спасибо за отзыв ($rating ⭐)!']},
+    'cmd_seller': {'enabled': False, 'title': 'Вызов продавца', 'text': ['Продавец получил уведомление и скоро ответит.']},
+    'out_of_stock': {'enabled': False, 'title': 'Товар закончился', 'text': ['Товар временно закончился, продавец выдаст заказ вручную.']},
+}
+
+_MSG = _CfgFile('messages',           _project_path('conf/messages.json'),           True,  SYSTEM_MESSAGES)
 _CC  = _CfgFile('custom_commands',    _project_path('conf/custom_commands.json'),    False, {'items': []})
 _AD  = _CfgFile('auto_deliveries',    _project_path('conf/auto_deliveries.json'),    False, [])
 _ARI = _CfgFile('auto_restore_items', _project_path('conf/auto_restore_items.json'), False, {'included': []})
@@ -118,6 +130,14 @@ def _validate(cfg: dict, default: dict) -> bool:
     return True
 
 
+def _same_kind(value: Any, default: Any) -> bool:
+    if isinstance(value, bool) or isinstance(default, bool):
+        return type(value) is type(default)
+    if isinstance(value, (int, float)) and isinstance(default, (int, float)):
+        return True
+    return type(value) is type(default)
+
+
 def _restore(current: dict, blueprint: dict) -> dict:
     out = copy.deepcopy(current)
     for key, default_val in blueprint.items():
@@ -125,7 +145,7 @@ def _restore(current: dict, blueprint: dict) -> dict:
             out[key] = copy.deepcopy(default_val)
         elif out[key] is None:
             pass
-        elif type(out[key]) != type(default_val):
+        elif not _same_kind(out[key], default_val):
             out[key] = copy.deepcopy(default_val)
         elif isinstance(default_val, dict):
             out[key] = _restore(out[key], default_val)
@@ -189,6 +209,18 @@ def _load(path: str, default: Any, need_restore: bool = True) -> Any:
     return raw
 
 
+def replace_with_retry(source: str, target: str, attempts: int = 8, delay: float = 0.05) -> None:
+    import time
+    for attempt in range(attempts):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if attempt + 1 == attempts:
+                raise
+            time.sleep(delay * (attempt + 1))
+
+
 def _save(path: str, data: Any) -> None:
     parent = os.path.dirname(path)
     os.makedirs(parent, exist_ok=True)
@@ -196,7 +228,9 @@ def _save(path: str, data: Any) -> None:
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as fh:
             json.dump(data, fh, ensure_ascii=False, indent=4)
-        os.replace(tmp_path, path)
+            fh.flush()
+            os.fsync(fh.fileno())
+        replace_with_retry(tmp_path, path)
         try:
             os.chmod(path, 0o600)
         except OSError:

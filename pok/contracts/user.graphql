@@ -1,0 +1,131 @@
+query user($id: UUID, $username: String, $hasSupportAccess: Boolean!) {
+  user(id: $id, username: $username) {
+    ...RegularUserProfile
+    ...UserVipStatusFragment @include(if: $hasSupportAccess)
+    __typename
+  }
+}
+
+fragment RegularUserProfile on UserProfile {
+  ...RegularUser
+  ...RegularUserFragment
+  __typename
+}
+
+fragment UserVipStatusFragment on User {
+  isVip
+  vipLog {
+    adminUsername
+    createdAt
+    event
+    __typename
+  }
+  __typename
+}
+
+fragment RegularUser on User {
+  id
+  isBlocked
+  isVerified
+  isBlockedFor
+  isFundsProtectionActive
+  hasFrozenBalance
+  username
+  email
+  role
+  balance {
+    ...RegularUserBalance
+    __typename
+  }
+  profile {
+    ...RegularUserFragment
+    __typename
+  }
+  stats {
+    ...RegularUserStats
+    __typename
+  }
+  hasEnabledNotifications
+  supportChatId
+  systemChatId
+  __typename
+}
+
+fragment RegularUserFragment on UserFragment {
+  id
+  username
+  role
+  avatarURL
+  isOnline
+  isBlocked
+  rating
+  testimonialCounter
+  createdAt
+  supportChatId
+  systemChatId
+  __typename
+}
+
+fragment RegularUserBalance on UserBalance {
+  id
+  value
+  frozen
+  available
+  withdrawable
+  pendingIncome
+  __typename
+}
+
+fragment RegularUserStats on UserStats {
+  id
+  items {
+    ...RegularUserItemsStats
+    __typename
+  }
+  deals {
+    ...RegularUserDealsStats
+    __typename
+  }
+  fragmentDeposits {
+    ...RegularUserFragmentDepositsStats
+    __typename
+  }
+  steamDeposits {
+    ...RegularUserSteamDepositsStats
+    __typename
+  }
+  __typename
+}
+
+fragment RegularUserItemsStats on UserItemsStats {
+  total
+  finished
+  __typename
+}
+
+fragment RegularUserDealsStats on UserDealsStats {
+  incoming {
+    total
+    finished
+    __typename
+  }
+  outgoing {
+    total
+    finished
+    automatedTotal
+    __typename
+  }
+  __typename
+}
+
+fragment RegularUserFragmentDepositsStats on UserFragmentDepositsStats {
+  total
+  finished
+  __typename
+}
+
+fragment RegularUserSteamDepositsStats on UserSteamDepositsStats {
+  total
+  finished
+  __typename
+}

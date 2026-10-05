@@ -1,14 +1,27 @@
 from __future__ import annotations
 import html
-from pok.models import ChatMessage
+from urllib.parse import urlsplit
 
-SYS_MSG_LABELS: dict[str, str] = {
-    '{{ITEM_PAID}}':             '💳 Оплата по сделке (заказ создан)',
-    '{{ITEM_SENT}}':             '📤 Продавец отправил товар',
-    '{{DEAL_CONFIRMED}}':        '✅ Покупатель подтвердил получение',
-    '{{DEAL_ROLLED_BACK}}':      '↩️ Возврат / сделка отменена',
-    '{{DEAL_HAS_PROBLEM}}':      '⚠️ Жалоба по сделке',
-    '{{DEAL_PROBLEM_RESOLVED}}': '✔️ Жалоба снята',
+from pok.models import ChatMessage
+from pok.response import system_event_name
+
+EVENT_LABELS: dict[str, str] = {
+    'ITEM_PAID':             '💳 Оплата по сделке (заказ создан)',
+    'ITEM_SENT':             '📤 Продавец отправил товар',
+    'DEAL_CONFIRMED':        '✅ Покупатель подтвердил получение',
+    'DEAL_ROLLED_BACK':      '↩️ Возврат / сделка отменена',
+    'DEAL_HAS_PROBLEM':      '⚠️ Жалоба по сделке',
+    'DEAL_PROBLEM_RESOLVED': '✔️ Жалоба снята',
+    'CHAT_STARTED':          '💬 Начат чат',
+}
+
+SYS_MSG_LABELS: dict[str, str] = {f'{{{{{name}}}}}': label for name, label in EVENT_LABELS.items()}
+
+BUTTON_LABELS: dict[str, str] = {
+    'ASK_FOR_EXTERNAL_REVIEW': 'Оставить отзыв',
+    'LOTTERY': 'Розыгрыш',
+    'LOTTERY_RESULTS': 'Итоги розыгрыша',
+    'CURRENT_BALANCE': 'Баланс',
 }
 
 
@@ -18,10 +31,33 @@ def _humanize_msg(text: str | None) -> str | None:
     return SYS_MSG_LABELS.get(text.strip(), text)
 
 
+def _event_label(message: ChatMessage) -> str | None:
+    if getattr(message, 'event', None) is None and not (message.text or '').strip().startswith('{{'):
+        return None
+    name = system_event_name(message)
+    if not name:
+        return None
+    return EVENT_LABELS.get(name, f'ℹ️ Событие {name}')
+
+
+def _buttons(message: ChatMessage) -> list[tuple[str, str]]:
+    rows = []
+    for button in getattr(message, 'buttons', None) or []:
+        url = getattr(button, 'url', None) or ''
+        if not button or urlsplit(url).scheme not in ('http', 'https'):
+            continue
+        kind = getattr(getattr(button, 'type', None), 'name', None)
+        rows.append(((getattr(button, 'text', None) or BUTTON_LABELS.get(kind) or 'Ссылка').strip(), url))
+    return rows
+
+
 def _build_plain(message: ChatMessage) -> str:
     parts: list[str] = []
-    if message.text:
-        parts.append(_humanize_msg(message.text) or '')
+    label = _event_label(message)
+    if label:
+        parts.append(label)
+    elif message.text:
+        parts.append(message.text)
     if message.file is not None:
         if getattr(message.file, 'url', None):
             parts.append(f'[файл] {message.file.filename or "файл"} | {message.file.url}')
@@ -31,15 +67,18 @@ def _build_plain(message: ChatMessage) -> str:
         if im is None:
             continue
         parts.append(f'[изображение] {im.url}' if getattr(im, 'url', None) else f'[изображение] id={im.id}')
+    for text, url in _buttons(message):
+        parts.append(f'[кнопка] {text}: {url}')
     return '\n'.join(parts)
 
 
 def _build_html(message: ChatMessage) -> str:
     parts: list[str] = []
-    if message.text:
-        shown = _humanize_msg(message.text)
-        raw   = (message.text or '').strip()
-        parts.append(html.escape(shown if shown and shown != raw else message.text))
+    label = _event_label(message)
+    if label:
+        parts.append(html.escape(label))
+    elif message.text:
+        parts.append(html.escape(message.text))
     if message.file is not None:
         if getattr(message.file, 'url', None):
             fn = html.escape(message.file.filename or 'файл')
@@ -54,6 +93,8 @@ def _build_html(message: ChatMessage) -> str:
             parts.append(f'📷 <a href="{html.escape(im.url)}">изображение</a>')
         else:
             parts.append(f'📷 изображение (id: {html.escape(str(im.id))})')
+    for text, url in _buttons(message):
+        parts.append(f'🔗 <a href="{html.escape(url)}">{html.escape(text)}</a>')
     return '\n'.join(parts) or '<i>нет текста</i>'
 
 

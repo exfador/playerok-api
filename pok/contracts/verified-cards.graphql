@@ -1,0 +1,35 @@
+query verifiedCards($pagination: Pagination, $sort: Sort, $filter: CardFilter) {
+  verifiedCards(filter: $filter, pagination: $pagination, sort: $sort) {
+    edges {
+      ...MinimalUserBankCardEdge
+      __typename
+    }
+    pageInfo {
+      startCursor
+      endCursor
+      hasPreviousPage
+      hasNextPage
+      __typename
+    }
+    totalCount
+    __typename
+  }
+}
+
+fragment MinimalUserBankCardEdge on UserBankCardEdge {
+  cursor
+  node {
+    ...MinimalUserBankCard
+    __typename
+  }
+  __typename
+}
+
+fragment MinimalUserBankCard on UserBankCard {
+  id
+  cardFirstSix
+  cardLastFour
+  cardType
+  isChosen
+  __typename
+}

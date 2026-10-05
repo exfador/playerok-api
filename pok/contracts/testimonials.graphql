@@ -1,0 +1,107 @@
+query testimonials($pagination: Pagination, $sort: Sort, $filter: TestimonialFilter!, $hasSupportAccess: Boolean!) {
+  testimonials(pagination: $pagination, sort: $sort, filter: $filter) {
+    edges {
+      cursor
+      node {
+        ...MinifiedTestimonial
+        creator {
+          ...RegularUserFragment
+          ...UserFragmentVipStatusFragment @include(if: $hasSupportAccess)
+          __typename
+        }
+        __typename
+      }
+      __typename
+    }
+    pageInfo {
+      startCursor
+      endCursor
+      hasPreviousPage
+      hasNextPage
+      __typename
+    }
+    totalCount
+    __typename
+  }
+}
+
+fragment MinifiedTestimonial on Testimonial {
+  id
+  status
+  text
+  rating
+  createdAt
+  updatedAt
+  deal {
+    ...DealProfileForTestimonials
+    __typename
+  }
+  creator {
+    ...RegularUserFragment
+    __typename
+  }
+  moderator {
+    ...RegularUserFragment
+    __typename
+  }
+  user {
+    ...RegularUserFragment
+    __typename
+  }
+  __typename
+}
+
+fragment RegularUserFragment on UserFragment {
+  id
+  username
+  role
+  avatarURL
+  isOnline
+  isBlocked
+  rating
+  testimonialCounter
+  createdAt
+  supportChatId
+  systemChatId
+  __typename
+}
+
+fragment UserFragmentVipStatusFragment on UserFragment {
+  isVip
+  __typename
+}
+
+fragment DealProfileForTestimonials on ItemDealProfile {
+  id
+  direction
+  status
+  item {
+    ...TestimonialItemProfile
+    __typename
+  }
+  __typename
+}
+
+fragment TestimonialItemProfile on ItemProfile {
+  id
+  slug
+  priority
+  status
+  name
+  price
+  rawPrice
+  approvalDate
+  createdAt
+  sellerType
+  attachment {
+    ...PartialFile
+    __typename
+  }
+  __typename
+}
+
+fragment PartialFile on File {
+  id
+  url
+  __typename
+}

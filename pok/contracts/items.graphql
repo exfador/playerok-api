@@ -1,0 +1,137 @@
+query items($filter: ItemFilter, $pagination: Pagination, $sort: Sort, $showForbiddenImage: Boolean) {
+  items(filter: $filter, pagination: $pagination, sort: $sort) {
+    edges {
+      ...ItemEdgeFields
+      __typename
+    }
+    pageInfo {
+      startCursor
+      endCursor
+      hasPreviousPage
+      hasNextPage
+      __typename
+    }
+    totalCount
+    __typename
+  }
+}
+
+fragment ItemEdgeFields on ItemProfileEdge {
+  cursor
+  node {
+    ...ItemEdgeNode
+    __typename
+  }
+  __typename
+}
+
+fragment ItemEdgeNode on ItemProfile {
+  ...MyItemEdgeNode
+  ...ForeignItemEdgeNode
+  __typename
+}
+
+fragment MyItemEdgeNode on MyItemProfile {
+  id
+  slug
+  priority
+  status
+  name
+  price
+  rawPrice
+  statusExpirationDate
+  sellerType
+  attachment(showForbiddenImage: $showForbiddenImage) {
+    ...PartialFile
+    __typename
+  }
+  isAttachmentsForbidden
+  user {
+    ...UserItemEdgeNode
+    __typename
+  }
+  game {
+    name
+    __typename
+  }
+  category {
+    name
+    __typename
+  }
+  approvalDate
+  createdAt
+  priorityPosition
+  viewsCounter
+  dealsCounter
+  keepInSale
+  feeMultiplier
+  isAutomated
+  __typename
+}
+
+fragment ForeignItemEdgeNode on ForeignItemProfile {
+  id
+  slug
+  priority
+  status
+  name
+  price
+  rawPrice
+  sellerType
+  attachment(showForbiddenImage: $showForbiddenImage) {
+    ...PartialFile
+    __typename
+  }
+  isAttachmentsForbidden
+  user {
+    ...UserItemEdgeNode
+    __typename
+  }
+  game {
+    name
+    __typename
+  }
+  category {
+    name
+    __typename
+  }
+  approvalDate
+  priorityPosition
+  createdAt
+  viewsCounter
+  dealsCounter
+  feeMultiplier
+  isAutomated
+  __typename
+}
+
+fragment PartialFile on File {
+  id
+  url
+  __typename
+}
+
+fragment UserItemEdgeNode on UserFragment {
+  ...UserEdgeNode
+  __typename
+}
+
+fragment UserEdgeNode on UserFragment {
+  ...RegularUserFragment
+  __typename
+}
+
+fragment RegularUserFragment on UserFragment {
+  id
+  username
+  role
+  avatarURL
+  isOnline
+  isBlocked
+  rating
+  testimonialCounter
+  createdAt
+  supportChatId
+  systemChatId
+  __typename
+}

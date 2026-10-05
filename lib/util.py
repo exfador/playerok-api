@@ -8,8 +8,6 @@ import logging
 import textwrap
 import requests
 import subprocess
-import curl_cffi
-import random
 import shutil
 import time
 import asyncio
@@ -57,6 +55,15 @@ def _display_tz():
     return datetime.now().astimezone().tzinfo
 
 
+def plural(count: int, one: str, few: str, many: str) -> str:
+    count = abs(int(count))
+    if count % 10 == 1 and count % 100 != 11:
+        return one
+    if 2 <= count % 10 <= 4 and not 12 <= count % 100 <= 14:
+        return few
+    return many
+
+
 def iso_to_display_str(iso, fmt: str = '%d.%m.%Y · %H:%M') -> str:
     if iso is None:
         return '—'
@@ -97,17 +104,36 @@ def clear_terminal() -> None:
         pass
 
 
+RESTART_EXIT_CODE = 75
+
+
+def _persist_engine_state() -> None:
+    try:
+        from bot.core import live_bridge
+        engine = live_bridge()
+        if engine is not None:
+            engine.persist_state()
+    except Exception as exc:
+        logging.getLogger('cxh.util').warning('Состояние перед перезапуском не сохранено: %s', exc)
+
+
 def reboot() -> None:
+    _persist_engine_state()
     os.environ['CXH_FAST_REBOOT'] = '1'
     try:
         sys.stdout.flush()
         sys.stderr.flush()
     except OSError:
         pass
-    clear_terminal()
     python = sys.executable
+    if sys.platform == 'win32':
+        if os.environ.get('CXH_LAUNCHER') == 'bat':
+            os._exit(RESTART_EXIT_CODE)
+        code = subprocess.call([python, *sys.argv], cwd=os.getcwd(), env={**os.environ})
+        os._exit(code)
+    clear_terminal()
     try:
-        os.execl(python, python, *sys.argv)
+        os.execv(python, [python, *sys.argv])
     except OSError:
         subprocess.Popen([python, *sys.argv], cwd=os.getcwd(), env={**os.environ})
         os._exit(0)
@@ -139,7 +165,8 @@ _LEVEL_COLORS = {
 
 _CXH_LOGGERS = (
     'cxh.conn', 'cxh.bot', 'cxh.ctrl', 'cxh.bus', 'cxh.ext',
-    'cxh.util', 'cxh.feed', 'cxh.cfg', 'cxh.boot',
+    'cxh.util', 'cxh.feed', 'cxh.cfg', 'cxh.boot', 'cxh.updater', 'cxh.broadcast',
+    'pl.conn', 'pl.feed', 'pl.ctrl', 'pl.ui',
 )
 
 
@@ -166,6 +193,7 @@ def _silence_noisy_loggers() -> None:
         'urllib3', 'urllib3.connectionpool', 'urllib3.util.retry',
         'tls_requests', 'aiogram', 'aiogram.event', 'aiogram.dispatcher',
         'aiohttp.client', 'aiohttp.access', 'httpcore', 'httpx', 'asyncio',
+        'websocket', 'charset_normalizer', 'curl_cffi',
     )
     for name in noisy:
         logging.getLogger(name).setLevel(logging.WARNING)
@@ -221,7 +249,13 @@ class _DateFolderFileHandler(logging.Handler):
                 self._stream = None
             day_dir = os.path.join(self.logs_root, new_date)
             os.makedirs(day_dir, exist_ok=True)
-            self._stream = open(os.path.join(day_dir, self.filename), mode='a', encoding='utf-8', buffering=1)
+            path = os.path.join(day_dir, self.filename)
+            self._stream = open(path, mode='a', encoding='utf-8', buffering=1)
+            for target, mode in ((self.logs_root, 0o700), (day_dir, 0o700), (path, 0o600)):
+                try:
+                    os.chmod(target, mode)
+                except OSError:
+                    pass
             self._current_date = new_date
             self._cleanup_old()
         except OSError:
@@ -359,15 +393,9 @@ def setup_prompt(step: int, total: int, title: str, description: list[str], exam
     return input('> ').strip()
 
 
-def _ensure_packaging() -> None:
-    try:
-        import packaging.requirements  
-    except ImportError:
-        subprocess.check_call(
-            [sys.executable, '-m', 'pip', 'install', '-q', 'packaging>=23'],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+def _packaging_available() -> bool:
+    import importlib.util
+    return importlib.util.find_spec('packaging') is not None
 
 
 def _requirement_status(req_line: str) -> str:
@@ -398,7 +426,9 @@ def check_requirements(requirements_path: str) -> None:
     try:
         if not os.path.exists(requirements_path):
             return
-        _ensure_packaging()
+        if not _packaging_available():
+            logger.warning('Пакет packaging не установлен — проверка зависимостей пропущена. Выполните `pip install -r %s`.', requirements_path)
+            return
         with open(requirements_path, encoding='utf-8') as f:
             lines = [ln.strip() for ln in f.readlines()]
         missing: list[str] = []
@@ -426,33 +456,6 @@ def check_requirements(requirements_path: str) -> None:
         logger.debug('check_requirements: %s', e)
 
 
-def monkey_patch_http() -> None:
-    _orig = curl_cffi.Session.request
-    _RETRY_CODES = {429: 'Too Many Requests', 500: 'Internal Server Error', 502: 'Bad Gateway', 503: 'Service Unavailable'}
-
-    def _request(self, method, url, **kwargs):
-        for attempt in range(6):
-            resp = _orig(self, method, url, **kwargs)
-            head = (resp.text or '')[:1200].lower()
-            retry_on = next(
-                (msg for code, msg in _RETRY_CODES.items()
-                 if resp.status_code == code or msg.lower() in head),
-                None,
-            )
-            if retry_on is None:
-                return resp
-            raw_retry = resp.headers.get('Retry-After')
-            try:
-                delay = float(raw_retry) if raw_retry else min(120.0, 5.0 * 2 ** attempt)
-            except Exception:
-                delay = min(120.0, 5.0 * 2 ** attempt)
-            logger.debug('%s — %s. Повтор через %.1f с.', url, retry_on, delay)
-            time.sleep(delay + random.uniform(0.2, 0.8))
-        return resp
-
-    curl_cffi.Session.request = _request
-
-
 def spawn_async(
     func: callable,
     args: list | None = None,
@@ -470,12 +473,9 @@ def spawn_async(
         try:
             loop.run_until_complete(func(*_args, **_kwargs))
         except Exception:
-            log.exception(
-                'spawn_async: поток панели Telegram завершился с ошибкой. '
-                'Опрос не работает, пока не исправите; в логах не будет [tg].'
-            )
+            log.exception('Фоновый поток %s завершился с ошибкой', name)
             try:
-                print('[spawn_async] Ошибка в потоке Telegram — см. logs/bot.log.', file=sys.stderr, flush=True)
+                print(f'[{name}] фоновый поток завершился с ошибкой — см. logs/bot.log.', file=sys.stderr, flush=True)
             except Exception:
                 pass
         finally:
@@ -489,11 +489,13 @@ def spawn_async(
     return thread
 
 
-def spawn_forever(func: callable, args: list = [], kwargs: dict = {}) -> None:
+def spawn_forever(func: callable, args: list | None = None, kwargs: dict | None = None) -> None:
+    _args, _kwargs = list(args or []), dict(kwargs or {})
+
     def _run():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        loop.create_task(func(*args, **kwargs))
+        loop.create_task(func(*_args, **_kwargs))
         try:
             loop.run_forever()
         finally:
@@ -700,36 +702,7 @@ def ascii_safe_ca_bundle() -> str:
     return src
 
 
-def account_reachable() -> bool:
-    try:
-        _load_conn_pok()
-        return True
-    except Exception:
-        return False
-
-
-def _load_conn_pok():
-    from pok.conn import Conn
-    from lib.cfg import AppConf
-    c = AppConf.read('config')['account']
-    Conn(
-        token=c.get('token') or None,
-        cookies=c.get('cookies') or None,
-        ddg5=c.get('ddg5') or '',
-        user_agent=c.get('user_agent') or '',
-        requests_timeout=int(c.get('timeout') or 30),
-        proxy=c.get('proxy') or None,
-    ).get()
-
-
-def account_banned() -> bool:
-    try:
-        return _load_conn_pok_acc().profile.is_blocked
-    except Exception:
-        return False
-
-
-def _load_conn_pok_acc():
+def build_account_conn():
     from pok.conn import Conn
     from lib.cfg import AppConf
     c = AppConf.read('config')['account']
@@ -740,7 +713,39 @@ def _load_conn_pok_acc():
         user_agent=c.get('user_agent') or '',
         requests_timeout=int(c.get('timeout') or 30),
         proxy=c.get('proxy') or None,
-    ).get()
+    )
+
+
+def probe_account() -> tuple[object | None, str | None]:
+    try:
+        conn = build_account_conn()
+    except Exception as e:
+        return None, f'{type(e).__name__}: {e}'
+    try:
+        return conn.get(), None
+    except Exception as e:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return None, f'{type(e).__name__}: {e}'
+
+
+def account_reachable() -> bool:
+    conn, error = probe_account()
+    if conn is not None:
+        conn.close()
+    return error is None
+
+
+def account_banned() -> bool:
+    conn, error = probe_account()
+    if conn is None:
+        return False
+    try:
+        return bool(conn.is_blocked or getattr(conn.profile, 'is_blocked', False))
+    finally:
+        conn.close()
 
 
 def ua_ok(ua: str) -> bool:
@@ -840,6 +845,19 @@ def proxy_display_parts(raw: str | None) -> tuple[str | None, str | None, str | 
     return None, None, None, None
 
 
+def proxy_masked(raw: str | None) -> str:
+    text = str(raw or '').strip()
+    if not text:
+        return ''
+    host, port, user, password = proxy_display_parts(text)
+    if not host:
+        return re.sub(r':[^:@/\s]+@', ':•••@', text)
+    low = normalize_proxy_setting(text).lower()
+    scheme = next((p for p in ('socks5h://', 'socks5://', 'https://', 'http://') if low.startswith(p)), '')
+    auth = f'{user}:•••@' if user and password else (f'{user}@' if user else '')
+    return f'{scheme}{auth}{host}:{port}' if port else f'{scheme}{auth}{host}'
+
+
 def proxy_url_for_requests(proxy: str) -> str | None:
     if not proxy or not str(proxy).strip():
         return None
@@ -878,15 +896,13 @@ def proxy_ok(proxy: str) -> bool:
         except ValueError:
             return False
         return bool(u.hostname and port is not None and 1 <= int(port) <= 65535)
+    if low.startswith(('http://', 'https://')):
+        s = s.split('://', 1)[1].rstrip('/')
     ip = r'(?:25[0-5]|2[0-4]\d|1\d{2}|[1-9]?\d)'
-    for pattern in (
-        re.compile(rf'^{ip}\.{ip}\.{ip}\.{ip}:(\d+)$'),
-        re.compile(rf'^[^:@]+:[^:@]+@{ip}\.{ip}\.{ip}\.{ip}:(\d+)$'),
-    ):
-        m = pattern.match(s)
-        if m:
-            return 1 <= int(m.group(1)) <= 65535
-    return False
+    label = r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?'
+    host = rf'(?:{ip}\.{ip}\.{ip}\.{ip}|(?:{label}\.)+[A-Za-z]{{2,63}})'
+    m = re.match(rf'^(?:[^:@/\s]+:[^@/\s]+@)?{host}:(\d{{1,5}})$', s)
+    return bool(m) and 1 <= int(m.group(1)) <= 65535
 
 
 def proxy_reachable(proxy: str, test_url: str = 'https://playerok.com', timeout: int = 10) -> bool:

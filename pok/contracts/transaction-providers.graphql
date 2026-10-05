@@ -1,0 +1,94 @@
+query transactionProviders($filter: TransactionProviderFilter!) {
+  transactionProviders(filter: $filter) {
+    ...RegularTransactionProvider
+    __typename
+  }
+}
+
+fragment RegularTransactionProvider on TransactionProvider {
+  id
+  name
+  fee
+  minFeeAmount
+  description
+  account {
+    ...RegularTransactionProviderAccount
+    __typename
+  }
+  props {
+    ...TransactionProviderPropsFragment
+    __typename
+  }
+  limits {
+    ...ProviderLimits
+    __typename
+  }
+  paymentMethods {
+    ...TransactionPaymentMethod
+    __typename
+  }
+  __typename
+}
+
+fragment RegularTransactionProviderAccount on TransactionProviderAccount {
+  id
+  value
+  userId
+  providerId
+  paymentMethodId
+  __typename
+}
+
+fragment TransactionProviderPropsFragment on TransactionProviderPropsFragment {
+  requiredUserData {
+    ...TransactionProviderRequiredUserData
+    __typename
+  }
+  tooltip
+  __typename
+}
+
+fragment ProviderLimits on ProviderLimits {
+  incoming {
+    ...ProviderLimitRange
+    __typename
+  }
+  outgoing {
+    ...ProviderLimitRange
+    __typename
+  }
+  __typename
+}
+
+fragment TransactionPaymentMethod on TransactionPaymentMethod {
+  id
+  name
+  fee
+  providerId
+  account {
+    ...RegularTransactionProviderAccount
+    __typename
+  }
+  props {
+    ...TransactionProviderPropsFragment
+    __typename
+  }
+  limits {
+    ...ProviderLimits
+    __typename
+  }
+  __typename
+}
+
+fragment TransactionProviderRequiredUserData on TransactionProviderRequiredUserData {
+  email
+  phoneNumber
+  eripAccountNumber
+  __typename
+}
+
+fragment ProviderLimitRange on ProviderLimitRange {
+  min
+  max
+  __typename
+}

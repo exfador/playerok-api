@@ -1,24 +1,20 @@
 from aiogram import Router, F
-from aiogram.types import CallbackQuery, FSInputFile
+from aiogram.types import CallbackQuery
 from aiogram.fsm.context import FSMContext
-from pathlib import Path
-from collections import deque
 from logging import getLogger
 import asyncio
-import shutil
 import os
 import html
 
 from lib.cfg import AppConf as cfg
-from lib.util import valid_index
+from lib.stock import DELIVERY_LOCK, find_good
+from lib.util import plural, proxy_masked, valid_index
 from lib.custom_commands import (
     cc_get_items,
     cc_wrap_items,
     cc_find_by_id,
     cc_toggle_event,
     cc_delete_item,
-    cc_trigger_taken,
-    cc_new_item,
 )
 from pok.defs import DealStage
 from lib.ext import find_extension, start_extension, stop_extension
@@ -56,6 +52,38 @@ def _patch_deal_idempotent(account, deal_id: str, target: DealStage):
         if getattr(current, 'status', None) == target:
             return current
         raise
+
+
+def _same_rule(rules, index, data: dict) -> bool:
+    if not _valid_index(rules, index):
+        return False
+    expected = data.get('auto_delivery_keys')
+    return expected is None or rules[index].get('keyphrases') == expected
+
+
+def _same_surface(data: dict, key: str, callback: CallbackQuery) -> bool:
+    message_id = getattr(callback.message, 'message_id', None)
+    return message_id is not None and data.get(key) == message_id
+
+
+async def _arm(state: FSMContext, key: str, target, callback: CallbackQuery, shown=None) -> None:
+    surface = getattr(shown, 'message_id', None) or callback.message.message_id
+    await state.update_data(**{key: {'target': target, 'surface': surface}})
+
+
+async def _armed(state: FSMContext, key: str, callback: CallbackQuery):
+    data = await state.get_data()
+    armed = data.get(key) or {}
+    if not armed.get('target') or armed.get('surface') != getattr(callback.message, 'message_id', None):
+        await callback.answer('Подтверждение устарело — откройте объект заново', show_alert=True)
+        return None
+    await state.update_data(**{key: None})
+    return armed['target']
+
+
+def _engine_or_none():
+    from bot.core import live_bridge
+    return live_bridge()
 
 
 def _runtime_sync_config() -> None:
@@ -100,7 +128,11 @@ async def hx_061(callback: CallbackQuery, callback_data: calls.PduRootNav, state
     if to == 'default':
         await emit_overlay(state, callback.message, templ.fac_040(), templ.fac_039(), callback)
     elif to == 'profile':
-        await emit_overlay(state, callback.message, templ.fac_049(), templ.fac_048(), callback)
+        try:
+            text = await asyncio.to_thread(templ.fac_049)
+        except Exception as exc:
+            text = f'👤 <b>Профиль на Playerok</b>\n\n❌ {html.escape(str(exc))}'
+        await emit_overlay(state, callback.message, text, templ.fac_048(), callback)
     elif to == 'logs':
         await emit_overlay(state, callback.message, templ.fac_038(), templ.fac_037(), callback)
     elif to == 'logger':
@@ -152,6 +184,28 @@ async def hx_upd_auto(callback: CallbackQuery, state: FSMContext):
     await emit_overlay(state, callback.message, templ.fac_upd_text(), templ.fac_upd_kb(), callback)
 
 
+@router.callback_query(F.data == CX.upd_en)
+async def hx_upd_enabled(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(None)
+    config = cfg.read('config')
+    upd = config.setdefault('updater', {})
+    upd['enabled'] = not bool(upd.get('enabled', False))
+    cfg.write('config', config)
+    _runtime_sync_config()
+    await emit_overlay(state, callback.message, templ.fac_upd_text(), templ.fac_upd_kb(), callback)
+
+
+@router.callback_query(F.data == CX.bc_en)
+async def hx_bc_enabled(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(None)
+    config = cfg.read('config')
+    bc = config.setdefault('broadcast', {})
+    bc['enabled'] = not bool(bc.get('enabled', False))
+    cfg.write('config', config)
+    _runtime_sync_config()
+    await emit_overlay(state, callback.message, templ.fac_upd_text(), templ.fac_upd_kb(), callback)
+
+
 @router.callback_query(F.data == CX.upd_notify)
 async def hx_upd_notify(callback: CallbackQuery, state: FSMContext):
     await state.set_state(None)
@@ -182,7 +236,11 @@ async def hx_sys_dl_do(callback: CallbackQuery, state: FSMContext):
     if not tag:
         await emit_overlay(state, callback.message, templ.fac_050('❌ Нет информации о релизе. Нажмите «🔄 Проверить обновления».'), templ.fac_system_kb(), callback)
         return
-    from lib.updater import GITHUB_REPO as _REPO
+    from lib.consts import VERSION as _VERSION
+    from lib.updater import GITHUB_REPO as _REPO, is_newer
+    if not is_newer(tag, _VERSION):
+        await emit_overlay(state, callback.message, templ.fac_050(f'✅ Установлена версия <b>{_html.escape(_VERSION)}</b>. Релиз {_html.escape(tag)} не новее — обновление не требуется.'), templ.fac_system_kb(), callback)
+        return
     url = (st.get('latest_download_url') or '').strip() or f'https://github.com/{_REPO}/archive/refs/tags/{tag}.zip'
 
     msg = callback.message
@@ -371,6 +429,8 @@ async def hx_026(callback: CallbackQuery, callback_data: calls.PduFulfillFilesPa
     await state.set_state(None)
     data = await state.get_data()
     index = data.get('auto_delivery_index')
+    if not _valid_index(cfg.read('auto_deliveries') or [], index):
+        return await hx_001(callback, calls.PduFulfillGrid(page=data.get('last_page', 0)), state)
     page = callback_data.page
     await state.update_data(last_page=page)
     await emit_overlay(state=state, message=callback.message, text=templ.fac_074(index), reply_markup=templ.fac_073(index, page), callback=callback)
@@ -441,7 +501,11 @@ async def hx_016(callback: CallbackQuery, callback_data: calls.PduCmdEvtFlip, st
 async def hx_002(callback: CallbackQuery, callback_data: calls.PduFulfillOpen, state: FSMContext):
     await state.set_state(None)
     index = callback_data.index
-    await state.update_data(auto_delivery_index=index)
+    rules = cfg.read('auto_deliveries') or []
+    if not _valid_index(rules, index):
+        data = await state.get_data()
+        return await hx_001(callback, calls.PduFulfillGrid(page=data.get('last_page', 0)), state)
+    await state.update_data(auto_delivery_index=index, auto_delivery_keys=rules[index].get('keyphrases'))
     data = await state.get_data()
     last_page = data.get('last_page', 0)
     await emit_overlay(state=state, message=callback.message, text=templ.fac_077(index), reply_markup=templ.fac_076(index, last_page), callback=callback)
@@ -450,9 +514,12 @@ async def hx_002(callback: CallbackQuery, callback_data: calls.PduFulfillOpen, s
 async def hx_062(callback: CallbackQuery, callback_data: calls.PduTplOpen, state: FSMContext):
     await state.set_state(None)
     message_id = callback_data.message_id
-    await state.update_data(message_id=message_id)
     data = await state.get_data()
     last_page = data.get('last_page', 0)
+    if message_id not in (cfg.read('messages') or {}):
+        await state.update_data(message_id=None)
+        return await hx_063(callback, calls.PduTplGrid(page=last_page), state)
+    await state.update_data(message_id=message_id)
     await emit_overlay(state=state, message=callback.message, text=templ.fac_088(message_id), reply_markup=templ.fac_087(message_id, last_page), callback=callback)
 
 @router.callback_query(calls.PduAddonOpen.filter())
@@ -492,21 +559,21 @@ async def hx_050(callback: CallbackQuery, state: FSMContext):
     await state.set_state(states.PduConnGrp.pdu_browser_ua)
     config = cfg.read('config')
     user_agent = config['account']['user_agent'] or '❌ Не задано'
-    await emit_overlay(state=state, message=callback.message, text=templ.fac_050(f'🎩 Введите новый <b>User Agent</b> вашего браузера:\n・ Текущее: <code>{user_agent}</code>'), reply_markup=templ.fac_023(calls.PduPrefsScope(to='auth').pack()))
+    await emit_overlay(state=state, message=callback.message, text=templ.fac_050(f'🎩 Введите новый <b>User Agent</b> вашего браузера:\n・ Текущее: <code>{html.escape(user_agent)}</code>'), reply_markup=templ.fac_023(calls.PduPrefsScope(to='auth').pack()))
 
 @router.callback_query(F.data == CX.pl_px)
 async def hx_045(callback: CallbackQuery, state: FSMContext):
     await state.set_state(states.PduConnGrp.pdu_pl_proxy_line)
     config = cfg.read('config')
-    proxy = config['account']['proxy'] or '❌ Не задано'
-    await emit_overlay(state=state, message=callback.message, text=templ.fac_068(f'🌐 Введите <b>HTTP-прокси</b> для аккаунта Playerok (<code>ip:port</code> или <code>user:pass@ip:port</code>):\n・ Текущий: <code>{proxy}</code>'), reply_markup=templ.fac_023(calls.PduPrefsScope(to='proxy').pack()))
+    proxy = html.escape(proxy_masked(config['account']['proxy'])) or '❌ Не задано'
+    await emit_overlay(state=state, message=callback.message, text=templ.fac_068(f'🌐 Введите <b>прокси</b> для аккаунта Playerok: {templ.PROXY_FORMATS}\n・ Текущий: <code>{proxy}</code>'), reply_markup=templ.fac_023(calls.PduPrefsScope(to='proxy').pack()))
 
 @router.callback_query(F.data == CX.tg_px)
 async def hx_048(callback: CallbackQuery, state: FSMContext):
     await state.set_state(states.PduConnGrp.pdu_tg_proxy_line)
     config = cfg.read('config')
-    proxy = config['bot']['proxy'] or '❌ Не задано'
-    await emit_overlay(state=state, message=callback.message, text=templ.fac_068(f'🌐 Введите <b>HTTP-прокси</b> для Telegram (<code>ip:port</code> или <code>user:pass@ip:port</code>):\n・ Текущий: <code>{proxy}</code>'), reply_markup=templ.fac_023(calls.PduPrefsScope(to='proxy').pack()))
+    proxy = html.escape(proxy_masked(config['bot']['proxy'])) or '❌ Не задано'
+    await emit_overlay(state=state, message=callback.message, text=templ.fac_068(f'🌐 Введите <b>прокси</b> для Telegram: {templ.PROXY_FORMATS}\n・ Текущий: <code>{proxy}</code>'), reply_markup=templ.fac_023(calls.PduPrefsScope(to='proxy').pack()))
 
 @router.callback_query(F.data == CX.pl_to)
 async def hx_047(callback: CallbackQuery, state: FSMContext):
@@ -540,7 +607,7 @@ async def hx_051(callback: CallbackQuery, state: FSMContext):
     await state.set_state(states.PduConnGrp.pdu_wm_text)
     config = cfg.read('config')
     watermark_value = config['features']['watermark']['text'] or '❌ Не задано'
-    await emit_overlay(state=state, message=callback.message, text=templ.fac_117(f'✏️ Введите новый <b>текст водяного знака</b>:\n・ Текущий: <code>{watermark_value}</code>'), reply_markup=templ.fac_023(calls.PduPrefsScope(to='watermark').pack()))
+    await emit_overlay(state=state, message=callback.message, text=templ.fac_117(f'✏️ Введите новый <b>текст водяного знака</b>:\n・ Текущий: <code>{html.escape(watermark_value)}</code>'), reply_markup=templ.fac_023(calls.PduPrefsScope(to='watermark').pack()))
 
 @router.callback_query(F.data == CX.in_rs_kw)
 async def hx_043(callback: CallbackQuery, state: FSMContext):
@@ -634,7 +701,7 @@ async def hx_033(callback: CallbackQuery, state: FSMContext):
             message=callback.message,
             text=templ.fac_062(
                 f'💬 Текст ответа в чат для <code>{item["trigger"]}</code> '
-                f'(отправляется после событий; несколько строк — несколько сообщений по смыслу одного блока):\n・ Сейчас: <blockquote>{cur}</blockquote>',
+                f'(отправляется после событий; несколько строк — несколько сообщений по смыслу одного блока):\n・ Сейчас: <blockquote>{html.escape(cur)}</blockquote>',
             ),
             reply_markup=templ.fac_023(calls.PduCmdOpen(cmd_id=cmd_id).pack()),
         )
@@ -646,7 +713,7 @@ async def hx_028(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     last_page = data.get('last_page', 0)
     await state.set_state(states.PduFulfillGrp.pdu_ff_sheet)
-    await emit_overlay(state=state, message=callback.message, text=templ.scr_delivs_float_text(f'📃 Введите номер страницы для перехода:'), reply_markup=templ.fac_023(calls.PduFulfillGrid(page=last_page).pack()))
+    await emit_overlay(state=state, message=callback.message, text=templ.fac_071('📃 Введите номер страницы для перехода:'), reply_markup=templ.fac_023(calls.PduFulfillGrid(page=last_page).pack()))
 
 @router.callback_query(F.data == CX.ad_kw_n)
 async def hx_038(callback: CallbackQuery, state: FSMContext):
@@ -667,7 +734,7 @@ async def hx_030(callback: CallbackQuery, state: FSMContext):
         auto_deliveries = cfg.read('auto_deliveries')
         if not _valid_index(auto_deliveries, index):
             return await hx_001(callback, calls.PduFulfillGrid(page=last_page), state)
-        auto_delivery_message = '</code>, <code>'.join(auto_deliveries[index]['keyphrases']) or '❌ Не задано'
+        auto_delivery_message = '</code>, <code>'.join(html.escape(str(k)) for k in auto_deliveries[index]['keyphrases']) or '❌ Не задано'
         await emit_overlay(state=state, message=callback.message, text=templ.fac_075(f'🔑 Введите новые <b>ключевые фразы</b> для автовыдачи по этому товару (через запятую)\n・ Текущее: <code>{auto_delivery_message}</code>'), reply_markup=templ.fac_023(calls.PduFulfillOpen(index=index).pack()))
     except Exception as e:
         await emit_overlay(state=state, message=callback.message, text=templ.fac_075(e), reply_markup=templ.fac_023(calls.PduFulfillGrid(page=last_page).pack()))
@@ -685,7 +752,7 @@ async def hx_031(callback: CallbackQuery, state: FSMContext):
         if not _valid_index(auto_deliveries, index):
             return await hx_001(callback, calls.PduFulfillGrid(page=last_page), state)
         auto_delivery_message = '\n'.join(auto_deliveries[index]['message']) or '❌ Не задано'
-        await emit_overlay(state=state, message=callback.message, text=templ.fac_075(f'💬 Введите новое <b>сообщение</b> после покупки\n・ Текущее: <blockquote>{auto_delivery_message}</blockquote>'), reply_markup=templ.fac_023(calls.PduFulfillOpen(index=index).pack()))
+        await emit_overlay(state=state, message=callback.message, text=templ.fac_075(f'💬 Введите новое <b>сообщение</b> после покупки\n・ Текущее: <blockquote>{html.escape(auto_delivery_message)}</blockquote>\n{templ.DELIVERY_VARIABLES}'), reply_markup=templ.fac_023(calls.PduFulfillOpen(index=index).pack()))
     except Exception as e:
         await emit_overlay(state=state, message=callback.message, text=templ.fac_075(e), reply_markup=templ.fac_023(calls.PduFulfillGrid(page=last_page).pack()))
 
@@ -726,7 +793,8 @@ async def hx_036(callback: CallbackQuery, state: FSMContext):
             return await hx_063(callback, calls.PduTplGrid(page=last_page), state)
         await state.set_state(states.PduTplGrp.pdu_tpl_body)
         messages = cfg.read('messages')
-        current = '\n'.join(messages[message_id]['text']) if messages[message_id]['text'] else '<i>пусто</i>'
+        raw_text = messages[message_id]['text']
+        current = html.escape('\n'.join(raw_text)) if raw_text else '<i>пусто</i>'
         available = fac_127(message_id)
         vars_block = fac_042(available)
         body = (
@@ -773,6 +841,49 @@ async def hx_098(callback: CallbackQuery, state: FSMContext):
     config['auto']['restore']['premium'] = not config['auto']['restore'].get('premium', False)
     cfg.write('config', config)
     return await hx_079(callback, calls.PduPrefsScope(to='restore'), state)
+
+@router.callback_query(F.data == CX.rs_kis)
+async def hx_rs_kis(callback: CallbackQuery, state: FSMContext):
+    config = cfg.read('config')
+    restore = config['auto']['restore']
+    if not restore.get('keep_in_sale', False) and not restore.get('premium'):
+        return await callback.answer('«Оставлять в продаже» работает только с платным PREMIUM — сначала включите «Платное (PREMIUM)».', show_alert=True)
+    restore['keep_in_sale'] = not restore.get('keep_in_sale', False)
+    cfg.write('config', config)
+    return await hx_079(callback, calls.PduPrefsScope(to='restore'), state)
+
+
+@router.callback_query(F.data == CX.rs_lim)
+async def hx_rs_lim(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(states.PduReviveGrp.pdu_revive_limit)
+    current = cfg.read('config')['auto']['restore'].get('premium_max_price') or 0
+    await emit_overlay(state=state, message=callback.message, text=templ.fac_103(
+        f'💰 Максимальная цена платного восстановления одного лота в ₽.\n・ <code>0</code> — без лимита.\n・ Сейчас: <code>{current}</code>'
+    ), reply_markup=templ.fac_023(calls.PduPrefsScope(to='restore').pack()), callback=callback)
+
+
+@router.callback_query(F.data == CX.bm_lim)
+async def hx_bm_lim(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(states.PduBoostGrp.pdu_boost_limit)
+    current = cfg.read('config')['auto']['bump'].get('max_price') or 0
+    await emit_overlay(state=state, message=callback.message, text=templ.fac_056(
+        f'💰 Максимальная цена одного поднятия в ₽.\n・ <code>0</code> — без лимита.\n・ Сейчас: <code>{current}</code>'
+    ), reply_markup=templ.fac_023(calls.PduPrefsScope(to='bump').pack()), callback=callback)
+
+
+@router.callback_query(F.data.in_({CX.day_lim, CX.day_lim_rs}))
+async def hx_day_lim(callback: CallbackQuery, state: FSMContext):
+    from lib.db import spend_today
+    origin = 'restore' if callback.data == CX.day_lim_rs else 'bump'
+    await state.set_state(states.PduBoostGrp.pdu_daily_limit)
+    await state.update_data(daily_limit_origin=origin)
+    current = cfg.read('config')['auto'].get('daily_limit') or 0
+    render = templ.fac_103 if origin == 'restore' else templ.fac_056
+    await emit_overlay(state=state, message=callback.message, text=render(
+        '💳 Сколько бот может тратить в день на платные автоподнятие и восстановление, ₽.\n'
+        f'・ <code>0</code> — без лимита.\n・ Сейчас: <code>{current}</code> · потрачено сегодня: <code>{spend_today():g}</code>'
+    ), reply_markup=templ.fac_023(calls.PduPrefsScope(to=origin).pack()), callback=callback)
+
 
 @router.callback_query(F.data == CX.rs_pol)
 async def hx_089(callback: CallbackQuery, state: FSMContext):
@@ -831,6 +942,16 @@ async def hx_082(callback: CallbackQuery, state: FSMContext):
     cfg.write('config', config)
     return await hx_079(callback, calls.PduPrefsScope(to='complete'), state)
 
+@router.callback_query(F.data == CX.sh_od)
+async def hx_confirm_only_delivered(callback: CallbackQuery, state: FSMContext):
+    config = cfg.read('config')
+    confirm = config['auto']['confirm']
+    confirm['only_delivered'] = not confirm.get('only_delivered', True)
+    cfg.write('config', config)
+    _runtime_sync_config()
+    return await hx_079(callback, calls.PduPrefsScope(to='complete'), state)
+
+
 @router.callback_query(F.data == CX.cc_en)
 async def hx_090(callback: CallbackQuery, state: FSMContext):
     config = cfg.read('config')
@@ -862,11 +983,12 @@ async def hx_085(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     last_page = data.get('last_page', 0)
     index = data.get('auto_delivery_index', 0)
-    auto_deliveries = cfg.read('auto_deliveries')
-    if not _valid_index(auto_deliveries, index):
-        return await hx_001(callback, calls.PduFulfillGrid(page=last_page), state)
-    auto_deliveries[index]['piece'] = not auto_deliveries[index].get('piece', False)
-    cfg.write('auto_deliveries', auto_deliveries)
+    with DELIVERY_LOCK:
+        auto_deliveries = cfg.read('auto_deliveries')
+        if not _same_rule(auto_deliveries, index, data):
+            return await hx_001(callback, calls.PduFulfillGrid(page=last_page), state)
+        auto_deliveries[index]['piece'] = not auto_deliveries[index].get('piece', False)
+        cfg.write('auto_deliveries', auto_deliveries)
     return await hx_002(callback, calls.PduFulfillOpen(index=index), state)
 
 @router.callback_query(F.data == CX.wm_en)
@@ -909,7 +1031,7 @@ async def hx_101(callback: CallbackQuery, state: FSMContext):
     return await hx_061(callback, calls.PduRootNav(to='logger'), state)
 
 @router.callback_query(F.data == CX.lg_dl)
-async def hx_098(callback: CallbackQuery, state: FSMContext):
+async def hx_098_deal(callback: CallbackQuery, state: FSMContext):
     config = cfg.read('config')
     _toggle_alert_type(config, 'deal', False)
     cfg.write('config', config)
@@ -957,7 +1079,7 @@ async def hx_096(callback: CallbackQuery, state: FSMContext):
     return await hx_061(callback, calls.PduRootNav(to='logger'), state)
 
 @router.callback_query(F.data == CX.lg_bt)
-async def hx_097(callback: CallbackQuery, state: FSMContext):
+async def hx_097_boot(callback: CallbackQuery, state: FSMContext):
     config = cfg.read('config')
     _toggle_alert_type(config, 'startup', True)
     cfg.write('config', config)
@@ -990,20 +1112,23 @@ async def hx_011(callback: CallbackQuery, state: FSMContext):
     messages = cfg.read('messages')
     info = messages.get(message_id, {})
     label = (info.get('title') or '').strip() or message_id
-    await emit_overlay(
+    shown = await emit_overlay(
         state=state, message=callback.message,
         text=templ.fac_084(f'Удалить шаблон «{html.escape(label)}»? Отменить нельзя.'),
         reply_markup=templ.fac_024(CX.tpl_del, calls.PduTplOpen(message_id=message_id).pack()),
         callback=callback,
     )
+    await _arm(state, 'tpl_delete', message_id, callback, shown)
 
 
 @router.callback_query(F.data == CX.tpl_del)
 async def hx_025(callback: CallbackQuery, state: FSMContext):
     await state.set_state(None)
     data = await state.get_data()
-    message_id = data.get('message_id')
     last_page = data.get('last_page', 0)
+    message_id = await _armed(state, 'tpl_delete', callback)
+    if message_id is None:
+        return
     messages = cfg.read('messages')
     if message_id and message_id in messages:
         del messages[message_id]
@@ -1062,14 +1187,8 @@ async def hx_024(callback: CallbackQuery, callback_data: calls.PduReviveAllowDro
         await state.set_state(None)
         data = await state.get_data()
         last_page = data.get('last_page', 0)
-        index = callback_data.index
-        if index is None:
-            return await hx_056(callback, calls.PduReviveAllowPage(page=last_page), state)
-        auto_restore_items = cfg.read('auto_restore_items')
-        if not _valid_index(auto_restore_items.get('included') or [], index):
-            return await hx_056(callback, calls.PduReviveAllowPage(page=last_page), state)
-        auto_restore_items['included'].pop(index)
-        cfg.write('auto_restore_items', auto_restore_items)
+        if not _drop_tagged('auto_restore_items', 'included', callback_data):
+            await callback.answer(_STALE_PHRASE, show_alert=True)
         return await hx_056(callback, calls.PduReviveAllowPage(page=last_page), state)
     except Exception as e:
         await emit_overlay(state=state, message=callback.message, text=templ.fac_104(e), reply_markup=templ.fac_023(calls.PduReviveAllowPage(page=last_page).pack()))
@@ -1080,14 +1199,8 @@ async def hx_023(callback: CallbackQuery, callback_data: calls.PduSealAllowDrop,
         await state.set_state(None)
         data = await state.get_data()
         last_page = data.get('last_page', 0)
-        index = callback_data.index
-        if index is None:
-            return await hx_055(callback, calls.PduSealAllowPage(page=last_page), state)
-        auto_complete_deals = cfg.read('auto_complete_deals')
-        if not _valid_index(auto_complete_deals.get('included') or [], index):
-            return await hx_055(callback, calls.PduSealAllowPage(page=last_page), state)
-        auto_complete_deals['included'].pop(index)
-        cfg.write('auto_complete_deals', auto_complete_deals)
+        if not _drop_tagged('auto_complete_deals', 'included', callback_data):
+            await callback.answer(_STALE_PHRASE, show_alert=True)
         return await hx_055(callback, calls.PduSealAllowPage(page=last_page), state)
     except Exception as e:
         await emit_overlay(state=state, message=callback.message, text=templ.fac_111(e), reply_markup=templ.fac_023(calls.PduSealAllowPage(page=last_page).pack()))
@@ -1098,14 +1211,8 @@ async def hx_022(callback: CallbackQuery, callback_data: calls.PduBoostAllowDrop
         await state.set_state(None)
         data = await state.get_data()
         last_page = data.get('last_page', 0)
-        index = callback_data.index
-        if index is None:
-            return await hx_054(callback, calls.PduBoostAllowPage(page=last_page), state)
-        auto_bump_items = cfg.read('auto_bump_items')
-        if not _valid_index(auto_bump_items.get('included') or [], index):
-            return await hx_054(callback, calls.PduBoostAllowPage(page=last_page), state)
-        auto_bump_items['included'].pop(index)
-        cfg.write('auto_bump_items', auto_bump_items)
+        if not _drop_tagged('auto_bump_items', 'included', callback_data):
+            await callback.answer(_STALE_PHRASE, show_alert=True)
         return await hx_054(callback, calls.PduBoostAllowPage(page=last_page), state)
     except Exception as e:
         await emit_overlay(state=state, message=callback.message, text=templ.fac_057(e), reply_markup=templ.fac_023(calls.PduBoostAllowPage(page=last_page).pack()))
@@ -1116,19 +1223,28 @@ async def hx_021(callback: CallbackQuery, callback_data: calls.PduBoostDenyDrop,
         await state.set_state(None)
         data = await state.get_data()
         last_page = data.get('last_page', 0)
-        index = callback_data.index
-        if index is None:
-            return await hx_053(callback, calls.PduBoostDenyPage(page=last_page), state)
-        auto_bump_items = cfg.read('auto_bump_items')
-        if 'excluded' not in auto_bump_items:
-            auto_bump_items['excluded'] = []
-        if not _valid_index(auto_bump_items['excluded'], index):
-            return await hx_053(callback, calls.PduBoostDenyPage(page=last_page), state)
-        auto_bump_items['excluded'].pop(index)
-        cfg.write('auto_bump_items', auto_bump_items)
+        if not _drop_tagged('auto_bump_items', 'excluded', callback_data):
+            await callback.answer(_STALE_PHRASE, show_alert=True)
         return await hx_053(callback, calls.PduBoostDenyPage(page=last_page), state)
     except Exception as e:
         await emit_overlay(state=state, message=callback.message, text=templ.fac_053(e), reply_markup=templ.fac_023(calls.PduBoostDenyPage(page=last_page).pack()))
+
+_STALE_PHRASE = 'Эта фраза уже удалена или список изменился — показываю актуальный'
+
+
+def _drop_tagged(name: str, key: str, callback_data) -> bool:
+    tag = getattr(callback_data, 'tag', '') or ''
+    if not tag:
+        return False
+    data = cfg.read(name) or {}
+    items = data.setdefault(key, [])
+    position = find_good(items, getattr(callback_data, 'index', None), tag)
+    if position is None:
+        return False
+    items.pop(position)
+    cfg.write(name, data)
+    return True
+
 
 def _save_notification(message) -> dict:
     try:
@@ -1179,12 +1295,9 @@ async def hx_058(callback: CallbackQuery, callback_data: calls.PduLogChatScroll,
         msgs = eng._recent_msgs(chat_id)
         from_cache = True
     if not msgs:
-        await callback.message.answer(
-            '❌ История пуста. Запрос списка сообщений на Playerok для этого клиента запрещён (403), '
-            'а в памяти бота ещё нет сообщений по этому чату. Отправьте или получите сообщение после перезапуска — '
-            'бот накапливает последние 25 сообщений из WebSocket.',
-            parse_mode='HTML',
-        )
+        reason = ('Playerok сейчас не отдаёт историю, а в памяти бота сообщений этого чата ещё нет — '
+                  'бот запоминает последние 25 сообщений из WebSocket.') if from_cache else 'В этом чате пока нет сообщений.'
+        await callback.message.answer(f'📭 История пуста. {reason}')
         return
     preview = None
     for m in msgs:
@@ -1223,19 +1336,30 @@ async def hx_070(callback: CallbackQuery, callback_data: calls.PduNickMemo, stat
     await state.set_state(None)
     username = callback_data.name
     do = callback_data.do
+    previous = await state.get_data()
     await state.update_data(username=username, notification_orig=_save_notification(callback.message))
     if do == 'send_mess':
         logger.info(f'[tg] ручной ответ  →  {username}')
+        old_prompt = previous.get('reply_message_id')
+        if old_prompt and old_prompt != callback.message.message_id:
+            from .helpers import msg_force_edit
+            try:
+                await msg_force_edit(callback.bot, callback.message.chat.id, old_prompt,
+                                     f'⏹ Ответ <b>{html.escape(previous.get("username") or "—")}</b> отменён: '
+                                     f'открыт ответ для <b>{html.escape(username)}</b>.', None)
+            except Exception:
+                pass
         await state.set_state(states.PduReplyDraftGrp.pdu_reply_body)
         from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
         back_kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text='⬅️ Назад', callback_data=CX.evt_back)]
         ])
-        await emit_overlay(
+        shown = await emit_overlay(
             state=state, message=callback.message,
-            text=f'💬 Введите сообщение для <b>{username}</b>:\n<i>Поддерживается текст и изображения.</i>',
+            text=f'💬 Введите сообщение для <b>{html.escape(username)}</b>:\n<i>Поддерживается текст и изображения.</i>',
             reply_markup=back_kb, callback=callback,
         )
+        await state.update_data(reply_message_id=getattr(shown, 'message_id', None) or callback.message.message_id)
     elif do == 'tpl_list':
         messages = cfg.read('messages') or {}
         if not messages:
@@ -1244,12 +1368,13 @@ async def hx_070(callback: CallbackQuery, callback_data: calls.PduNickMemo, stat
         order = list(messages.keys())
         await state.update_data(tpl_pick_order=order)
         await callback.answer()
-        await emit_overlay(
+        shown = await emit_overlay(
             state=state, message=callback.message,
             text=templ.fac_033(username, 0, order),
             reply_markup=templ.fac_032(0, order),
             callback=callback,
         )
+        await state.update_data(tpl_message_id=getattr(shown, 'message_id', None) or callback.message.message_id)
 
 
 @router.callback_query(calls.PduLogTplMenu.filter())
@@ -1259,16 +1384,18 @@ async def hx_059(callback: CallbackQuery, callback_data: calls.PduLogTplMenu, st
     data = await state.get_data()
     username = data.get('username')
     order = data.get('tpl_pick_order') or []
-    if not username or not order:
+    if not username or not order or not _same_surface(data, 'tpl_message_id', callback):
         await callback.answer('Сессия устарела — откройте уведомление снова', show_alert=True)
         return
     await callback.answer()
-    await emit_overlay(
+    shown = await emit_overlay(
         state=state, message=callback.message,
         text=templ.fac_033(username, page, order),
         reply_markup=templ.fac_032(page, order),
         callback=callback,
     )
+    if getattr(shown, 'message_id', None):
+        await state.update_data(tpl_message_id=shown.message_id)
 
 
 @router.callback_query(calls.PduLogTplFire.filter())
@@ -1279,13 +1406,15 @@ async def hx_060(callback: CallbackQuery, callback_data: calls.PduLogTplFire, st
     data = await state.get_data()
     username = data.get('username')
     order = data.get('tpl_pick_order') or []
-    if not username or idx < 0 or idx >= len(order):
+    if not username or idx < 0 or idx >= len(order) or not _same_surface(data, 'tpl_message_id', callback):
         await callback.answer('Сессия устарела — откройте «Шаблоны» снова', show_alert=True)
+        return
+    eng = _engine_or_none()
+    if eng is None:
+        await callback.answer('Движок Playerok ещё не запущен', show_alert=True)
         return
     mess_id = order[idx]
     await callback.answer()
-    from bot.core import live_bridge
-    eng = live_bridge()
     text = eng._render_tpl(mess_id, username)
     if not text or not str(text).strip():
         kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -1298,8 +1427,10 @@ async def hx_060(callback: CallbackQuery, callback_data: calls.PduLogTplFire, st
         )
         return
     try:
-        chat = eng._room_by_alias(username)
-        last_sent = eng._push(chat.id, text)
+        chat = await asyncio.to_thread(eng._room_by_alias, username)
+        if chat is None:
+            raise Exception(f'Чат с {username} не найден на Playerok')
+        last_sent = await asyncio.to_thread(eng._push, chat.id, text)
         if not last_sent:
             raise Exception('Не удалось отправить в чат Playerok')
         preview = text[:120].replace('\n', ' ')
@@ -1330,21 +1461,25 @@ async def hx_069(callback: CallbackQuery, callback_data: calls.PduDealMemo, stat
     await state.set_state(None)
     deal_id = callback_data.de_id
     do = callback_data.do
-    await state.update_data(deal_id=deal_id, notification_orig=_save_notification(callback.message))
+    await state.update_data(deal_id=deal_id, deal_message_id=callback.message.message_id,
+                            notification_orig=_save_notification(callback.message))
+    shown = None
     if do == 'refund':
-        await emit_overlay(
+        shown = await emit_overlay(
             state=state, message=callback.message,
             text=f'↩️ Подтвердите <b>возврат</b> по <a href="https://playerok.com/deal/{deal_id}">сделке</a>:',
             reply_markup=templ.fac_024(confirm_cb=CX.dl_rf, cancel_cb=CX.evt_back),
             callback=callback,
         )
     elif do == 'complete':
-        await emit_overlay(
+        shown = await emit_overlay(
             state=state, message=callback.message,
             text=f'✅ Подтвердите <b>выполнение</b> <a href="https://playerok.com/deal/{deal_id}">сделки</a>:',
             reply_markup=templ.fac_024(confirm_cb=CX.dl_ok, cancel_cb=CX.evt_back),
             callback=callback,
         )
+    if getattr(shown, 'message_id', None):
+        await state.update_data(deal_message_id=shown.message_id)
 
 @router.callback_query(calls.PduFulfillModePick.filter())
 async def hx_078(callback: CallbackQuery, callback_data: calls.PduFulfillModePick, state: FSMContext):
@@ -1358,18 +1493,30 @@ async def hx_078(callback: CallbackQuery, callback_data: calls.PduFulfillModePic
         await emit_overlay(state=state, message=callback.message, text=templ.fac_093(f'📦 Отправьте <b>товары</b> для поштучной выдачи (1 строка = 1 товар, можно прислать .txt файл с товарами):'), reply_markup=templ.fac_023(calls.PduFulfillGrid(page=last_page).pack()), callback=callback)
     else:
         await state.set_state(states.PduFulfillGrp.pdu_ff_msg_new)
-        await emit_overlay(state=state, message=callback.message, text=templ.fac_093(f'💬 Введите <b>сообщение автовыдачи</b>, которое будет отправляться после покупки товара:'), reply_markup=templ.fac_023(calls.PduFulfillGrid(page=last_page).pack()), callback=callback)
+        await emit_overlay(state=state, message=callback.message, text=templ.fac_093(f'💬 Введите <b>сообщение автовыдачи</b>, которое будет отправляться после покупки товара.\n\n{templ.DELIVERY_VARIABLES}'), reply_markup=templ.fac_023(calls.PduFulfillGrid(page=last_page).pack()), callback=callback)
+
+async def _deal_target(callback: CallbackQuery, state: FSMContext) -> str | None:
+    data = await state.get_data()
+    if not _same_surface(data, 'deal_message_id', callback) or not data.get('deal_id'):
+        await callback.answer('Подтверждение устарело — откройте уведомление о сделке заново', show_alert=True)
+        return None
+    if _engine_or_none() is None:
+        await callback.answer('Движок Playerok ещё не запущен', show_alert=True)
+        return None
+    await state.update_data(deal_message_id=None)
+    return data['deal_id']
+
 
 @router.callback_query(F.data == CX.dl_rf)
 async def hx_067(callback: CallbackQuery, state: FSMContext):
     await state.set_state(None)
-    from bot.core import live_bridge as _bridge
     from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-    eng = _bridge()
-    data = await state.get_data()
-    deal_id = data.get('deal_id')
+    deal_id = await _deal_target(callback, state)
+    if deal_id is None:
+        return
+    eng = _engine_or_none()
     try:
-        _patch_deal_idempotent(eng.bot_account, deal_id, DealStage.ROLLED_BACK)
+        await asyncio.to_thread(_patch_deal_idempotent, eng.bot_account, deal_id, DealStage.ROLLED_BACK)
         logger.info(f'[tg] возврат  deal={deal_id}')
         text = f'↩️ Возврат по <a href="https://playerok.com/deal/{deal_id}">сделке</a> оформлен.'
     except Exception as e:
@@ -1385,13 +1532,13 @@ async def hx_067(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == CX.dl_ok)
 async def hx_009(callback: CallbackQuery, state: FSMContext):
     await state.set_state(None)
-    from bot.core import live_bridge as _bridge
     from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-    eng = _bridge()
-    data = await state.get_data()
-    deal_id = data.get('deal_id')
+    deal_id = await _deal_target(callback, state)
+    if deal_id is None:
+        return
+    eng = _engine_or_none()
     try:
-        _patch_deal_idempotent(eng.bot_account, deal_id, DealStage.SENT)
+        await asyncio.to_thread(_patch_deal_idempotent, eng.bot_account, deal_id, DealStage.SENT)
         logger.info(f'[tg] сделка закрыта вручную  deal={deal_id}')
         text = f'✅ Сделка <a href="https://playerok.com/deal/{deal_id}">отмечена выполненной</a>.'
     except Exception as e:
@@ -1410,10 +1557,24 @@ async def hx_006(callback: CallbackQuery, state: FSMContext):
         return await hx_079(callback, calls.PduPrefsScope(to='bump'), state)
     try:
         await state.set_state(None)
-        await emit_overlay(state=state, message=callback.message, text=templ.fac_056(f'🔝 Идёт <b>обновление позиций</b> — смотрите консоль…'), reply_markup=templ.fac_023(calls.PduPrefsScope(to='bump').pack()))
+        await emit_overlay(state=state, message=callback.message, text=templ.fac_056('🔝 Поднимаю лоты…'), reply_markup=templ.fac_023(calls.PduPrefsScope(to='bump').pack()))
         from bot.core import live_bridge as _bridge
-        _bridge().bump_items()
-        await emit_overlay(state=state, message=callback.message, text=templ.fac_056(f'✅ <b>Позиции</b> обновлены'), reply_markup=templ.fac_023(calls.PduPrefsScope(to='bump').pack()))
+        engine = _bridge()
+        if engine is None:
+            raise Exception('Движок Playerok ещё не запущен')
+        stats = await asyncio.to_thread(engine.bump_items) or {}
+        if stats.get('checked') == 0:
+            return await emit_overlay(state=state, message=callback.message, text=templ.fac_056(
+                'ℹ️ Сейчас в продаже нет лотов — поднимать нечего.\nПоднимаются только активные лоты (APPROVED) с PREMIUM.'
+            ), reply_markup=templ.fac_023(calls.PduPrefsScope(to='bump').pack()))
+        summary = (
+            f'Поднято: <b>{stats.get("bumped", 0)}</b>\n'
+            f'Не PREMIUM: {stats.get("skip_priority", 0)} · нет в списке: {stats.get("skip_phrases", 0)} · '
+            f'исключено: {stats.get("skip_excluded", 0)}\n'
+            f'Дороже лимита: {stats.get("skip_price", 0)} · дневной лимит: {stats.get("skip_budget", 0)} · '
+            f'неизвестно: {stats.get("uncertain", 0)} · ошибок: {stats.get("error", 0)}'
+        )
+        await emit_overlay(state=state, message=callback.message, text=templ.fac_056(f'✅ <b>Готово</b>\n\n{summary}'), reply_markup=templ.fac_023(calls.PduPrefsScope(to='bump').pack()))
     except Exception as e:
         await emit_overlay(state=state, message=callback.message, text=templ.fac_056(e), reply_markup=templ.fac_023(calls.PduPrefsScope(to='bump').pack()))
 
@@ -1479,12 +1640,14 @@ async def hx_013(callback: CallbackQuery, state: FSMContext):
         if not item:
             return await hx_017(callback, calls.PduCmdGrid(page=last_page), state)
         trig = item['trigger']
-        await emit_overlay(
+        shown = await emit_overlay(
             state=state,
             message=callback.message,
-            text=templ.fac_062(f'🗑 Удалить команду <code>{trig}</code>?'),
+            text=templ.fac_062(f'🗑 Удалить команду <code>{html.escape(trig)}</code>?'),
             reply_markup=templ.fac_024(confirm_cb=CX.cc_del, cancel_cb=calls.PduCmdOpen(cmd_id=cmd_id).pack()),
+            callback=callback,
         )
+        await _arm(state, 'cc_delete', cmd_id, callback, shown)
     except Exception as e:
         data = await state.get_data()
         lp = data.get('last_page', 0)
@@ -1496,9 +1659,9 @@ async def hx_019(callback: CallbackQuery, state: FSMContext):
         await state.set_state(None)
         data = await state.get_data()
         last_page = data.get('last_page', 0)
-        cmd_id = data.get('custom_cmd_id')
+        cmd_id = await _armed(state, 'cc_delete', callback)
         if not cmd_id:
-            return await hx_017(callback, calls.PduCmdGrid(page=last_page), state)
+            return
         items = cc_get_items(cfg.read('custom_commands'))
         trig = (cc_find_by_id(items, cmd_id) or {}).get('trigger', cmd_id)
         if not cc_delete_item(items, cmd_id):
@@ -1507,8 +1670,9 @@ async def hx_019(callback: CallbackQuery, state: FSMContext):
         await emit_overlay(
             state=state,
             message=callback.message,
-            text=templ.fac_062(f'✅ Команда <code>{trig}</code> удалена'),
+            text=templ.fac_062(f'✅ Команда <code>{html.escape(trig)}</code> удалена'),
             reply_markup=templ.fac_023(calls.PduCmdGrid(page=last_page).pack()),
+            callback=callback,
         )
     except Exception as e:
         data = await state.get_data()
@@ -1527,9 +1691,10 @@ async def hx_000(callback: CallbackQuery, state: FSMContext):
         goods = data.get('new_auto_delivery_goods')
         if not keyphrases or piece is None or (piece is True and (not goods)) or (piece is False and (not message)):
             return await hx_001(callback, calls.PduFulfillGrid(page=last_page), state)
-        auto_deliveries = cfg.read('auto_deliveries')
-        auto_deliveries.append({'piece': piece, 'keyphrases': keyphrases, 'message': message.splitlines() if message and (not piece) else '', 'goods': goods if goods and piece else []})
-        cfg.write('auto_deliveries', auto_deliveries)
+        with DELIVERY_LOCK:
+            auto_deliveries = cfg.read('auto_deliveries')
+            auto_deliveries.append({'piece': piece, 'keyphrases': keyphrases, 'message': message.splitlines() if message and (not piece) else [], 'goods': goods if goods and piece else []})
+            cfg.write('auto_deliveries', auto_deliveries)
         await emit_overlay(state=state, message=callback.message, text=templ.fac_093(f'✅ <b>Авто-выдача</b> была успешно добавлена'), reply_markup=templ.fac_023(calls.PduFulfillGrid(page=last_page).pack()))
     except Exception as e:
         await emit_overlay(state=state, message=callback.message, text=templ.fac_093(e), reply_markup=templ.fac_023(calls.PduFulfillGrid(page=last_page).pack()))
@@ -1541,9 +1706,14 @@ async def hx_012(callback: CallbackQuery, state: FSMContext):
         data = await state.get_data()
         last_page = data.get('last_page', 0)
         index = data.get('auto_delivery_index')
-        if index is None:
+        rules = cfg.read('auto_deliveries') or []
+        if not _valid_index(rules, index):
             return await hx_001(callback, calls.PduFulfillGrid(page=last_page), state)
-        await emit_overlay(state=state, message=callback.message, text=templ.fac_075('🗑️ Подтвердите <b>удаление автовыдачи</b>:'), reply_markup=templ.fac_024(confirm_cb=CX.ad_del, cancel_cb=calls.PduFulfillOpen(index=index).pack()))
+        rule = rules[index]
+        phrases = html.escape(', '.join(rule.get('keyphrases') or []) or 'без фраз')
+        left = len(rule.get('goods') or []) if rule.get('piece', True) else 0
+        stock = f'\nВместе с правилом удалятся <b>{left}</b> {plural(left, "товар", "товара", "товаров")} со склада.' if left else ''
+        await emit_overlay(state=state, message=callback.message, text=templ.fac_075(f'🗑️ Удалить автовыдачу <code>{phrases}</code>?{stock}'), reply_markup=templ.fac_024(confirm_cb=CX.ad_del, cancel_cb=calls.PduFulfillOpen(index=index).pack()))
     except Exception as e:
         await emit_overlay(state=state, message=callback.message, text=templ.fac_075(e), reply_markup=templ.fac_023(calls.PduFulfillGrid(page=last_page).pack()))
 
@@ -1556,11 +1726,13 @@ async def hx_018(callback: CallbackQuery, state: FSMContext):
         index = data.get('auto_delivery_index')
         if index is None:
             return await hx_001(callback, calls.PduFulfillGrid(page=last_page), state)
-        auto_deliveries = cfg.read('auto_deliveries')
-        if not _valid_index(auto_deliveries, index):
-            return await hx_001(callback, calls.PduFulfillGrid(page=last_page), state)
-        del auto_deliveries[index]
-        cfg.write('auto_deliveries', auto_deliveries)
+        with DELIVERY_LOCK:
+            auto_deliveries = cfg.read('auto_deliveries')
+            if not _same_rule(auto_deliveries, index, data):
+                await callback.answer('Список автовыдачи изменился — откройте правило заново', show_alert=True)
+                return await hx_001(callback, calls.PduFulfillGrid(page=last_page), state)
+            del auto_deliveries[index]
+            cfg.write('auto_deliveries', auto_deliveries)
         await emit_overlay(state=state, message=callback.message, text=templ.fac_075('✅ <b>Авто-выдача</b> удалена'), reply_markup=templ.fac_023(calls.PduFulfillGrid(page=last_page).pack()))
     except Exception as e:
         await emit_overlay(state=state, message=callback.message, text=templ.fac_075(e), reply_markup=templ.fac_023(calls.PduFulfillGrid(page=last_page).pack()))
@@ -1575,14 +1747,17 @@ async def hx_020(callback: CallbackQuery, callback_data: calls.PduFulfillFileDro
         deliv_index = data.get('auto_delivery_index')
         if deliv_index is None:
             return await hx_001(callback, calls.PduFulfillGrid(page=last_page), state)
-        auto_deliveries = cfg.read('auto_deliveries')
-        if not _valid_index(auto_deliveries, deliv_index):
-            return await hx_001(callback, calls.PduFulfillGrid(page=last_page), state)
-        goods = auto_deliveries[deliv_index].get('goods') or []
-        if not _valid_index(goods, index):
-            return await hx_026(callback, calls.PduFulfillFilesPage(page=last_page), state)
-        goods.pop(index)
-        cfg.write('auto_deliveries', auto_deliveries)
+        with DELIVERY_LOCK:
+            auto_deliveries = cfg.read('auto_deliveries')
+            if not _same_rule(auto_deliveries, deliv_index, data):
+                return await hx_001(callback, calls.PduFulfillGrid(page=last_page), state)
+            goods = auto_deliveries[deliv_index].setdefault('goods', [])
+            position = find_good(goods, index, callback_data.tag)
+            if position is not None:
+                goods.pop(position)
+                cfg.write('auto_deliveries', auto_deliveries)
+        if position is None:
+            await callback.answer('Этот товар уже выдан или удалён', show_alert=True)
         return await hx_026(callback, calls.PduFulfillFilesPage(page=last_page), state)
     except Exception as e:
         await emit_overlay(state=state, message=callback.message, text=templ.fac_072(e), reply_markup=templ.fac_023(calls.PduFulfillGrid(page=last_page).pack()))
@@ -1607,20 +1782,18 @@ async def hx_072(callback: CallbackQuery, state: FSMContext):
     await state.set_state(None)
     from lib.util import get_bot_log_path
     from aiogram.types import BufferedInputFile
+    from .cmd import _pack_log
     import datetime
     log_path = get_bot_log_path()
     try:
         if not os.path.exists(log_path):
             return await emit_overlay(state=state, message=callback.message, text=templ.fac_036('❌ Файл логов не найден'), reply_markup=templ.fac_037(), callback=callback)
-        content = open(log_path, 'rb').read()
-        today = datetime.datetime.now().strftime('%d-%m-%Y')
-        filename = f'log_{today}.txt'
-        line_count = content.count(b'\n')
-        size_kb = len(content) / 1024
-        err_count = content.count(b'| ERROR |')
+        now = datetime.datetime.now()
+        payload, filename, size, line_count, err_count, trimmed = await asyncio.to_thread(_pack_log, log_path, f'log_{now.strftime("%d-%m-%Y")}')
         await callback.message.answer_document(
-            document=BufferedInputFile(content, filename=filename),
-            caption=f'📋 Лог за <b>{datetime.datetime.now().strftime("%d.%m.%Y")}</b>\n{line_count} строк · {size_kb:.1f} KB · ошибок: {err_count}',
+            document=BufferedInputFile(payload, filename=filename),
+            caption=(f'📋 Лог за <b>{now.strftime("%d.%m.%Y")}</b>\n{line_count} строк · {size / 1024:.1f} KB · ошибок: {err_count}'
+                     + ('\n✂️ Лог большой — отправлен только конец.' if trimmed else '')),
             parse_mode='HTML',
             reply_markup=templ.fac_016(),
         )
@@ -1638,4 +1811,14 @@ async def hx_010(callback: CallbackQuery, state: FSMContext):
         await state.set_state(None)
         return await hx_079(callback, calls.PduPrefsScope(to='bump'), state)
     await state.set_state(None)
-    await emit_overlay(state=state, message=callback.message, text=templ.fac_056('Подтвердите <b>обновление позиций</b> ↓'), reply_markup=templ.fac_024(CX.bm_run, calls.PduPrefsScope(to='bump').pack()))
+    auto_cfg = cfg.read('config')['auto']
+    price = auto_cfg['bump'].get('max_price') or 0
+    limit = auto_cfg.get('daily_limit') or 0
+    cost = (f'Каждое поднятие платное: до <b>{price} ₽</b> за лот' if price else 'Каждое поднятие платное, лимит цены не задан') + (
+        f', всего не больше <b>{limit} ₽</b> в день.' if limit else '.')
+    await emit_overlay(state=state, message=callback.message, text=templ.fac_056(f'Поднять подходящие PREMIUM-лоты сейчас?\n\n💳 {cost}'), reply_markup=templ.fac_024(CX.bm_run, calls.PduPrefsScope(to='bump').pack()))
+
+
+@router.callback_query(F.data.in_({CX.noop, CX.ad_g_pg}))
+async def hx_noop(callback: CallbackQuery):
+    await callback.answer()

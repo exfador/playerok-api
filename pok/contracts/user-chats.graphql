@@ -1,0 +1,101 @@
+query userChats($pagination: Pagination, $filter: ChatFilter) {
+  chats(pagination: $pagination, filter: $filter) {
+    edges {
+      cursor
+      node {
+        id
+        type
+        status
+        unreadMessagesCounter
+        bookmarked
+        lastMessage {
+          ...ListLastChatMessageFields
+          __typename
+        }
+        participants {
+          ...ListChatParticipant
+          __typename
+        }
+        __typename
+      }
+      __typename
+    }
+    pageInfo {
+      startCursor
+      endCursor
+      hasPreviousPage
+      hasNextPage
+      __typename
+    }
+    totalCount
+    __typename
+  }
+}
+
+fragment ListLastChatMessageFields on ChatMessage {
+  id
+  text
+  createdAt
+  isRead
+  isBulkMessaging
+  event
+  file {
+    id
+    url
+    __typename
+  }
+  user {
+    id
+    username
+    role
+    __typename
+  }
+  eventByUser {
+    id
+    username
+    __typename
+  }
+  eventToUser {
+    id
+    username
+    __typename
+  }
+  deal {
+    id
+    direction
+    status
+    user {
+      id
+      username
+      __typename
+    }
+    item {
+      id
+      sellerType
+      user {
+        id
+        username
+        __typename
+      }
+      __typename
+    }
+    __typename
+  }
+  images {
+    id
+    __typename
+  }
+  imageLinks
+  __typename
+}
+
+fragment ListChatParticipant on UserFragment {
+  id
+  username
+  avatarURL
+  isOnline
+  role
+  isBlocked
+  isVip
+  __typename
+}

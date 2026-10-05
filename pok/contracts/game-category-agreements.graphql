@@ -1,0 +1,29 @@
+query gameCategoryAgreements($filter: GameCategoryAgreementsFilter!, $pagination: Pagination, $sort: Sort) {
+  gameCategoryAgreements(filter: $filter, pagination: $pagination, sort: $sort) {
+    edges {
+      cursor
+      node {
+        ...MinimalGameCategoryAgreement
+        __typename
+      }
+      __typename
+    }
+    pageInfo {
+      startCursor
+      endCursor
+      hasNextPage
+      hasPreviousPage
+      __typename
+    }
+    totalCount
+    __typename
+  }
+}
+
+fragment MinimalGameCategoryAgreement on GameCategoryAgreement {
+  description
+  iconType
+  id
+  sequence
+  __typename
+}

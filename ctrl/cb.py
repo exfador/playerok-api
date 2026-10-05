@@ -94,10 +94,6 @@ class CX:
     xt_on = 'cx_21'
     xt_rf = 'cx_22'
 
-    st_dq = 'cx_23'
-    st_rst = 'cx_24'
-    st_bk = 'cx_25'
-
     dl_rf = 'cx_26'
     dl_ok = 'cx_27'
 
@@ -108,3 +104,17 @@ class CX:
     upd_notify = 'cx_2d'
 
     xt_imp = 'cx_2e'
+
+    upd_en = 'cx_2i'
+    bc_en = 'cx_2j'
+    day_lim = 'cx_2k'
+    day_lim_rs = 'cx_2q'
+    acc_open = 'cx_2l'
+    acc_pw = 'cx_2m'
+    acc_kick = 'cx_2n'
+    acc_kick_go = 'cx_2o'
+    sh_od = 'cx_2p'
+
+    rs_lim = 'cx_2f'
+    rs_kis = 'cx_2g'
+    bm_lim = 'cx_2h'

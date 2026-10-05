@@ -1,5 +1,5 @@
 from aiogram import types, Router, F
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from logging import getLogger
 from tempfile import NamedTemporaryFile
@@ -15,15 +15,47 @@ import time
 from lib.cfg import AppConf as cfg, hash_password, password_needs_rehash, verify_password
 from lib.custom_commands import cc_get_items, cc_wrap_items, cc_new_item, cc_trigger_taken, cc_find_by_id
 from lib.ext import ADDONS_DIR, all_extensions
-from lib.util import token_ok, cookies_ok, parse_cookies_string, ua_ok, proxy_ok, proxy_reachable, proxy_probe_html_suffix, valid_index
+from lib.util import token_ok, cookies_ok, parse_cookies_string, ua_ok, proxy_ok, proxy_reachable, proxy_probe_html_suffix, valid_index, plural, proxy_masked
 from . import ui as templ
 from . import states
 from . import keys as calls
 from .cb import CX
 from .helpers import emit_overlay, adm_gate, msg_force_edit
+from bot._kit import clean_phrases
+from lib.stock import DELIVERY_LOCK
+
+
+def _same_rule(rules, index, data: dict) -> bool:
+    if not valid_index(rules, index):
+        return False
+    expected = data.get('auto_delivery_keys')
+    return expected is None or rules[index].get('keyphrases') == expected
 
 logger = getLogger('pl.ctrl')
 router = Router()
+MAX_ADDON_FILES = 2000
+MAX_ADDON_BYTES = 50 * 1024 * 1024
+
+
+def _number(text: str | None) -> int | None:
+    raw = (text or '').strip()
+    return int(raw) if raw.isascii() and raw.isdigit() else None
+
+
+def _page(text: str | None, items: int, per_page: int = 7) -> int:
+    number = _number(text)
+    if number is None:
+        raise Exception('❌ Вы должны ввести числовое значение')
+    total_pages = max(1, math.ceil(items / per_page))
+    if not 1 <= number <= total_pages:
+        raise Exception(f'❌ Допустимый номер страницы: от 1 до {total_pages}')
+    return number - 1
+
+
+async def _retry(state: FSMContext, current, error) -> str:
+    await state.set_state(current)
+    return f'{error}\n\n<i>Можно сразу отправить исправленное значение или нажать «Назад».</i>'
+
 
 @router.message(Command('start'))
 async def on_cmd_start(message: types.Message, state: FSMContext):
@@ -91,6 +123,7 @@ async def on_cmd_status(message: types.Message, state: FSMContext):
     tg_ok = bool(telegram.get('polling_active')) and tg_fresh
     supervisor_ok = bool(market.get('feed_supervisor_alive'))
     overall = ws_ok and tg_ok and supervisor_ok and workers_ok and not market.get('stopping')
+    last_seen = max((v for v in (feed.get('last_pong_at'), feed.get('last_message_at')) if v is not None), default=None)
     error = feed.get('last_error') or telegram.get('last_error')
     error_line = ''
     if error:
@@ -99,7 +132,7 @@ async def on_cmd_status(message: types.Message, state: FSMContext):
         f'{"🟢" if overall else "🟡"} <b>Состояние CXH 24/7</b>\n\n'
         f'⏱ Аптайм: {_uptime(market.get("started_at"))}\n\n'
         f'{"🟢" if ws_ok else "🔴"} Playerok онлайн: <b>{"да" if ws_ok else "нет"}</b>\n'
-        f'├ Последний pong/ответ: {_age(feed.get("last_pong_at") or feed.get("last_message_at"))}\n'
+        f'├ Последний сигнал от сервера: {_age(last_seen)}\n'
         f'├ Переподключений: {int(feed.get("reconnect_count") or 0)}\n'
         f'└ Активных чат-подписок: {int(feed.get("subscriptions") or 0)}\n\n'
         f'{"🟢" if tg_ok else "🔴"} Telegram polling/API: <b>{"работает" if tg_ok else "требует внимания"}</b>\n'
@@ -151,7 +184,7 @@ async def on_cmd_logs(message: types.Message, state: FSMContext):
     try:
         dt = datetime.datetime.strptime(date_str, '%d.%m.%Y')
     except ValueError:
-        await message.answer('❌ Неверный формат даты. Используйте <code>ДД.ММ.ГГГГ</code>, например: <code>05.04.2026</code>', parse_mode='HTML')
+        await message.answer(f'❌ Неверный формат даты. Используйте <code>ДД.ММ.ГГГГ</code>, например: <code>{datetime.datetime.now():%d.%m.%Y}</code>', parse_mode='HTML')
         return
 
     log_path = os.path.join(project_root_dir(), 'logs', dt.strftime('%Y-%m-%d'), 'bot.log')
@@ -159,28 +192,77 @@ async def on_cmd_logs(message: types.Message, state: FSMContext):
         await message.answer(f'❌ Лог за <b>{date_str}</b> не найден.', parse_mode='HTML')
         return
 
+    name = f'log_{dt.strftime("%d-%m-%Y")}'
+    payload, filename, size, line_count, err_count, trimmed = await asyncio.to_thread(_pack_log, log_path, name)
+    caption = (f'📋 Лог за <b>{date_str}</b>\n{line_count} строк · {size / 1024:.1f} KB · ошибок: {err_count}'
+               + ('\n✂️ Лог большой — отправлен только конец.' if trimmed else ''))
+    await message.answer_document(BufferedInputFile(payload, filename=filename), caption=caption, parse_mode='HTML')
+
+
+_LOG_PLAIN_LIMIT = 5 * 1024 * 1024
+_LOG_SEND_LIMIT = 45 * 1024 * 1024
+
+
+def _pack_log(log_path: str, name: str) -> tuple[bytes, str, int, int, int, bool]:
+    import io
+    import zipfile
+    size = os.path.getsize(log_path)
     with open(log_path, 'rb') as log_file:
         content = log_file.read()
-    filename = f'log_{dt.strftime("%d-%m-%Y")}.txt'
-    size_kb = len(content) / 1024
     line_count = content.count(b'\n')
     err_count = content.count(b'| ERROR |')
-    caption = f'📋 Лог за <b>{date_str}</b>\n{line_count} строк · {size_kb:.1f} KB · ошибок: {err_count}'
-    await message.answer_document(
-        BufferedInputFile(content, filename=filename),
-        caption=caption,
-        parse_mode='HTML'
-    )
+    if len(content) <= _LOG_PLAIN_LIMIT:
+        return content, f'{name}.txt', size, line_count, err_count, False
+    trimmed = False
+    window = len(content)
+    while True:
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+            archive.writestr(f'{name}.txt', content[-window:])
+        packed = buffer.getvalue()
+        if len(packed) <= _LOG_SEND_LIMIT or window <= _LOG_PLAIN_LIMIT:
+            return packed, f'{name}.zip', size, line_count, err_count, trimmed
+        window //= 2
+        trimmed = True
+
+_GATE_FAILURES: dict[int, tuple[int, float]] = {}
+_GATE_FREE_ATTEMPTS = 5
+
+
+def _gate_locked_for(user_id: int) -> int:
+    failures, until = _GATE_FAILURES.get(user_id, (0, 0.0))
+    return max(0, int(until - time.monotonic()))
+
+
+def _gate_register_failure(user_id: int) -> None:
+    failures, _ = _GATE_FAILURES.get(user_id, (0, 0.0))
+    failures += 1
+    lock = 0.0
+    if failures >= _GATE_FREE_ATTEMPTS:
+        lock = min(3600.0, 60.0 * 2 ** (failures - _GATE_FREE_ATTEMPTS))
+    _GATE_FAILURES[user_id] = (failures, time.monotonic() + lock)
+    logger.warning('[tg] неверный пароль панели user_id=%s, попытка %s', user_id, failures)
+
 
 @router.message(states.PduGateGrp.pdu_gate_secret, F.text)
 async def rx_026(message: types.Message, state: FSMContext):
     try:
         await state.set_state(None)
-        config = cfg.read('config')
+        user_id = message.from_user.id
         plain_password = message.text.strip()
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        wait = _gate_locked_for(user_id)
+        if wait:
+            raise Exception(f'⏳ Слишком много попыток. Повторите через {wait} с.')
+        config = cfg.read('config')
         stored_hash = config['bot']['password_hash']
-        if not verify_password(plain_password, stored_hash):
+        if not await asyncio.to_thread(verify_password, plain_password, stored_hash):
+            _gate_register_failure(user_id)
             raise Exception('❌ Неверный пароль.')
+        _GATE_FAILURES.pop(user_id, None)
         if password_needs_rehash(stored_hash):
             config['bot']['password_hash'] = hash_password(plain_password)
         if message.from_user.id not in config['bot']['admins']:
@@ -204,23 +286,38 @@ async def rx_009(message: types.Message, state: FSMContext):
     try:
         from bot.core import live_bridge
         eng = live_bridge()
-        chat = eng._room_by_alias(username)
+        if eng is None:
+            raise Exception('Движок Playerok ещё не запущен')
+        if not username:
+            raise Exception('Получатель не выбран — откройте уведомление снова')
+        chat = await asyncio.to_thread(eng._room_by_alias, username)
+        if chat is None:
+            raise Exception(f'Чат с {html.escape(username)} не найден на Playerok')
         if message.text:
             if not message.text.strip():
                 raise Exception('Пустое сообщение')
-            last_sent = eng._push(chat.id, text=message.text.strip())
+            last_sent = await asyncio.to_thread(eng._push, chat.id, message.text.strip())
+            if not last_sent:
+                raise Exception('Playerok не принял сообщение')
             sent_msg = message.text
         elif message.photo:
             photo = message.photo[-1]
             with NamedTemporaryFile(delete=False, suffix='.jpg') as tmp:
-                await message.bot.download(photo, destination=tmp.name)
                 tmp_path = tmp.name
-            if caption_raw:
-                eng._push(chat.id, text=caption_raw)
-                sent_msg += caption_raw + ' '
-                await asyncio.sleep(1)
-            last_sent = eng._push(chat.id, photo_file_path=tmp_path)
-            os.remove(tmp_path)
+            try:
+                await message.bot.download(photo, destination=tmp_path)
+                if caption_raw:
+                    await asyncio.to_thread(eng._push, chat.id, caption_raw)
+                    sent_msg += caption_raw + ' '
+                    await asyncio.sleep(1)
+                last_sent = await asyncio.to_thread(eng._push, chat.id, None, tmp_path)
+            finally:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            if not last_sent:
+                raise Exception('Playerok не принял изображение')
             sent_msg += '[фото]'
         preview = sent_msg[:60].replace('\n', ' ')
         po_url = last_sent.file.url if last_sent and last_sent.file else None
@@ -294,6 +391,13 @@ async def _apply_cookie_jar_from_bot(jar: dict, state: FSMContext, message: type
     )
 
 
+async def _forget_secret_message(message: types.Message) -> None:
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
 @router.message(states.PduConnGrp.pdu_golden_key, F.document)
 async def rx_032_doc(message: types.Message, state: FSMContext):
     try:
@@ -312,13 +416,14 @@ async def rx_032_doc(message: types.Message, state: FSMContext):
                 os.unlink(tmp_path)
             except OSError:
                 pass
+            await _forget_secret_message(message)
         items = _extract_cookie_list(data)
         jar = cookies_from_json_list(items)
         if not jar.get('token') or not token_ok(jar['token']):
             raise Exception('В документе не найден валидный Cookie `token=` для playerok.com')
         await _apply_cookie_jar_from_bot(jar, state, message, source='из документа')
     except Exception as e:
-        await emit_overlay(state=state, message=message, text=templ.fac_050(f'❌ {e}'), reply_markup=templ.fac_023(calls.PduPrefsScope(to='auth').pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_050(await _retry(state, states.PduConnGrp.pdu_golden_key, f'❌ {e}')), reply_markup=templ.fac_023(calls.PduPrefsScope(to='auth').pack()))
 
 
 @router.message(states.PduConnGrp.pdu_golden_key, F.text)
@@ -329,6 +434,8 @@ async def rx_032(message: types.Message, state: FSMContext):
         import json as _json
         raw = (message.text or '').strip()
         low = raw.lower()
+        if low not in ('true', 'да', 'y', 'yes', 'ok', '1'):
+            await _forget_secret_message(message)
         if low in ('true', 'да', 'y', 'yes', 'ok', '1'):
             jar, err = load_cookies_json(COOKIES_JSON_PATH)
             if err:
@@ -359,95 +466,85 @@ async def rx_032(message: types.Message, state: FSMContext):
                 f'• или Header String (<code>token=...; __ddg5_=...</code>)'
             )
         config = cfg.read('config')
+        jar = parse_cookies_string(config['account'].get('cookies') or '')
+        jar['token'] = raw
         config['account']['token'] = raw
+        config['account']['cookies'] = '; '.join(f'{k}={v}' for k, v in jar.items() if v)
         cfg.write('config', config)
         await emit_overlay(state=state, message=message, text=templ.fac_050('✅ <b>Токен</b> сохранён (без Cookie — возможны блокировки DDoS-Guard)'), reply_markup=templ.fac_023(calls.PduPrefsScope(to='auth').pack()))
     except Exception as e:
-        await emit_overlay(state=state, message=message, text=templ.fac_050(f'❌ {e}'), reply_markup=templ.fac_023(calls.PduPrefsScope(to='auth').pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_050(await _retry(state, states.PduConnGrp.pdu_golden_key, f'❌ {e}')), reply_markup=templ.fac_023(calls.PduPrefsScope(to='auth').pack()))
 
 @router.message(states.PduConnGrp.pdu_browser_ua, F.text)
 async def rx_033(message: types.Message, state: FSMContext):
     try:
         await state.set_state(None)
-        user_agent = message.text
+        user_agent = (message.text or '').strip()
         if not ua_ok(user_agent):
             raise Exception('❌ Неверный формат User Agent. Пример: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36')
         config = cfg.read('config')
         config['account']['user_agent'] = user_agent
         cfg.write('config', config)
-        await emit_overlay(state=state, message=message, text=templ.fac_050(f'✅ <b>User Agent</b> был успешно изменён на <b>{user_agent}</b>'), reply_markup=templ.fac_023(calls.PduPrefsScope(to='auth').pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_050(
+            f'✅ <b>User Agent</b> сохранён: <code>{html.escape(user_agent)}</code>\n\n♻️ Применится после перезапуска бота (/restart).'
+        ), reply_markup=templ.fac_023(calls.PduPrefsScope(to='auth').pack()))
     except Exception as e:
-        await emit_overlay(state=state, message=message, text=templ.fac_050(e), reply_markup=templ.fac_023(calls.PduPrefsScope(to='auth').pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_050(await _retry(state, states.PduConnGrp.pdu_browser_ua, e)), reply_markup=templ.fac_023(calls.PduPrefsScope(to='auth').pack()))
 
 @router.message(states.PduConnGrp.pdu_pl_proxy_line, F.text)
 async def rx_027(message: types.Message, state: FSMContext):
     try:
         await state.set_state(None)
-        proxy = message.text
+        proxy = message.text.strip()
         if len(proxy) <= 3:
             raise Exception('❌ Слишком короткое значение')
         if not proxy_ok(proxy):
-            raise Exception('❌ Неверный формат. Нужен <b>HTTP</b>-прокси: <code>ip:port</code> или <code>user:pass@ip:port</code>')
-        if not proxy_reachable(proxy):
+            raise Exception(f'❌ Неверный формат прокси. Подходит: {templ.PROXY_FORMATS}')
+        if not await asyncio.to_thread(proxy_reachable, proxy):
             raise Exception('❌ Указанный вами прокси не работает. Нет подключения к playerok.com')
         config = cfg.read('config')
         config['account']['proxy'] = proxy
         cfg.write('config', config)
         probe = await asyncio.to_thread(proxy_probe_html_suffix, proxy)
-        await emit_overlay(state=state, message=message, text=templ.fac_068(f'✅ <b>Прокси для Playerok</b> (HTTP) сохранён: <b>{html.escape(proxy)}</b>{probe}'), reply_markup=templ.fac_023(calls.PduPrefsScope(to='proxy').pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_068(f'✅ <b>Прокси для Playerok</b> сохранён: <code>{html.escape(proxy_masked(proxy))}</code>{probe}\n\n♻️ Применится после перезапуска бота (/restart).'), reply_markup=templ.fac_023(calls.PduPrefsScope(to='proxy').pack()))
     except Exception as e:
-        await emit_overlay(state=state, message=message, text=templ.fac_068(e), reply_markup=templ.fac_023(calls.PduPrefsScope(to='proxy').pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_068(await _retry(state, states.PduConnGrp.pdu_pl_proxy_line, e)), reply_markup=templ.fac_023(calls.PduPrefsScope(to='proxy').pack()))
 
 @router.message(states.PduConnGrp.pdu_tg_proxy_line, F.text)
 async def rx_031(message: types.Message, state: FSMContext):
     try:
         await state.set_state(None)
-        proxy = message.text
+        proxy = message.text.strip()
         if len(proxy) <= 3:
             raise Exception('❌ Слишком короткое значение')
         if not proxy_ok(proxy):
-            raise Exception('❌ Неверный формат. Нужен <b>HTTP</b>-прокси: <code>ip:port</code> или <code>user:pass@ip:port</code>')
-        if not proxy_reachable(proxy, 'https://api.telegram.org/'):
+            raise Exception(f'❌ Неверный формат прокси. Подходит: {templ.PROXY_FORMATS}')
+        if not await asyncio.to_thread(proxy_reachable, proxy, 'https://api.telegram.org/'):
             raise Exception('❌ Указанный вами прокси не работает. Нет подключения к api.telegram.org')
         config = cfg.read('config')
         config['bot']['proxy'] = proxy
         cfg.write('config', config)
         probe = await asyncio.to_thread(proxy_probe_html_suffix, proxy)
-        await emit_overlay(state=state, message=message, text=templ.fac_068(f'✅ <b>Прокси для Telegram</b> (HTTP) сохранён: <b>{html.escape(proxy)}</b>{probe}'), reply_markup=templ.fac_023(calls.PduPrefsScope(to='proxy').pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_068(f'✅ <b>Прокси для Telegram</b> сохранён: <code>{html.escape(proxy_masked(proxy))}</code>{probe}\n\n♻️ Применится после перезапуска бота (/restart).'), reply_markup=templ.fac_023(calls.PduPrefsScope(to='proxy').pack()))
     except Exception as e:
-        await emit_overlay(state=state, message=message, text=templ.fac_068(e), reply_markup=templ.fac_023(calls.PduPrefsScope(to='proxy').pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_068(await _retry(state, states.PduConnGrp.pdu_tg_proxy_line, e)), reply_markup=templ.fac_023(calls.PduPrefsScope(to='proxy').pack()))
 
 @router.message(states.PduConnGrp.pdu_http_timeout, F.text)
 async def rx_029(message: types.Message, state: FSMContext):
     try:
         await state.set_state(None)
-        timeout = message.text
-        if not timeout.isdigit():
-            raise Exception('❌ Вы должны ввести числовое значение')
-        if int(timeout) < 0:
-            raise Exception('❌ Слишком низкое значение')
+        raw = (message.text or '').strip()
+        if not raw.isascii() or not raw.isdigit():
+            raise Exception('❌ Введите целое число секунд, например 30')
+        timeout = int(raw)
+        if not 5 <= timeout <= 300:
+            raise Exception('❌ Допустимо от 5 до 300 секунд')
         config = cfg.read('config')
-        config['account']['timeout'] = int(timeout)
+        config['account']['timeout'] = timeout
         cfg.write('config', config)
-        await emit_overlay(state=state, message=message, text=templ.fac_050(f'Таймаут запросов изменён на <b>{timeout} с</b>'), reply_markup=templ.fac_023(calls.PduPrefsScope(to='auth').pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_050(f'✅ Таймаут запросов изменён на <b>{timeout} с</b> — применяется сразу.'), reply_markup=templ.fac_023(calls.PduPrefsScope(to='auth').pack()))
     except Exception as e:
-        await emit_overlay(state=state, message=message, text=templ.fac_050(str(e)), reply_markup=templ.fac_023(calls.PduPrefsScope(to='auth').pack()))
-
-@router.message(states.PduConnGrp.pdu_listener_delay, F.text)
-async def rx_007(message: types.Message, state: FSMContext):
-    try:
-        await state.set_state(None)
-        delay = message.text
-        if not delay.isdigit():
-            raise Exception('❌ Вы должны ввести числовое значение')
-        if int(delay) < 0:
-            raise Exception('❌ Слишком низкое значение')
-        config = cfg.read('config')
-        config['account']['listener_delay'] = int(delay)
-        cfg.write('config', config)
-        await emit_overlay(state=state, message=message, text=templ.fac_050(f'✅ <b>Периодичность запросов</b> была успешна изменена на <b>{delay}</b>'), reply_markup=templ.fac_023(calls.PduPrefsScope(to='auth').pack()))
-    except Exception as e:
-        await emit_overlay(state=state, message=message, text=templ.fac_050(e), reply_markup=templ.fac_023(calls.PduPrefsScope(to='auth').pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_050(await _retry(state, states.PduConnGrp.pdu_http_timeout, e)), reply_markup=templ.fac_023(calls.PduPrefsScope(to='auth').pack()))
 
 @router.message(states.PduConnGrp.pdu_wm_text, F.text)
 async def rx_034(message: types.Message, state: FSMContext):
@@ -461,72 +558,67 @@ async def rx_034(message: types.Message, state: FSMContext):
         cfg.write('config', config)
         await emit_overlay(state=state, message=message, text=templ.fac_119(), reply_markup=templ.fac_118())
     except Exception as e:
-        await emit_overlay(state=state, message=message, text=templ.fac_117(str(e)), reply_markup=templ.fac_023(calls.PduPrefsScope(to='watermark').pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_117(await _retry(state, states.PduConnGrp.pdu_wm_text, e)), reply_markup=templ.fac_023(calls.PduPrefsScope(to='watermark').pack()))
 
 @router.message(states.PduConnGrp.pdu_log_tail, F.text)
 async def rx_008(message: types.Message, state: FSMContext):
     try:
         await state.set_state(None)
-        max_size = message.text
-        if not max_size.isdigit():
+        max_size_int = _number(message.text)
+        if max_size_int is None:
             raise Exception('❌ Вы должны ввести числовое значение')
-        if int(max_size) <= 0:
-            raise Exception('❌ Слишком низкое значение')
-        max_size_int = int(max_size)
+        if not 1 <= max_size_int <= 10240:
+            raise Exception('❌ Допустимо от 1 до 10240 МБ')
         config = cfg.read('config')
         config['logs']['max_mb'] = max_size_int
         cfg.write('config', config)
         await emit_overlay(state=state, message=message, text=templ.fac_036(f'✅ <b>Максимальный размер файла логов</b> был успешно изменён на <b>{max_size_int} MB</b>'), reply_markup=templ.fac_023(calls.PduRootNav(to='logs').pack()))
     except Exception as e:
-        await emit_overlay(state=state, message=message, text=templ.fac_036(e), reply_markup=templ.fac_023(calls.PduRootNav(to='logs').pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_036(await _retry(state, states.PduConnGrp.pdu_log_tail, e)), reply_markup=templ.fac_023(calls.PduRootNav(to='logs').pack()))
 
 @router.message(states.PduTplGrp.pdu_tpl_sheet, F.text)
 async def rx_011(message: types.Message, state: FSMContext):
     try:
         await state.set_state(None)
-        if not message.text.isdigit():
-            raise Exception('❌ Вы должны ввести числовое значение')
-        page = int(message.text) - 1
+        page = _page(message.text, len(cfg.read('messages')))
         await state.update_data(last_page=page)
         await emit_overlay(state=state, message=message, text=templ.fac_089(), reply_markup=templ.fac_085(page))
     except Exception as e:
         data = await state.get_data()
         last_page = data.get('last_page', 0)
-        await emit_overlay(state=state, message=message, text=templ.fac_084(e), reply_markup=templ.fac_023(calls.PduTplGrid(page=last_page).pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_084(await _retry(state, states.PduTplGrp.pdu_tpl_sheet, e)), reply_markup=templ.fac_023(calls.PduTplGrid(page=last_page).pack()))
 
 @router.message(states.PduAddonGrp.pdu_addon_sheet, F.text)
 async def rx_028(message: types.Message, state: FSMContext):
     try:
         await state.set_state(None)
-        if not message.text.isdigit():
-            raise Exception('❌ Вы должны ввести числовое значение')
-        page = int(message.text) - 1
-        per_page = 7
-        total_pages = max(1, math.ceil(len(all_extensions()) / per_page))
-        if page < 0 or page >= total_pages:
-            raise Exception(f'❌ Допустимый номер страницы: от 1 до {total_pages}')
+        page = _page(message.text, len(all_extensions()))
         await state.update_data(last_page=page)
         await emit_overlay(state=state, message=message, text=templ.fac_047(), reply_markup=templ.fac_046(page))
     except Exception as e:
         data = await state.get_data()
         last_page = data.get('last_page', 0)
-        await emit_overlay(state=state, message=message, text=templ.fac_043(e), reply_markup=templ.fac_023(calls.PduAddonGrid(page=last_page).pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_043(await _retry(state, states.PduAddonGrp.pdu_addon_sheet, e)), reply_markup=templ.fac_023(calls.PduAddonGrid(page=last_page).pack()))
 
 @router.message(states.PduTplGrp.pdu_tpl_body, F.text)
 async def rx_010(message: types.Message, state: FSMContext):
+    await state.set_state(None)
+    data = await state.get_data()
+    message_id = data.get('message_id')
+    messages = cfg.read('messages') or {}
+    known = message_id in messages
+    back = (calls.PduTplOpen(message_id=message_id) if known else calls.PduTplGrid(page=data.get('last_page', 0))).pack()
     try:
-        await state.set_state(None)
-        data = await state.get_data()
-        message_id = data.get('message_id')
+        if not known:
+            raise Exception('❌ Шаблон не найден — откройте его заново')
         if len(message.text) <= 0:
             raise Exception('❌ Слишком короткий текст')
-        messages = cfg.read('messages')
-        message_split_lines = message.text.split('\n')
-        messages[message_id]['text'] = message_split_lines
+        messages[message_id]['text'] = message.text.split('\n')
         cfg.write('messages', messages)
-        await emit_overlay(state=state, message=message, text=templ.fac_086(f'✅ <b>Текст шаблона</b> <code>{message_id}</code> изменён на <blockquote>{message.text}</blockquote>'), reply_markup=templ.fac_023(calls.PduTplOpen(message_id=message_id).pack()))
+        title = html.escape(templ.fac_013(message_id, messages[message_id]))
+        await emit_overlay(state=state, message=message, text=templ.fac_086(f'✅ Текст шаблона <b>«{title}»</b> изменён:\n<blockquote>{html.escape(message.text)}</blockquote>'), reply_markup=templ.fac_023(back))
     except Exception as e:
-        await emit_overlay(state=state, message=message, text=templ.fac_086(e), reply_markup=templ.fac_023(calls.PduTplOpen(message_id=message_id).pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_086(await _retry(state, states.PduTplGrp.pdu_tpl_body, e)), reply_markup=templ.fac_023(back))
 
 @router.message(states.PduTplGrp.pdu_tpl_name_new, F.text)
 async def rx_024(message: types.Message, state: FSMContext):
@@ -550,7 +642,7 @@ async def rx_024(message: types.Message, state: FSMContext):
     except Exception as e:
         await emit_overlay(
             state=state, message=message,
-            text=templ.fac_084(str(e)),
+            text=templ.fac_084(await _retry(state, states.PduTplGrp.pdu_tpl_name_new, e)),
             reply_markup=templ.fac_023(calls.PduTplGrid(page=0).pack()),
         )
 
@@ -584,7 +676,7 @@ async def rx_025(message: types.Message, state: FSMContext):
     except Exception as e:
         await emit_overlay(
             state=state, message=message,
-            text=templ.fac_084(str(e)),
+            text=templ.fac_084(await _retry(state, states.PduTplGrp.pdu_tpl_text_new, e)),
             reply_markup=templ.fac_023(calls.PduTplGrid(page=0).pack()),
         )
 
@@ -593,11 +685,12 @@ async def rx_025(message: types.Message, state: FSMContext):
 async def rx_030(message: types.Message, state: FSMContext):
     try:
         await state.set_state(None)
-        if not message.text.isdigit():
-            raise Exception('❌ Вы должны ввести числовое значение')
-        interval = int(message.text)
-        if interval < 30:
-            raise Exception('❌ Не меньше 30 секунд')
+        raw = (message.text or '').strip()
+        if not raw.isascii() or not raw.isdigit():
+            raise Exception('❌ Введите целое число секунд, например 300')
+        interval = int(raw)
+        if not 30 <= interval <= 86400:
+            raise Exception('❌ Допустимо от 30 до 86400 секунд')
         config = cfg.read('config')
         if 'poll' not in config['auto']['restore'] or not isinstance(config['auto']['restore'].get('poll'), dict):
             config['auto']['restore']['poll'] = {'enabled': False, 'interval': 300}
@@ -605,24 +698,62 @@ async def rx_030(message: types.Message, state: FSMContext):
         cfg.write('config', config)
         await emit_overlay(state=state, message=message, text=templ.fac_103(f'✅ Проверка завершённых раз в <b>{interval}</b> с'), reply_markup=templ.fac_023(calls.PduPrefsScope(to='restore').pack()))
     except Exception as e:
-        await emit_overlay(state=state, message=message, text=templ.fac_103(e), reply_markup=templ.fac_023(calls.PduPrefsScope(to='restore').pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_103(await _retry(state, states.PduReviveGrp.pdu_revive_poll_sec, e)), reply_markup=templ.fac_023(calls.PduPrefsScope(to='restore').pack()))
+
+
+async def _save_price_limit(message: types.Message, state: FSMContext, section: str | None, key: str, back: str, render, current) -> None:
+    try:
+        await state.set_state(None)
+        raw = (message.text or '').strip().replace(',', '.')
+        try:
+            value = float(raw)
+        except ValueError:
+            raise Exception('❌ Введите число, например <code>50</code>')
+        if not math.isfinite(value) or value < 0 or value > 100000:
+            raise Exception('❌ Допустимо от 0 до 100000')
+        config = cfg.read('config')
+        target = config['auto'] if section is None else config['auto'][section]
+        target[key] = int(value) if value.is_integer() else round(value, 2)
+        cfg.write('config', config)
+        shown = 'без лимита' if not value else f'{target[key]} ₽'
+        await emit_overlay(state=state, message=message, text=render(f'✅ Лимит сохранён: <b>{shown}</b>'), reply_markup=templ.fac_023(calls.PduPrefsScope(to=back).pack()))
+    except Exception as e:
+        await emit_overlay(state=state, message=message, text=render(await _retry(state, current, e)), reply_markup=templ.fac_023(calls.PduPrefsScope(to=back).pack()))
+
+
+@router.message(states.PduReviveGrp.pdu_revive_limit, F.text)
+async def rx_revive_limit(message: types.Message, state: FSMContext):
+    await _save_price_limit(message, state, 'restore', 'premium_max_price', 'restore', templ.fac_103, states.PduReviveGrp.pdu_revive_limit)
+
+
+@router.message(states.PduBoostGrp.pdu_boost_limit, F.text)
+async def rx_boost_limit(message: types.Message, state: FSMContext):
+    await _save_price_limit(message, state, 'bump', 'max_price', 'bump', templ.fac_056, states.PduBoostGrp.pdu_boost_limit)
+
+
+@router.message(states.PduBoostGrp.pdu_daily_limit, F.text)
+async def rx_daily_limit(message: types.Message, state: FSMContext):
+    origin = 'restore' if (await state.get_data()).get('daily_limit_origin') == 'restore' else 'bump'
+    render = templ.fac_103 if origin == 'restore' else templ.fac_056
+    await _save_price_limit(message, state, None, 'daily_limit', origin, render, states.PduBoostGrp.pdu_daily_limit)
 
 
 @router.message(states.PduBoostGrp.pdu_boost_interval_sec, F.text)
 async def rx_004(message: types.Message, state: FSMContext):
     try:
         await state.set_state(None)
-        if not message.text.isdigit():
-            raise Exception('❌ Вы должны ввести числовое значение')
-        if int(message.text) <= 0:
-            raise Exception('❌ Слишком низкое значение')
-        interval = int(message.text)
+        raw = (message.text or '').strip()
+        if not raw.isascii() or not raw.isdigit():
+            raise Exception('❌ Введите целое число секунд, например 3600')
+        interval = int(raw)
+        if not 600 <= interval <= 604800:
+            raise Exception('❌ Допустимо от 600 секунд (10 минут) до 604800 (7 дней): каждое поднятие платное')
         config = cfg.read('config')
         config['auto']['bump']['interval'] = interval
         cfg.write('config', config)
-        await emit_overlay(state=state, message=message, text=templ.fac_056(f'✅ <b>Интервал автоподнятия предметов</b> был успешно изменён на <b>{interval}</b>'), reply_markup=templ.fac_023(calls.PduPrefsScope(to='bump').pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_056(f'✅ Интервал автоподнятия: <b>{interval} с</b>'), reply_markup=templ.fac_023(calls.PduPrefsScope(to='bump').pack()))
     except Exception as e:
-        await emit_overlay(state=state, message=message, text=templ.fac_056(e), reply_markup=templ.fac_023(calls.PduPrefsScope(to='bump').pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_056(await _retry(state, states.PduBoostGrp.pdu_boost_interval_sec, e)), reply_markup=templ.fac_023(calls.PduPrefsScope(to='bump').pack()))
 
 @router.message(states.PduBoostGrp.pdu_boost_allow_line, F.text)
 async def rx_018(message: types.Message, state: FSMContext):
@@ -631,16 +762,18 @@ async def rx_018(message: types.Message, state: FSMContext):
         if len(message.text) <= 0:
             raise Exception('❌ Слишком короткое значение')
         keyphrases = [phrase.strip() for phrase in message.text.split(',') if phrase.strip()]
+        if not keyphrases:
+            raise Exception('❌ Укажите хотя бы одну непустую фразу')
         auto_bump_items = cfg.read('auto_bump_items')
         auto_bump_items['included'].append(keyphrases)
         cfg.write('auto_bump_items', auto_bump_items)
         data = await state.get_data()
         last_page = data.get('last_page', 0)
-        await emit_overlay(state=state, message=message, text=templ.fac_091(f"✅ Предмет с ключевыми фразами <code>{'</code>, <code>'.join(keyphrases)}</code> успешно включён в автоподнятие"), reply_markup=templ.fac_023(calls.PduBoostAllowPage(page=last_page).pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_091(f"✅ В автоподнятие добавлено: <code>{'</code>, <code>'.join(html.escape(str(k)) for k in keyphrases)}</code>"), reply_markup=templ.fac_023(calls.PduBoostAllowPage(page=last_page).pack()))
     except Exception as e:
         data = await state.get_data()
         last_page = data.get('last_page', 0)
-        await emit_overlay(state=state, message=message, text=templ.fac_091(e), reply_markup=templ.fac_023(calls.PduBoostAllowPage(page=last_page).pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_091(await _retry(state, states.PduBoostGrp.pdu_boost_allow_line, e)), reply_markup=templ.fac_023(calls.PduBoostAllowPage(page=last_page).pack()))
 
 @router.message(states.PduBoostGrp.pdu_boost_allow_bulk, F.document.file_name.lower().endswith('.txt'))
 async def rx_019(message: types.Message, state: FSMContext):
@@ -663,11 +796,11 @@ async def rx_019(message: types.Message, state: FSMContext):
         cfg.write('auto_bump_items', auto_bump_items)
         data = await state.get_data()
         last_page = data.get('last_page', 0)
-        await emit_overlay(state=state, message=message, text=templ.fac_091(f'✅ Успешно включено <b>{len(keyphrases_list)}</b> предметов из файла в автоподнятие'), reply_markup=templ.fac_023(calls.PduBoostAllowPage(page=last_page).pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_091(f'✅ Из файла в автоподнятие добавлено <b>{len(keyphrases_list)}</b> {plural(len(keyphrases_list), "строка", "строки", "строк")}'), reply_markup=templ.fac_023(calls.PduBoostAllowPage(page=last_page).pack()))
     except Exception as e:
         data = await state.get_data()
         last_page = data.get('last_page', 0)
-        await emit_overlay(state=state, message=message, text=templ.fac_091(e), reply_markup=templ.fac_023(calls.PduBoostAllowPage(page=last_page).pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_091(await _retry(state, states.PduBoostGrp.pdu_boost_allow_bulk, e)), reply_markup=templ.fac_023(calls.PduBoostAllowPage(page=last_page).pack()))
 
 @router.message(states.PduBoostGrp.pdu_boost_deny_line, F.text)
 async def rx_016(message: types.Message, state: FSMContext):
@@ -676,6 +809,8 @@ async def rx_016(message: types.Message, state: FSMContext):
         if len(message.text) <= 0:
             raise Exception('❌ Слишком короткое значение')
         keyphrases = [phrase.strip() for phrase in message.text.split(',') if phrase.strip()]
+        if not keyphrases:
+            raise Exception('❌ Укажите хотя бы одну непустую фразу')
         auto_bump_items = cfg.read('auto_bump_items')
         if 'excluded' not in auto_bump_items:
             auto_bump_items['excluded'] = []
@@ -686,14 +821,14 @@ async def rx_016(message: types.Message, state: FSMContext):
         await emit_overlay(
             state=state, message=message,
             text=templ.fac_090(
-                f"✅ В исключения добавлено: <code>{'</code>, <code>'.join(keyphrases)}</code>",
+                f"✅ В исключения добавлено: <code>{'</code>, <code>'.join(html.escape(str(k)) for k in keyphrases)}</code>",
             ),
             reply_markup=templ.fac_023(calls.PduBoostDenyPage(page=last_page).pack()),
         )
     except Exception as e:
         data = await state.get_data()
         last_page = data.get('last_page', 0)
-        await emit_overlay(state=state, message=message, text=templ.fac_090(e), reply_markup=templ.fac_023(calls.PduBoostDenyPage(page=last_page).pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_090(await _retry(state, states.PduBoostGrp.pdu_boost_deny_line, e)), reply_markup=templ.fac_023(calls.PduBoostDenyPage(page=last_page).pack()))
 
 @router.message(states.PduBoostGrp.pdu_boost_deny_bulk, F.document.file_name.lower().endswith('.txt'))
 async def rx_017(message: types.Message, state: FSMContext):
@@ -726,19 +861,18 @@ async def rx_017(message: types.Message, state: FSMContext):
     except Exception as e:
         data = await state.get_data()
         last_page = data.get('last_page', 0)
-        await emit_overlay(state=state, message=message, text=templ.fac_090(e), reply_markup=templ.fac_023(calls.PduBoostDenyPage(page=last_page).pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_090(await _retry(state, states.PduBoostGrp.pdu_boost_deny_bulk, e)), reply_markup=templ.fac_023(calls.PduBoostDenyPage(page=last_page).pack()))
 
 @router.message(states.PduCmdGrp.pdu_cmd_sheet, F.text)
 async def rx_006(message: types.Message, state: FSMContext):
     try:
-        if not message.text.strip().isdigit():
-            raise Exception('❌ Вы должны ввести числовое значение')
-        await state.update_data(last_page=int(message.text.strip()) - 1)
         await state.set_state(None)
-        await emit_overlay(state=state, message=message, text=templ.fac_067(), reply_markup=templ.fac_066(page=int(message.text) - 1))
+        page = _page(message.text, len(cc_get_items(cfg.read('custom_commands'))))
+        await state.update_data(last_page=page)
+        await emit_overlay(state=state, message=message, text=templ.fac_067(), reply_markup=templ.fac_066(page=page))
     except Exception as e:
         data = await state.get_data()
-        await emit_overlay(state=state, message=message, text=templ.fac_065(e), reply_markup=templ.fac_023(calls.PduCmdGrid(page=data.get('last_page', 0)).pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_065(await _retry(state, states.PduCmdGrp.pdu_cmd_sheet, e)), reply_markup=templ.fac_023(calls.PduCmdGrid(page=data.get('last_page', 0)).pack()))
 
 @router.message(states.PduCmdGrp.pdu_cmd_body_new, F.text)
 async def rx_015(message: types.Message, state: FSMContext):
@@ -765,7 +899,7 @@ async def rx_015(message: types.Message, state: FSMContext):
             reply_markup=templ.fac_063(new_item['id'], last_page),
         )
     except Exception as e:
-        await emit_overlay(state=state, message=message, text=templ.fac_092(e), reply_markup=templ.fac_023(calls.PduCmdGrid(page=last_page).pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_092(await _retry(state, states.PduCmdGrp.pdu_cmd_body_new, e)), reply_markup=templ.fac_023(calls.PduCmdGrid(page=last_page).pack()))
 
 @router.message(states.PduCmdGrp.pdu_cmd_reply, F.text)
 async def rx_005(message: types.Message, state: FSMContext):
@@ -796,7 +930,7 @@ async def rx_005(message: types.Message, state: FSMContext):
         await emit_overlay(
             state=state,
             message=message,
-            text=templ.fac_062(e),
+            text=templ.fac_062(await _retry(state, states.PduCmdGrp.pdu_cmd_reply, e)),
             reply_markup=templ.fac_023(calls.PduCmdOpen(cmd_id=cmd_id).pack()) if cmd_id else templ.fac_023(calls.PduCmdGrid(page=last_page).pack()),
         )
 
@@ -809,12 +943,14 @@ async def rx_020(message: types.Message, state: FSMContext):
         if len(message.text) <= 0:
             raise Exception('❌ Слишком короткое значение')
         keyphrases = [phrase.strip() for phrase in message.text.split(',') if phrase.strip()]
+        if not keyphrases:
+            raise Exception('❌ Укажите хотя бы одну непустую фразу')
         auto_complete_deals = cfg.read('auto_complete_deals')
         auto_complete_deals['included'].append(keyphrases)
         cfg.write('auto_complete_deals', auto_complete_deals)
-        await emit_overlay(state=state, message=message, text=templ.fac_109('✅ Предмет успешно включён в автоподтверждение'), reply_markup=templ.fac_023(calls.PduSealAllowPage(page=last_page).pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_109(f"✅ В автоподтверждение добавлено: <code>{'</code>, <code>'.join(html.escape(str(k)) for k in keyphrases)}</code>"), reply_markup=templ.fac_023(calls.PduSealAllowPage(page=last_page).pack()))
     except Exception as e:
-        await emit_overlay(state=state, message=message, text=templ.fac_109(e), reply_markup=templ.fac_023(calls.PduSealAllowPage(page=last_page).pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_109(await _retry(state, states.PduSealGrp.pdu_seal_phrase_line, e)), reply_markup=templ.fac_023(calls.PduSealAllowPage(page=last_page).pack()))
 
 @router.message(states.PduSealGrp.pdu_seal_phrase_bulk, F.document.file_name.lower().endswith('.txt'))
 async def rx_021(message: types.Message, state: FSMContext):
@@ -837,9 +973,9 @@ async def rx_021(message: types.Message, state: FSMContext):
         auto_complete_deals = cfg.read('auto_complete_deals')
         auto_complete_deals['included'].extend(keyphrases_list)
         cfg.write('auto_complete_deals', auto_complete_deals)
-        await emit_overlay(state=state, message=message, text=templ.fac_109(f'✅ Успешно включено <b>{len(keyphrases_list)} предметов</b> из файла в автоподтверждение'), reply_markup=templ.fac_023(calls.PduSealAllowPage(page=last_page).pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_109(f'✅ Из файла в автоподтверждение добавлено <b>{len(keyphrases_list)}</b> {plural(len(keyphrases_list), "строка", "строки", "строк")}'), reply_markup=templ.fac_023(calls.PduSealAllowPage(page=last_page).pack()))
     except Exception as e:
-        await emit_overlay(state=state, message=message, text=templ.fac_109(e), reply_markup=templ.fac_023(calls.PduSealAllowPage(page=last_page).pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_109(await _retry(state, states.PduSealGrp.pdu_seal_phrase_bulk, e)), reply_markup=templ.fac_023(calls.PduSealAllowPage(page=last_page).pack()))
 
 @router.message(states.PduReviveGrp.pdu_revive_phrase_line, F.text)
 async def rx_022(message: types.Message, state: FSMContext):
@@ -850,12 +986,14 @@ async def rx_022(message: types.Message, state: FSMContext):
         if len(message.text) <= 0:
             raise Exception('❌ Слишком короткое значение')
         keyphrases = [phrase.strip() for phrase in message.text.split(',') if phrase.strip()]
+        if not keyphrases:
+            raise Exception('❌ Укажите хотя бы одну непустую фразу')
         auto_restore_items = cfg.read('auto_restore_items')
         auto_restore_items['included'].append(keyphrases)
         cfg.write('auto_restore_items', auto_restore_items)
-        await emit_overlay(state=state, message=message, text=templ.fac_096(f"✅ Предмет с ключевыми фразами <code>{'</code>, <code>'.join(keyphrases)}</code> успешно включён в автовосстановление"), reply_markup=templ.fac_023(calls.PduReviveAllowPage(page=last_page).pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_096(f"✅ В автовосстановление добавлено: <code>{'</code>, <code>'.join(html.escape(str(k)) for k in keyphrases)}</code>"), reply_markup=templ.fac_023(calls.PduReviveAllowPage(page=last_page).pack()))
     except Exception as e:
-        await emit_overlay(state=state, message=message, text=templ.fac_096(e), reply_markup=templ.fac_023(calls.PduReviveAllowPage(page=last_page).pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_096(await _retry(state, states.PduReviveGrp.pdu_revive_phrase_line, e)), reply_markup=templ.fac_023(calls.PduReviveAllowPage(page=last_page).pack()))
 
 @router.message(states.PduReviveGrp.pdu_revive_phrase_bulk, F.document.file_name.lower().endswith('.txt'))
 async def rx_023(message: types.Message, state: FSMContext):
@@ -878,23 +1016,21 @@ async def rx_023(message: types.Message, state: FSMContext):
         auto_restore_items = cfg.read('auto_restore_items')
         auto_restore_items['included'].extend(keyphrases_list)
         cfg.write('auto_restore_items', auto_restore_items)
-        await emit_overlay(state=state, message=message, text=templ.fac_096(f'✅ Успешно включено <b>{len(keyphrases_list)}</b> предметов из файла в автовосстановление'), reply_markup=templ.fac_023(calls.PduReviveAllowPage(page=last_page).pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_096(f'✅ Из файла в автовосстановление добавлено <b>{len(keyphrases_list)}</b> {plural(len(keyphrases_list), "строка", "строки", "строк")}'), reply_markup=templ.fac_023(calls.PduReviveAllowPage(page=last_page).pack()))
     except Exception as e:
-        await emit_overlay(state=state, message=message, text=templ.fac_096(e), reply_markup=templ.fac_023(calls.PduReviveAllowPage(page=last_page).pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_096(await _retry(state, states.PduReviveGrp.pdu_revive_phrase_bulk, e)), reply_markup=templ.fac_023(calls.PduReviveAllowPage(page=last_page).pack()))
 
 @router.message(states.PduFulfillGrp.pdu_ff_sheet, F.text)
 async def rx_000(message: types.Message, state: FSMContext):
     try:
         await state.set_state(None)
-        if not message.text.isdigit():
-            raise Exception('❌ Вы должны ввести числовое значение')
-        page = int(message.text) - 1
+        page = _page(message.text, len(cfg.read('auto_deliveries')))
         await state.update_data(last_page=page)
-        await emit_overlay(state=state, message=message, text=templ.scr_delivs_float_text(f'📃 Введите номер страницы для перехода:'), reply_markup=templ.fac_078(page))
+        await emit_overlay(state=state, message=message, text=templ.fac_079(), reply_markup=templ.fac_078(page))
     except Exception as e:
         data = await state.get_data()
         last_page = data.get('last_page', 0)
-        await emit_overlay(state=state, message=message, text=templ.scr_delivs_float_text(e), reply_markup=templ.fac_023(calls.PduFulfillGrid(page=last_page).pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_071(await _retry(state, states.PduFulfillGrp.pdu_ff_sheet, e)), reply_markup=templ.fac_023(calls.PduFulfillGrid(page=last_page).pack()))
 
 @router.message(states.PduFulfillGrp.pdu_ff_keys_new, F.text)
 async def rx_013(message: types.Message, state: FSMContext):
@@ -902,14 +1038,18 @@ async def rx_013(message: types.Message, state: FSMContext):
         await state.set_state(None)
         data = await state.get_data()
         last_page = data.get('last_page', 0)
-        if len(message.text) <= 0:
-            raise Exception('❌ Слишком короткое значение')
-        keyphrases = [phrase.strip() for phrase in message.text.split(',')]
+        keyphrases = clean_phrases(message.text)
+        if not keyphrases:
+            raise Exception('❌ Укажите хотя бы одну непустую фразу')
         await state.update_data(new_auto_delivery_keyphrases=keyphrases)
         await state.set_state(states.PduFulfillGrp.pdu_ff_piece_edit)
-        await emit_overlay(state=state, message=message, text=templ.fac_093(f'🛒 Выберите <b>тип автовыдачи</b>:'), reply_markup=templ.fac_095(last_page))
+        await emit_overlay(state=state, message=message, text=templ.fac_093(
+            '🛒 Выберите <b>тип автовыдачи</b>:\n\n'
+            '🔑 <b>Поштучно</b> — каждому покупателю по одному ключу/ссылке из вашего списка.\n'
+            '💬 <b>Один текст</b> — всем покупателям одно и то же сообщение.'
+        ), reply_markup=templ.fac_095(last_page))
     except Exception as e:
-        await emit_overlay(state=state, message=message, text=templ.fac_093(e), reply_markup=templ.fac_023(calls.PduFulfillGrid(page=last_page).pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_093(await _retry(state, states.PduFulfillGrp.pdu_ff_keys_new, e)), reply_markup=templ.fac_023(calls.PduFulfillGrid(page=last_page).pack()))
 
 @router.message(states.PduFulfillGrp.pdu_ff_msg_new, F.text)
 async def rx_014(message: types.Message, state: FSMContext):
@@ -921,11 +1061,11 @@ async def rx_014(message: types.Message, state: FSMContext):
             raise Exception('❌ Слишком короткое значение')
         await state.update_data(new_auto_delivery_message=message.text)
         keyphrases = data.get('new_auto_delivery_keyphrases')
-        phrases = '</code>, <code>'.join(keyphrases)
+        phrases = '</code>, <code>'.join(html.escape(str(k)) for k in keyphrases)
         msg = message.text
-        await emit_overlay(state=state, message=message, text=templ.fac_093(f'✔️ Подтвердите <b>добавление автовыдачи</b>:\n<b>· Ключевые фразы:</b> <code>{phrases}</code>\n<b>· Тип выдачи:</b> Сообщением\n<b>· Сообщение:</b> {msg}'), reply_markup=templ.fac_024(confirm_cb=CX.ad_go, cancel_cb=calls.PduFulfillGrid(page=last_page).pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_093(f'✔️ Подтвердите <b>добавление автовыдачи</b>:\n<b>· Ключевые фразы:</b> <code>{phrases}</code>\n<b>· Тип выдачи:</b> Сообщением\n<b>· Сообщение:</b> {html.escape(msg)}'), reply_markup=templ.fac_024(confirm_cb=CX.ad_go, cancel_cb=calls.PduFulfillGrid(page=last_page).pack()))
     except Exception as e:
-        await emit_overlay(state=state, message=message, text=templ.fac_093(e), reply_markup=templ.fac_023(calls.PduFulfillGrid(page=last_page).pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_093(await _retry(state, states.PduFulfillGrp.pdu_ff_msg_new, e)), reply_markup=templ.fac_023(calls.PduFulfillGrid(page=last_page).pack()))
 
 @router.message(states.PduFulfillGrp.pdu_ff_goods_new, F.text | F.document)
 async def rx_012(message: types.Message, state: FSMContext):
@@ -950,10 +1090,10 @@ async def rx_012(message: types.Message, state: FSMContext):
             raise Exception('❌ Не удалось извлечь товары')
         await state.update_data(new_auto_delivery_goods=goods)
         keyphrases = data.get('new_auto_delivery_keyphrases')
-        phrases = '</code>, <code>'.join(keyphrases)
+        phrases = '</code>, <code>'.join(html.escape(str(k)) for k in keyphrases)
         await emit_overlay(state=state, message=message, text=templ.fac_093(f'✔️ Подтвердите <b>добавление автовыдачи</b>:\n<b>· Ключевые фразы:</b> <code>{phrases}</code>\n<b>· Тип выдачи:</b> Поштучно\n<b>· Товары:</b> {len(goods)} шт.'), reply_markup=templ.fac_024(confirm_cb=CX.ad_go, cancel_cb=calls.PduFulfillGrid(page=last_page).pack()))
     except Exception as e:
-        await emit_overlay(state=state, message=message, text=templ.fac_093(e), reply_markup=templ.fac_023(calls.PduFulfillGrid(page=last_page).pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_093(await _retry(state, states.PduFulfillGrp.pdu_ff_goods_new, e)), reply_markup=templ.fac_023(calls.PduFulfillGrid(page=last_page).pack()))
 
 @router.message(states.PduFulfillGrp.pdu_ff_keys_edit, F.text)
 async def rx_002(message: types.Message, state: FSMContext):
@@ -963,16 +1103,20 @@ async def rx_002(message: types.Message, state: FSMContext):
         index = data.get('auto_delivery_index')
         if len(message.text) <= 0:
             raise Exception('❌ Слишком короткое значение')
-        auto_deliveries = cfg.read('auto_deliveries')
-        if not valid_index(auto_deliveries, index):
-            return await emit_overlay(state=state, message=message, text=templ.fac_075('⚠️ Автовыдача изменилась или была удалена.'), reply_markup=templ.fac_023(calls.PduFulfillGrid(page=data.get('last_page', 0)).pack()))
-        keyphrases = [phrase.strip() for phrase in message.text.split(',')]
-        auto_deliveries[index]['keyphrases'] = keyphrases
-        cfg.write('auto_deliveries', auto_deliveries)
-        keyphrases_str = '</code>, <code>'.join(keyphrases)
+        keyphrases = clean_phrases(message.text)
+        if not keyphrases:
+            raise Exception('❌ Укажите хотя бы одну непустую фразу')
+        with DELIVERY_LOCK:
+            auto_deliveries = cfg.read('auto_deliveries')
+            if not _same_rule(auto_deliveries, index, data):
+                return await emit_overlay(state=state, message=message, text=templ.fac_075('⚠️ Автовыдача изменилась или была удалена.'), reply_markup=templ.fac_023(calls.PduFulfillGrid(page=data.get('last_page', 0)).pack()))
+            auto_deliveries[index]['keyphrases'] = keyphrases
+            cfg.write('auto_deliveries', auto_deliveries)
+        await state.update_data(auto_delivery_keys=keyphrases)
+        keyphrases_str = '</code>, <code>'.join(html.escape(str(k)) for k in keyphrases)
         await emit_overlay(state=state, message=message, text=templ.fac_075(f'✅ <b>Ключевые фразы</b> были успешно изменены на: <code>{keyphrases_str}</code>'), reply_markup=templ.fac_023(calls.PduFulfillOpen(index=index).pack()))
     except Exception as e:
-        await emit_overlay(state=state, message=message, text=templ.fac_075(e), reply_markup=templ.fac_023(calls.PduFulfillOpen(index=index).pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_075(await _retry(state, states.PduFulfillGrp.pdu_ff_keys_edit, e)), reply_markup=templ.fac_023(calls.PduFulfillOpen(index=index).pack()))
 
 @router.message(states.PduFulfillGrp.pdu_ff_msg_edit, F.text)
 async def rx_003(message: types.Message, state: FSMContext):
@@ -982,14 +1126,15 @@ async def rx_003(message: types.Message, state: FSMContext):
         index = data.get('auto_delivery_index')
         if len(message.text) <= 0:
             raise Exception('❌ Слишком короткий текст')
-        auto_deliveries = cfg.read('auto_deliveries')
-        if not valid_index(auto_deliveries, index):
-            return await emit_overlay(state=state, message=message, text=templ.fac_075('⚠️ Автовыдача изменилась или была удалена.'), reply_markup=templ.fac_023(calls.PduFulfillGrid(page=data.get('last_page', 0)).pack()))
-        auto_deliveries[index]['message'] = message.text.splitlines()
-        cfg.write('auto_deliveries', auto_deliveries)
-        await emit_overlay(state=state, message=message, text=templ.fac_075(f'✅ <b>Сообщение автовыдачи</b> было успешно изменено на: <blockquote>{message.text}</blockquote>'), reply_markup=templ.fac_023(calls.PduFulfillOpen(index=index).pack()))
+        with DELIVERY_LOCK:
+            auto_deliveries = cfg.read('auto_deliveries')
+            if not _same_rule(auto_deliveries, index, data):
+                return await emit_overlay(state=state, message=message, text=templ.fac_075('⚠️ Автовыдача изменилась или была удалена.'), reply_markup=templ.fac_023(calls.PduFulfillGrid(page=data.get('last_page', 0)).pack()))
+            auto_deliveries[index]['message'] = message.text.splitlines()
+            cfg.write('auto_deliveries', auto_deliveries)
+        await emit_overlay(state=state, message=message, text=templ.fac_075(f'✅ <b>Сообщение автовыдачи</b> было успешно изменено на: <blockquote>{html.escape(message.text)}</blockquote>'), reply_markup=templ.fac_023(calls.PduFulfillOpen(index=index).pack()))
     except Exception as e:
-        await emit_overlay(state=state, message=message, text=templ.fac_075(e), reply_markup=templ.fac_023(calls.PduFulfillOpen(index=index).pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_075(await _retry(state, states.PduFulfillGrp.pdu_ff_msg_edit, e)), reply_markup=templ.fac_023(calls.PduFulfillOpen(index=index).pack()))
 
 @router.message(states.PduFulfillGrp.pdu_ff_goods_add, F.text | F.document)
 async def rx_001(message: types.Message, state: FSMContext):
@@ -1013,14 +1158,15 @@ async def rx_001(message: types.Message, state: FSMContext):
             raise Exception('❌ Отправьте текст или файл')
         if not goods:
             raise Exception('❌ Не удалось извлечь товары')
-        auto_deliveries = cfg.read('auto_deliveries')
-        if not valid_index(auto_deliveries, index):
-            return await emit_overlay(state=state, message=message, text=templ.fac_094('⚠️ Автовыдача изменилась или была удалена.'), reply_markup=templ.fac_023(calls.PduFulfillGrid(page=last_page).pack()))
-        auto_deliveries[index]['goods'].extend(goods)
-        cfg.write('auto_deliveries', auto_deliveries)
-        await emit_overlay(state=state, message=message, text=templ.fac_094(f'✅ <b>{len(goods)} товаров</b> успешно добавлено в автовыдачу'), reply_markup=templ.fac_023(calls.PduFulfillFilesPage(page=last_page).pack()))
+        with DELIVERY_LOCK:
+            auto_deliveries = cfg.read('auto_deliveries')
+            if not _same_rule(auto_deliveries, index, data):
+                return await emit_overlay(state=state, message=message, text=templ.fac_094('⚠️ Автовыдача изменилась или была удалена.'), reply_markup=templ.fac_023(calls.PduFulfillGrid(page=last_page).pack()))
+            auto_deliveries[index].setdefault('goods', []).extend(goods)
+            cfg.write('auto_deliveries', auto_deliveries)
+        await emit_overlay(state=state, message=message, text=templ.fac_094(f'✅ В автовыдачу {plural(len(goods), "добавлен", "добавлено", "добавлено")} <b>{len(goods)}</b> {plural(len(goods), "товар", "товара", "товаров")}'), reply_markup=templ.fac_023(calls.PduFulfillFilesPage(page=last_page).pack()))
     except Exception as e:
-        await emit_overlay(state=state, message=message, text=templ.fac_094(e), reply_markup=templ.fac_023(calls.PduFulfillFilesPage(page=last_page).pack()))
+        await emit_overlay(state=state, message=message, text=templ.fac_094(await _retry(state, states.PduFulfillGrp.pdu_ff_goods_add, e)), reply_markup=templ.fac_023(calls.PduFulfillFilesPage(page=last_page).pack()))
 
 
 @router.message(
@@ -1051,12 +1197,14 @@ async def rx_addon_import(message: types.Message, state: FSMContext):
             with zf:
                 names = [n for n in zf.namelist() if not n.startswith('__MACOSX/')]
                 for n in names:
-                    if n.startswith(('/', '..', '\\')) or '..' in n.replace('\\', '/').split('/'):
-                        raise Exception(f'❌ Опасный путь в архиве: {n!r}')
+                    if n.startswith(('/', '..', '\\')) or '..' in n.replace('\\', '/').split('/') or re.match(r'^[A-Za-z]:', n):
+                        raise Exception(f'❌ Опасный путь в архиве: <code>{html.escape(n)}</code>')
+                unpacked = sum(info.file_size for info in zf.infolist())
+                if len(names) > MAX_ADDON_FILES or unpacked > MAX_ADDON_BYTES:
+                    raise Exception(f'❌ Архив слишком большой: допустимо до {MAX_ADDON_FILES} файлов и {MAX_ADDON_BYTES // (1024 * 1024)} МБ после распаковки.')
 
                 os.makedirs(ADDONS_DIR, exist_ok=True)
 
-                top_entries = {n.split('/', 1)[0] for n in names if n.strip()}
                 root_files = [n for n in names if '/' not in n.rstrip('/') and n]
                 has_root_init = any(n == '__init__.py' for n in root_files)
 
@@ -1113,6 +1261,23 @@ async def rx_addon_import(message: types.Message, state: FSMContext):
         await emit_overlay(
             state=state,
             message=message,
-            text=templ.fac_043(str(e)),
+            text=templ.fac_043(await _retry(state, states.PduAddonGrp.pdu_addon_import_file, e)),
             reply_markup=templ.fac_023(calls.PduAddonGrid(page=last_page).pack()),
         )
+
+
+@router.message(StateFilter(
+    states.PduAddonGrp.pdu_addon_import_file,
+    states.PduBoostGrp.pdu_boost_allow_bulk,
+    states.PduBoostGrp.pdu_boost_deny_bulk,
+    states.PduSealGrp.pdu_seal_phrase_bulk,
+    states.PduReviveGrp.pdu_revive_phrase_bulk,
+))
+async def rx_expect_file(message: types.Message, state: FSMContext):
+    extension = '.zip' if await state.get_state() == states.PduAddonGrp.pdu_addon_import_file.state else '.txt'
+    await message.answer(f'📎 Здесь нужен файл <b>{extension}</b> — пришлите его документом. Чтобы выйти, нажмите «Назад» на экране выше.', parse_mode='HTML')
+
+
+@router.message(StateFilter(states.PduFulfillGrp.pdu_ff_piece_new, states.PduFulfillGrp.pdu_ff_piece_edit))
+async def rx_expect_choice(message: types.Message):
+    await message.answer('👆 Выберите тип выдачи кнопкой на экране выше.')

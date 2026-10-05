@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from logging import getLogger
 from lib.consts import C_BRIGHT, C_DIM
 from lib.bus import graft, prune, graft_mkt, prune_mkt, fire
-from lib.util import check_requirements
+from lib.util import check_requirements, plural
 
 logger = getLogger('cxh.ext')
 ADDONS_DIR = str(Path(__file__).resolve().parent.parent / 'ext')
@@ -69,10 +69,27 @@ async def _enable_extension(ext: Extension) -> None:
         await fire('PLUG_IN', [ext], handler)
 
 
+def _disabled_names() -> set[str]:
+    from lib.db import AppDb
+    state = AppDb.get('ext_state') or {}
+    return {str(name) for name in state.get('disabled') or []}
+
+
+def _remember_disabled(name: str, disabled: bool) -> None:
+    from lib.db import AppDb
+    names = _disabled_names()
+    if disabled:
+        names.add(name)
+    else:
+        names.discard(name)
+    AppDb.set('ext_state', {'disabled': sorted(names)})
+
+
 async def start_extension(ext_uuid: UUID) -> bool:
     try:
         ext = find_extension(ext_uuid)
         await _enable_extension(ext)
+        _remember_disabled(ext._dir_name, False)
         logger.info('Расширение %s%s%s включено', C_BRIGHT, ext.meta.name, Fore.RESET)
         return True
     except Exception as e:
@@ -95,6 +112,7 @@ async def stop_extension(ext_uuid: UUID) -> bool:
     try:
         ext = find_extension(ext_uuid)
         await _disable_extension(ext)
+        _remember_disabled(ext._dir_name, True)
         logger.info('Расширение %s%s%s выключено', C_BRIGHT, ext.meta.name, Fore.RESET)
         return True
     except Exception as e:
@@ -132,41 +150,33 @@ def _detach_subrouter(router) -> None:
     router._parent_router = None
 
 
-def _attach_ext_routes_before_cmd(main_router, routes: list) -> None:
-    from ctrl.cmd import router as cmd_router
-    try:
-        cmd_idx = main_router.sub_routers.index(cmd_router)
-    except ValueError:
-        cmd_idx = len(main_router.sub_routers)
-    for i, r in enumerate(routes):
-        if r.parent_router is not None:
-            _detach_subrouter(r)
-        main_router.sub_routers.insert(cmd_idx + i, r)
-        r._parent_router = main_router
-
-
 def _replace_extension_tg_routers(old_routes: list, new_routes: list) -> None:
     from ctrl import router as main_rt
-    from ctrl.panel import get_panel
+    from ctrl.cmd import router as cmd_router
 
-    panel = get_panel()
-    dp = getattr(panel, 'dp', None) if panel else None
-    if dp is not None and main_rt.parent_router is dp:
-        for r in old_routes:
-            _detach_subrouter(r)
-        try:
-            main_idx = dp.sub_routers.index(main_rt)
-        except ValueError:
-            main_idx = len(dp.sub_routers)
-        for i, r in enumerate(new_routes):
-            if r.parent_router is not None:
-                _detach_subrouter(r)
-            dp.sub_routers.insert(main_idx + i, r)
-            r._parent_router = dp
-        return
-    for r in old_routes:
-        _detach_subrouter(r)
-    _attach_ext_routes_before_cmd(main_rt, new_routes)
+    if cmd_router.parent_router is None:
+        main_rt.include_router(cmd_router)
+    removed = old_routes + new_routes
+    remaining = [route for route in main_rt.sub_routers if route not in removed]
+    following = [route for route in _routers_following_extension(main_rt, old_routes) if route not in removed]
+    for route in old_routes:
+        _detach_subrouter(route)
+    for route in new_routes:
+        _detach_subrouter(route)
+        main_rt.include_router(route)
+    preceding = [route for route in remaining if route not in following]
+    main_rt.sub_routers[:] = preceding + new_routes + following
+
+
+def _routers_following_extension(main_router, old_routes: list) -> list:
+    encountered = False
+    following = []
+    for route in main_router.sub_routers:
+        if route in old_routes:
+            encountered = True
+        elif encountered:
+            following.append(route)
+    return following
 
 
 async def refresh_extension(ext_uuid: UUID | str) -> bool:
@@ -271,17 +281,17 @@ def discover_extensions() -> list[Extension]:
 
 
 def _ext_count_str(count: int) -> str:
-    last = int(str(count)[-1])
-    if last == 1:
-        return f'Подключено {C_BRIGHT}{count}{Fore.RESET} расширение'
-    elif 2 <= last <= 4:
-        return f'Подключено {C_BRIGHT}{count}{Fore.RESET} расширения'
-    return f'Подключено {C_BRIGHT}{count}{Fore.RESET} расширений'
+    word = plural(count, 'расширение', 'расширения', 'расширений')
+    return f'Подключено {C_BRIGHT}{count}{Fore.RESET} {word}'
 
 
 async def activate_extensions(extensions: list[Extension]) -> None:
     global _extensions
+    disabled = _disabled_names()
     for ext in extensions:
+        if ext._dir_name in disabled:
+            logger.info('Расширение «%s» выключено в панели — не подключаю', ext.meta.name)
+            continue
         try:
             await _enable_extension(ext)
         except Exception as e:

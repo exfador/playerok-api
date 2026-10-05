@@ -1,0 +1,183 @@
+query chat($id: UUID!, $hasSupportAccess: Boolean!) {
+  chat(id: $id) {
+    ...RegularChatWithUserVipStatus
+    __typename
+  }
+}
+
+fragment RegularChatWithUserVipStatus on Chat {
+  id
+  type
+  unreadMessagesCounter
+  bookmarked
+  isTextingAllowed
+  owner {
+    ...ChatParticipant
+    __typename
+  }
+  agent {
+    ...ChatParticipant
+    __typename
+  }
+  participants {
+    ...ChatParticipant
+    ...UserFragmentVipStatusFragment @include(if: $hasSupportAccess)
+    __typename
+  }
+  deals {
+    ...ChatActiveItemDeal
+    item {
+      ...ChatDealMyItemEdgeNode
+      ...ChatDealForeignItemEdgeNode
+      user {
+        ...UserItemEdgeNode
+        ...UserFragmentVipStatusFragment @include(if: $hasSupportAccess)
+        __typename
+      }
+      __typename
+    }
+    user {
+      ...RegularUserFragment
+      ...UserFragmentVipStatusFragment @include(if: $hasSupportAccess)
+      __typename
+    }
+    __typename
+  }
+  status
+  startedAt
+  finishedAt
+  __typename
+}
+
+fragment ChatParticipant on UserFragment {
+  ...RegularUserFragment
+  __typename
+}
+
+fragment UserFragmentVipStatusFragment on UserFragment {
+  isVip
+  __typename
+}
+
+fragment ChatActiveItemDeal on ItemDealProfile {
+  id
+  direction
+  status
+  hasProblem
+  props {
+    ...ItemDealProps
+    __typename
+  }
+  testimonial {
+    id
+    rating
+    __typename
+  }
+  item {
+    ...ChatDealItemEdgeNode
+    __typename
+  }
+  user {
+    ...RegularUserFragment
+    __typename
+  }
+  __typename
+}
+
+fragment ChatDealMyItemEdgeNode on MyItemProfile {
+  id
+  slug
+  priority
+  status
+  name
+  price
+  rawPrice
+  statusExpirationDate
+  sellerType
+  attachment {
+    ...PartialFile
+    __typename
+  }
+  user {
+    ...UserItemEdgeNode
+    __typename
+  }
+  approvalDate
+  createdAt
+  priorityPosition
+  feeMultiplier
+  __typename
+}
+
+fragment ChatDealForeignItemEdgeNode on ForeignItemProfile {
+  id
+  slug
+  priority
+  status
+  name
+  price
+  rawPrice
+  sellerType
+  attachment {
+    ...PartialFile
+    __typename
+  }
+  user {
+    ...UserItemEdgeNode
+    __typename
+  }
+  approvalDate
+  priorityPosition
+  createdAt
+  feeMultiplier
+  __typename
+}
+
+fragment UserItemEdgeNode on UserFragment {
+  ...UserEdgeNode
+  __typename
+}
+
+fragment RegularUserFragment on UserFragment {
+  id
+  username
+  role
+  avatarURL
+  isOnline
+  isBlocked
+  rating
+  testimonialCounter
+  createdAt
+  supportChatId
+  systemChatId
+  __typename
+}
+
+fragment ItemDealProps on ItemDealProps {
+  autoConfirmPeriod
+  confirmationRestriction
+  confirmationRestrictionTexts {
+    sellerDealSubtitle
+    buyerDealSubtitle
+    buyerTimerText
+    __typename
+  }
+  __typename
+}
+
+fragment ChatDealItemEdgeNode on ItemProfile {
+  ...ChatDealMyItemEdgeNode
+  ...ChatDealForeignItemEdgeNode
+  __typename
+}
+
+fragment PartialFile on File {
+  id
+  url
+  __typename
+}
+
+fragment UserEdgeNode on UserFragment {
+  ...RegularUserFragment
+  __typename
+}

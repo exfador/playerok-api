@@ -1,0 +1,21 @@
+query viewerBalance {
+  viewer {
+    id
+    role
+    balance {
+      ...RegularUserBalance
+      __typename
+    }
+    __typename
+  }
+}
+
+fragment RegularUserBalance on UserBalance {
+  id
+  value
+  frozen
+  available
+  withdrawable
+  pendingIncome
+  __typename
+}

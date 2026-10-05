@@ -1,0 +1,186 @@
+mutation removeTransaction($id: UUID!) {
+  removeTransaction(id: $id) {
+    ...RegularTransaction
+    __typename
+  }
+}
+
+fragment RegularTransaction on Transaction {
+  id
+  operation
+  direction
+  providerId
+  provider {
+    ...RegularTransactionProvider
+    __typename
+  }
+  user {
+    ...RegularUserFragment
+    __typename
+  }
+  creator {
+    ...RegularUserFragment
+    __typename
+  }
+  status
+  statusDescription
+  statusExpirationDate
+  value
+  fee
+  createdAt
+  props {
+    ...RegularTransactionProps
+    __typename
+  }
+  verifiedAt
+  verifiedBy {
+    ...UserEdgeNode
+    __typename
+  }
+  completedBy {
+    ...UserEdgeNode
+    __typename
+  }
+  paymentMethodId
+  completedAt
+  isSuspicious
+  spbBankName
+  autoClaimedAt
+  __typename
+}
+
+fragment RegularTransactionProvider on TransactionProvider {
+  id
+  name
+  fee
+  minFeeAmount
+  description
+  account {
+    ...RegularTransactionProviderAccount
+    __typename
+  }
+  props {
+    ...TransactionProviderPropsFragment
+    __typename
+  }
+  limits {
+    ...ProviderLimits
+    __typename
+  }
+  paymentMethods {
+    ...TransactionPaymentMethod
+    __typename
+  }
+  __typename
+}
+
+fragment RegularUserFragment on UserFragment {
+  id
+  username
+  role
+  avatarURL
+  isOnline
+  isBlocked
+  rating
+  testimonialCounter
+  createdAt
+  supportChatId
+  systemChatId
+  __typename
+}
+
+fragment RegularTransactionProps on TransactionPropsFragment {
+  creatorId
+  dealId
+  paidFromPendingIncome
+  paymentURL
+  successURL
+  fee
+  paymentAccount {
+    id
+    value
+    __typename
+  }
+  paymentGateway
+  alreadySpent
+  exchangeRate
+  amountAfterConversionRub
+  amountAfterConversionUsdt
+  fragmentUsername
+  userData {
+    account
+    email
+    ipAddress
+    phoneNumber
+    __typename
+  }
+  __typename
+}
+
+fragment UserEdgeNode on UserFragment {
+  ...RegularUserFragment
+  __typename
+}
+
+fragment RegularTransactionProviderAccount on TransactionProviderAccount {
+  id
+  value
+  userId
+  providerId
+  paymentMethodId
+  __typename
+}
+
+fragment TransactionProviderPropsFragment on TransactionProviderPropsFragment {
+  requiredUserData {
+    ...TransactionProviderRequiredUserData
+    __typename
+  }
+  tooltip
+  __typename
+}
+
+fragment ProviderLimits on ProviderLimits {
+  incoming {
+    ...ProviderLimitRange
+    __typename
+  }
+  outgoing {
+    ...ProviderLimitRange
+    __typename
+  }
+  __typename
+}
+
+fragment TransactionPaymentMethod on TransactionPaymentMethod {
+  id
+  name
+  fee
+  providerId
+  account {
+    ...RegularTransactionProviderAccount
+    __typename
+  }
+  props {
+    ...TransactionProviderPropsFragment
+    __typename
+  }
+  limits {
+    ...ProviderLimits
+    __typename
+  }
+  __typename
+}
+
+fragment TransactionProviderRequiredUserData on TransactionProviderRequiredUserData {
+  email
+  phoneNumber
+  eripAccountNumber
+  __typename
+}
+
+fragment ProviderLimitRange on ProviderLimitRange {
+  min
+  max
+  __typename
+}

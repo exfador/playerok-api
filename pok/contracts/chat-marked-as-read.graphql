@@ -1,0 +1,265 @@
+subscription chatMarkedAsRead($filter: ChatFilter, $showForbiddenImage: Boolean) {
+  chatMarkedAsRead(filter: $filter) {
+    ...ChatUpdatedFields
+    __typename
+  }
+}
+
+fragment ChatUpdatedFields on Chat {
+  id
+  unreadMessagesCounter
+  isTextingAllowed
+  lastMessage {
+    ...LastChatMessageFields
+    __typename
+  }
+  status
+  startedAt
+  finishedAt
+  __typename
+}
+
+fragment LastChatMessageFields on ChatMessage {
+  id
+  text
+  createdAt
+  isRead
+  isBulkMessaging
+  event
+  file {
+    ...RegularFile
+    __typename
+  }
+  user {
+    ...ChatMessageUserFields
+    __typename
+  }
+  eventByUser {
+    ...ChatMessageUserFields
+    __typename
+  }
+  eventToUser {
+    ...ChatMessageUserFields
+    __typename
+  }
+  deal {
+    ...ChatMessageItemDeal
+    __typename
+  }
+  __typename
+}
+
+fragment RegularFile on File {
+  id
+  url
+  filename
+  mime
+  __typename
+}
+
+fragment ChatMessageUserFields on UserFragment {
+  ...UserEdgeNode
+  __typename
+}
+
+fragment ChatMessageItemDeal on ItemDeal {
+  id
+  direction
+  status
+  statusDescription
+  hasProblem
+  props {
+    ...ItemDealProps
+    __typename
+  }
+  user {
+    ...ChatParticipant
+    __typename
+  }
+  testimonial {
+    ...ChatMessageDealTestimonial
+    __typename
+  }
+  item {
+    id
+    name
+    price
+    slug
+    rawPrice
+    sellerType
+    user {
+      ...ChatParticipant
+      __typename
+    }
+    category {
+      id
+      __typename
+    }
+    attachments(showForbiddenImage: $showForbiddenImage) {
+      ...PartialFile
+      __typename
+    }
+    isAttachmentsForbidden
+    comment
+    dataFields {
+      ...GameCategoryDataFieldWithValue
+      __typename
+    }
+    obtainingType {
+      ...GameCategoryObtainingType
+      __typename
+    }
+    __typename
+  }
+  obtainingFields {
+    ...GameCategoryDataFieldWithValue
+    __typename
+  }
+  automationObtainingFields {
+    ...ItemDealAutomationObtainingField
+    __typename
+  }
+  chat {
+    id
+    type
+    __typename
+  }
+  transaction {
+    id
+    statusExpirationDate
+    __typename
+  }
+  statusExpirationDate
+  commentFromBuyer
+  gameCategoryWarnings {
+    ...ItemDealWarningFragment
+    __typename
+  }
+  obtainingTypeWarnings {
+    ...ItemDealWarningFragment
+    __typename
+  }
+  __typename
+}
+
+fragment UserEdgeNode on UserFragment {
+  ...RegularUserFragment
+  __typename
+}
+
+fragment ItemDealProps on ItemDealProps {
+  autoConfirmPeriod
+  confirmationRestriction
+  confirmationRestrictionTexts {
+    sellerDealSubtitle
+    buyerDealSubtitle
+    buyerTimerText
+    __typename
+  }
+  __typename
+}
+
+fragment ChatParticipant on UserFragment {
+  ...RegularUserFragment
+  __typename
+}
+
+fragment ChatMessageDealTestimonial on Testimonial {
+  id
+  status
+  text
+  rating
+  createdAt
+  updatedAt
+  creator {
+    ...RegularUserFragment
+    __typename
+  }
+  moderator {
+    ...RegularUserFragment
+    __typename
+  }
+  user {
+    ...RegularUserFragment
+    __typename
+  }
+  __typename
+}
+
+fragment PartialFile on File {
+  id
+  url
+  __typename
+}
+
+fragment GameCategoryDataFieldWithValue on GameCategoryDataFieldWithValue {
+  id
+  label
+  type
+  inputType
+  copyable
+  hidden
+  required
+  value
+  __typename
+}
+
+fragment GameCategoryObtainingType on GameCategoryObtainingType {
+  id
+  name
+  stockType
+  description
+  gameCategoryId
+  noCommentFromBuyer
+  instructionForBuyer
+  instructionForSeller
+  sequence
+  feeMultiplier
+  agreements {
+    ...MinimalGameCategoryAgreement
+    __typename
+  }
+  props {
+    minTestimonialsForSeller
+    __typename
+  }
+  __typename
+}
+
+fragment ItemDealAutomationObtainingField on AutomationObtainingFieldItemDeals {
+  code
+  value
+  name
+  __typename
+}
+
+fragment ItemDealWarningFragment on ItemDealWarning {
+  id
+  status
+  title
+  text
+  __typename
+}
+
+fragment RegularUserFragment on UserFragment {
+  id
+  username
+  role
+  avatarURL
+  isOnline
+  isBlocked
+  rating
+  testimonialCounter
+  createdAt
+  supportChatId
+  systemChatId
+  __typename
+}
+
+fragment MinimalGameCategoryAgreement on GameCategoryAgreement {
+  description
+  iconType
+  id
+  sequence
+  __typename
+}

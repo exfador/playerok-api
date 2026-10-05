@@ -104,18 +104,22 @@ class PduLogChatScroll(CallbackData, prefix='cxLc'):
 
 class PduReviveAllowDrop(CallbackData, prefix='cxDRi'):
     index: int
+    tag: str = ''
 
 
 class PduSealAllowDrop(CallbackData, prefix='cxDSh'):
     index: int
+    tag: str = ''
 
 
 class PduBoostAllowDrop(CallbackData, prefix='cxDBi'):
     index: int
+    tag: str = ''
 
 
 class PduBoostDenyDrop(CallbackData, prefix='cxDBx'):
     index: int
+    tag: str = ''
 
 
 class PduLogExport(CallbackData, prefix='cxSL'):
@@ -128,3 +132,24 @@ class PduFulfillModePick(CallbackData, prefix='cxAP'):
 
 class PduFulfillFileDrop(CallbackData, prefix='cxDG'):
     index: int
+    tag: str = ''
+
+
+class PduItemsGrid(CallbackData, prefix='cxIg'):
+    page: int
+
+
+class PduItemOpen(CallbackData, prefix='cxIo'):
+    id: str
+
+
+class PduItemAct(CallbackData, prefix='cxIa'):
+    do: str
+
+
+class PduItemTier(CallbackData, prefix='cxIt'):
+    i: int
+
+
+class PduItemObtain(CallbackData, prefix='cxIb'):
+    i: int

@@ -1,0 +1,23 @@
+subscription userUpdated($userId: UUID) {
+  userUpdated(userId: $userId) {
+    ...PartialUserProfile
+    __typename
+  }
+}
+
+fragment PartialUserProfile on UserProfile {
+  __typename
+  ...PartialUser
+  ...PartialUserFragment
+}
+
+fragment PartialUser on User {
+  id
+  unreadChatsCounter
+  __typename
+}
+
+fragment PartialUserFragment on UserFragment {
+  id
+  __typename
+}

@@ -127,10 +127,25 @@ class LocalDataCleaner:
             self._log.warning("Completed with %d error(s).", len(report.errors))
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+    parser = argparse.ArgumentParser(description="Удаляет conf/, db/, storage/, logs/ и __pycache__ этого проекта.")
+    parser.add_argument("--yes", action="store_true", help="действительно удалить (без флага только показать)")
+    args = parser.parse_args(argv)
     log = LoggingBootstrap.configure(logging.INFO)
     root = Path(__file__).resolve().parent
-    report = LocalDataCleaner(ProjectScope(root), log=log).run()
+    config = CleanupConfig()
+    if not args.yes:
+        targets = [f"{name}/" for name in config.data_dir_names if (root / name).exists()]
+        if targets:
+            log.info("Будут удалены: %s и все __pycache__.", ", ".join(targets))
+            if (root / "conf").exists():
+                log.info("Токены, Cookie и пароль панели из conf/ пропадут.")
+        else:
+            log.info("Данных нет, будут удалены только __pycache__.")
+        log.info("Для удаления запустите: python clean.py --yes")
+        return 0
+    report = LocalDataCleaner(ProjectScope(root), config=config, log=log).run()
     return 0 if report.ok else 1
 
 

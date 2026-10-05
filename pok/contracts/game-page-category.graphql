@@ -1,0 +1,50 @@
+query GamePageCategory($id: UUID, $slug: String) {
+  gameCategory(id: $id, slug: $slug) {
+    ...GamePageCategoryFragment
+    seo {
+      ...GameCategorySeo
+      __typename
+    }
+    __typename
+  }
+}
+
+fragment GamePageCategoryFragment on GameCategory {
+  id
+  slug
+  name
+  options {
+    ...RegularGameCategoryOption
+    __typename
+  }
+  useCustomObtaining
+  __typename
+}
+
+fragment GameCategorySeo on GameCategorySeo {
+  id
+  seoText
+  metaTitle
+  metaDescription
+  metaKeywords
+  metaRobots
+  metaLang
+  metaViewport
+  __typename
+}
+
+fragment RegularGameCategoryOption on GameCategoryOption {
+  id
+  group
+  label
+  type
+  field
+  value
+  valueRangeLimit {
+    min
+    max
+    __typename
+  }
+  multiple
+  __typename
+}

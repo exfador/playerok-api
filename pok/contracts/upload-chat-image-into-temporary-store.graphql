@@ -1,0 +1,10 @@
+mutation uploadChatImageIntoTemporaryStore($file: Upload!, $input: UploadTemporaryAttachmentInput!) {
+  uploadChatImageIntoTemporaryStore(file: $file, input: $input) {
+    expiresAt
+    id
+    url
+    chatId
+    clientAttachmentId
+    __typename
+  }
+}

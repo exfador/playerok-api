@@ -1,0 +1,50 @@
+query messageTemplates($pagination: Pagination, $sort: Sort, $filter: MessageTemplateFilter!) {
+  messageTemplates(pagination: $pagination, sort: $sort, filter: $filter) {
+    edges {
+      ...MessageTemplateEdgeFields
+      __typename
+    }
+    pageInfo {
+      startCursor
+      endCursor
+      hasPreviousPage
+      hasNextPage
+      __typename
+    }
+    totalCount
+    __typename
+  }
+}
+
+fragment MessageTemplateEdgeFields on MessageTemplateEdge {
+  cursor
+  node {
+    ...MessageTemplate
+    __typename
+  }
+  __typename
+}
+
+fragment MessageTemplate on MessageTemplate {
+  id
+  type
+  title
+  text
+  sequence
+  createdAt
+  group {
+    ...MessageTemplateGroup
+    __typename
+  }
+  __typename
+}
+
+fragment MessageTemplateGroup on MessageTemplateGroup {
+  id
+  type
+  title
+  createdAt
+  sequence
+  templatesCounter
+  __typename
+}

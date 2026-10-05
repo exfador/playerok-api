@@ -1,0 +1,64 @@
+query games($pagination: Pagination, $filter: GameFilter, $sort: Sort) {
+  games(pagination: $pagination, filter: $filter, sort: $sort) {
+    ...GameList
+    __typename
+  }
+}
+
+fragment GameList on GameList {
+  edges {
+    ...GameEdgeFields
+    __typename
+  }
+  pageInfo {
+    startCursor
+    endCursor
+    hasPreviousPage
+    hasNextPage
+    __typename
+  }
+  totalCount
+  __typename
+}
+
+fragment GameEdgeFields on GameEdge {
+  cursor
+  node {
+    ...GameEdgeNode
+    __typename
+  }
+  __typename
+}
+
+fragment GameEdgeNode on Game {
+  id
+  slug
+  name
+  type
+  isNew
+  logo {
+    ...RegularFile
+    __typename
+  }
+  categories {
+    ...GameEdgeNodeGameCategory
+    __typename
+  }
+  createdAt
+  __typename
+}
+
+fragment RegularFile on File {
+  id
+  url
+  filename
+  mime
+  __typename
+}
+
+fragment GameEdgeNodeGameCategory on GameCategory {
+  id
+  slug
+  name
+  __typename
+}
